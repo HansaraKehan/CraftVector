@@ -1,5 +1,7 @@
 # VectorCraft for Android (early preview)
 
+<img width="2304" height="1440" alt="Screenshot_20261018_173204" src="https://github.com/user-attachments/assets/92ac85fe-0a0e-472c-9204-4a928c98e90a" />
+
 An unofficial Android build of [VectorCraft](https://github.com/storytold/vectorcraft), the open-source vector
 illustration app written in Rust by the ArtCraft team, a clean-room take on the Illustrator workflow. This build runs
 it as a native Android app (egui + wgpu), not as a web page.
