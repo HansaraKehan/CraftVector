@@ -9,11 +9,11 @@ it as a native Android app (egui + wgpu), not as a web page.
 > **Early preview.** This is a first working port, not a finished product. See [Limitations](#limitations).
 
 This repository does not contain VectorCraft's source. A GitHub Actions workflow downloads the upstream source,
-adds a small Android layer, builds the APK and publishes it under [Releases](../../releases).
+adds a small Android layer, builds the APK and publishes it under [Releases](github.com/HansaraKehan/CraftVector/releases).
 
 ## Download
 
-Get the latest `.apk` from the [Releases](../../releases) page, open it and allow the install when Android asks.
+Get the latest `.apk` from the [Releases](github.com/HansaraKehan/CraftVector/releases) page, open it and allow the install when Android asks.
 You need:
 
 - an ARM64 phone or tablet (most devices from the last several years)
