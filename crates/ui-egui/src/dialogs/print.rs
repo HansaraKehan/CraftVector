@@ -558,8 +558,8 @@ fn art_texture(app: &mut VectorcraftApp, ctx: &egui::Context, layers: PrintLayer
 fn whole(ui: &mut egui::Ui, d: &mut Dialog, path: &str, range: std::ops::RangeInclusive<f64>, enabled: bool) {
     let v = get(d, path).as_f64().unwrap_or(*range.start());
     ui.add_enabled_ui(enabled, |ui| {
-        if let Some(x) = widgets::plain_field(ui, path, v, "", 0, 56.0) {
-            set(d, path, json!(x.round().clamp(*range.start(), *range.end()) as u64));
+        if let Some(x) = widgets::range_field(ui, path, v, range, "", 0, 56.0) {
+            set(d, path, json!(x as u64));
         }
     });
 }
@@ -688,7 +688,7 @@ fn output(ui: &mut egui::Ui, d: &mut Dialog, pv: &Result<Value, String>) {
         for ink in inks {
             let name = ink["name"].as_str().unwrap_or_default();
             let on = ink["print"].as_bool().unwrap_or(true);
-            if widgets::check(ui, "", on, true) {
+            if widgets::check_box(ui, name, on, true) {
                 set_ink(d, name, "print", json!(!on));
             }
             let spot = if ink["spot"] == true { format!(" ({})", tl!("spot")) } else { String::new() };

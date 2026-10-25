@@ -49,7 +49,7 @@ pub struct PrefSpec {
     pub kind: PrefKind,
 }
 
-/// Categories in Illustrator's order (Plug-ins & Scratch Disks is "Performance & Storage" here).
+/// Categories in Illustrator's order.
 pub const PREF_CATEGORIES: &[&str] = &[
     "General",
     "Selection & Anchor Display",
@@ -59,7 +59,7 @@ pub const PREF_CATEGORIES: &[&str] = &[
     "Smart Guides",
     "Slices",
     "Hyphenation",
-    "Performance & Storage",
+    "Plug-ins & Scratch Disks",
     "User Interface",
     "Performance",
     "File Handling",
@@ -89,8 +89,10 @@ pub const GPU_PREFERENCES: &[(&str, &str)] =
     &[("automatic", "Automatic"), ("lowPower", "Power Saving (integrated)"), ("highPerformance", "High Performance (discrete)")];
 /// Performance › Linux Display Server (`linuxDisplayServer`), read by the desktop app at startup:
 /// `x11` opens the window through XWayland on a Wayland session, where dropped files arrive
-/// (winit 0.30 has no Wayland drag and drop, #1151).
-const LINUX_DISPLAY_SERVERS: &[(&str, &str)] = &[("automatic", "Automatic"), ("x11", "X11 (XWayland)")];
+/// (winit 0.30 has no Wayland drag and drop, #1151); `x11WithPen` does the same only when a pen is
+/// attached as the app starts: under XWayland a drawing tablet's pen draws as a mouse (#2028).
+const LINUX_DISPLAY_SERVERS: &[(&str, &str)] =
+    &[("automatic", "Automatic"), ("x11", "X11 (XWayland)"), ("x11WithPen", "X11 (XWayland) When a Pen Is Attached")];
 const BLACK: &[(&str, &str)] = &[("accurate", "Display All Blacks Accurately"), ("rich", "Display All Blacks as Rich Black")];
 const BLACK_OUT: &[(&str, &str)] = &[("accurate", "Output All Blacks Accurately"), ("rich", "Output All Blacks as Rich Black")];
 
@@ -138,6 +140,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("scaleStrokes", "General", "Options", "Scale Strokes & Effects", bool),
     p!("zoomWithMouseWheel", "General", "Options", "Zoom with Mouse Wheel", bool),
     p!("scrubNumericFields", "General", "Options", "Scrub Numeric Fields by Dragging", bool),
+    p!("trackpadRotateView", "General", "Options", "Trackpad Gesture to Rotate View", bool),
     // Selection & Anchor Display
     p!("selectionTolerance", "Selection & Anchor Display", "Selection", "Tolerance", num(1.0, 8.0, "px")),
     p!("objectSelectionByPathOnly", "Selection & Anchor Display", "Selection", "Object Selection by Path Only", bool),
@@ -231,7 +234,10 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("anchorPathLabels", "Smart Guides", "Display Options", "Anchor/Path Labels", bool),
     p!("measurementLabels", "Smart Guides", "Display Options", "Measurement Labels", bool),
     p!("spacingGuides", "Smart Guides", "Display Options", "Spacing Guides", bool),
+    p!("distanceGuides", "Smart Guides", "Display Options", "Invoke Distance Guides", bool),
     p!("snappingTolerance", "Smart Guides", "", "Snapping Tolerance", num(0.0, 40.0, "pt")),
+    p!("snapTangent", "Smart Guides", "Geometric Guides", "Snap to Tangent", bool),
+    p!("snapPerpendicular", "Smart Guides", "Geometric Guides", "Snap to Perpendicular", bool),
     // Slices
     p!("showSliceNumbers", "Slices", "", "Show Slice Numbers", bool),
     p!("sliceLineColor", "Slices", "", "Line Color", color),
@@ -253,10 +259,10 @@ pub const PREF_SPECS: &[PrefSpec] = &[
         ])
     ),
     p!("hyphenationExceptions", "Hyphenation", "", "Exceptions (comma separated)", text),
-    // Performance & Storage
-    p!("pluginsFolder", "Performance & Storage", "Plug-ins", "Additional Plug-ins Folder", text),
-    p!("scratchPrimary", "Performance & Storage", "Scratch Disks", "Primary", text),
-    p!("scratchSecondary", "Performance & Storage", "Scratch Disks", "Secondary", text),
+    // Plug-ins & Scratch Disks
+    p!("pluginsFolder", "Plug-ins & Scratch Disks", "Plug-ins", "Additional Plug-ins Folder", text),
+    p!("scratchPrimary", "Plug-ins & Scratch Disks", "Scratch Disks", "Primary", text),
+    p!("scratchSecondary", "Plug-ins & Scratch Disks", "Scratch Disks", "Secondary", text),
     // User Interface
     p!(
         "uiBrightness",
@@ -466,13 +472,14 @@ impl Prefs {
 
     /// The folders the app reads (fonts, plug-ins) or writes (Data Recovery copies, the Templates
     /// folder it makes for its dialogs) on its own, with the access each needs.
-    fn folders_mut(&mut self) -> [(&mut String, crate::file_access::Access); 4] {
+    fn folders_mut(&mut self) -> [(&mut String, &'static [crate::file_access::Access]); 4] {
         use crate::file_access::Access;
         [
-            (&mut self.fonts_folder, Access::Read),
-            (&mut self.plugins_folder, Access::Read),
-            (&mut self.recovery_folder, Access::Write),
-            (&mut self.templates_folder, Access::Write),
+            (&mut self.fonts_folder, &[Access::Read][..]),
+            (&mut self.plugins_folder, &[Access::Read][..]),
+            // Data Recovery lists and restores what is in its folder too.
+            (&mut self.recovery_folder, &[Access::Write, Access::Read][..]),
+            (&mut self.templates_folder, &[Access::Write][..]),
         ]
     }
 
@@ -488,7 +495,7 @@ impl Prefs {
             if folder.is_empty() || folder == old.trim() {
                 continue;
             }
-            if let Err(e) = roots.check(folder, access) {
+            if let Err(e) = access.iter().try_for_each(|a| roots.check(folder, *a)) {
                 refused.push(e);
                 *new = old.clone();
             }
@@ -536,7 +543,9 @@ impl Session {
         self.prefs = p;
         if fonts_folder_changed {
             let folder = self.prefs.fonts_folder.trim();
-            vectorcraft_text::set_user_font_dirs(if folder.is_empty() { vec![] } else { vec![folder.into()] });
+            // A folder an automation caller chose is read without following its links out of it.
+            let confined = crate::file_access::current().is_some();
+            vectorcraft_text::set_user_font_dirs_confined(if folder.is_empty() { vec![] } else { vec![folder.into()] }, confined);
             // Once the fonts were scanned, scan again now: the folder's fonts appear (or go) in the
             // font menus, and type in them lays out again. The first scan reads it anyway.
             if vectorcraft_text::FontDb::global().installed_fonts_changed() {

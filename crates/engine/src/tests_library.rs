@@ -43,6 +43,18 @@ fn libraries_are_made_renamed_and_deleted() {
     assert!(s.execute("library.get", &json!({"library": "Client"})).is_err());
 }
 
+/// A library's file is named after it, and a Windows device name (`CON`, `NUL`, `COM1`…) gets a
+/// `-` after it, on every platform.
+#[test]
+fn a_library_named_after_a_windows_device_gets_a_dash() {
+    let mut s = session();
+    let ids: Vec<String> = ["CON", "nul", "Com1", "LPT³", "Console", "COM10"]
+        .iter()
+        .map(|name| run(&mut s, "library.create", json!({"name": name}))["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, ["CON-", "nul-", "Com1-", "LPT³-", "Console", "COM10"]);
+}
+
 #[test]
 fn a_graphic_goes_into_a_library_and_comes_out_in_another_document() {
     let mut s = session();
@@ -129,6 +141,88 @@ fn text_styles_come_from_the_selected_type_and_apply_in_one_step() {
     run(&mut s, "charStyle.new", json!({"name": name, "attrs": {"size": 5}}));
     let r = run(&mut s, "library.use", json!({"library": lib, "kind": "charStyle", "item": name}));
     assert_eq!(r["style"], format!("{name} 2"));
+}
+
+/// A library with the character and paragraph styles of 31 pt type, an undo group opened in the
+/// first document with a rectangle drawn in it, and a second document, active, with type
+/// selected → (session, library, character style, paragraph style).
+fn group_open_in_another_document() -> (Session, String, String, String) {
+    let mut s = session();
+    let lib = run(&mut s, "library.create", json!({}))["id"].as_str().unwrap().to_string();
+    let t = run(&mut s, "text.create", json!({"x": 10, "y": 50, "text": "Heading", "size": 31}))["id"].clone();
+    run(&mut s, "select.set", json!({"ids": [t]}));
+    let char_style = run(&mut s, "library.add", json!({"library": lib, "kind": "charStyle"}))["name"].as_str().unwrap().to_string();
+    let para_style = run(&mut s, "library.add", json!({"library": lib, "kind": "paraStyle"}))["name"].as_str().unwrap().to_string();
+    // The second document exists before the group begins, so no group opens in it.
+    run(&mut s, "file.new", json!({"width": 200, "height": 200}));
+    run(&mut s, "document.activate", json!({"index": 0}));
+    run(&mut s, "edit.undoGroup.begin", json!({}));
+    run(&mut s, "shape.rectangle", json!({"x": 0, "y": 0, "width": 20, "height": 20}));
+    run(&mut s, "document.activate", json!({"index": 1}));
+    let u = run(&mut s, "text.create", json!({"x": 10, "y": 50, "text": "Body", "size": 9}))["id"].clone();
+    run(&mut s, "select.set", json!({"ids": [u]}));
+    (s, lib, char_style, para_style)
+}
+
+/// A library style used in one document does not close an undo group that is open in another
+/// document, so that document's next edit still joins the group's undo step.
+#[test]
+fn a_library_style_leaves_another_documents_undo_group_open() {
+    let (mut s, lib, name, _) = group_open_in_another_document();
+    run(&mut s, "library.use", json!({"library": lib, "kind": "charStyle", "item": name}));
+    assert!(s.documents()[0].undo_group.is_some(), "the first document's undo group stays open");
+    s.set_active(0);
+    let undo = s.doc().unwrap().history.undo.len();
+    run(&mut s, "shape.rectangle", json!({"x": 30, "y": 0, "width": 20, "height": 20}));
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo, "the edit joins the group's step");
+}
+
+/// A library style that fails to apply takes back only the edits it made in its own document: an
+/// undo group open in another document stays open, and the edits made in it stay.
+#[test]
+fn a_library_style_that_fails_takes_back_only_its_own_edits() {
+    let (mut s, lib, _, name) = group_open_in_another_document();
+    run(&mut s, "select.none", json!({}));
+    assert!(s.execute("library.use", &json!({"library": lib, "kind": "paraStyle", "item": name})).is_err(), "no type selected");
+    assert!(s.doc().unwrap().doc.para_styles.iter().all(|p| p.name != name), "the style it added is taken back");
+    let first = &s.documents()[0];
+    assert_eq!(first.doc.layers[0].children().map_or(0, |c| c.len()), 2, "the type and the rectangle drawn in the group stay");
+    assert!(first.undo_group.is_some(), "the first document's undo group stays open");
+}
+
+/// A library style that fails to apply inside an undo group open in its own document takes back
+/// the style it added, and the group stays open with the edits made in it before.
+#[test]
+fn a_library_style_that_fails_in_an_open_group_takes_back_its_own_edits() {
+    let (mut s, lib, _, name) = group_open_in_another_document();
+    s.set_active(0);
+    run(&mut s, "select.none", json!({}));
+    let undo = s.doc().unwrap().history.undo.len();
+    assert!(s.execute("library.use", &json!({"library": lib, "kind": "paraStyle", "item": name})).is_err(), "no type selected");
+    let d = s.doc().unwrap();
+    assert!(d.doc.para_styles.iter().all(|p| p.name != name), "the style it added is taken back");
+    assert_eq!(d.doc.layers[0].children().map_or(0, |c| c.len()), 2, "the type and the rectangle drawn in the group stay");
+    assert_eq!(d.history.undo.len(), undo, "still the group's one step");
+    assert!(d.undo_group.is_some(), "the group stays open");
+}
+
+/// A text style that a library file names with spaces around it comes into the document with the
+/// name trimmed, as New Character Style and New Paragraph Style trim a name, and applies.
+#[test]
+fn a_library_style_named_with_spaces_comes_in_trimmed() {
+    let mut s = session();
+    let style = |attrs: Value| json!([{"name": " Body ", "attrs": attrs}]);
+    let data = json!({"name": "Spaced", "charStyles": style(json!({"size": 31.0})), "paraStyles": style(json!({}))});
+    let lib = run(&mut s, "library.import", json!({"data": data.to_string()}))["id"].as_str().unwrap().to_string();
+    let t = run(&mut s, "text.create", json!({"x": 10, "y": 50, "text": "Body", "size": 9}))["id"].clone();
+    run(&mut s, "select.set", json!({"ids": [t]}));
+    for kind in ["charStyle", "paraStyle"] {
+        assert_eq!(run(&mut s, "library.use", json!({"library": lib, "kind": kind, "item": " Body "}))["style"], "Body", "{kind}");
+    }
+    let d = &s.doc().unwrap().doc;
+    assert_eq!((d.char_styles[0].name.as_str(), d.para_styles[0].name.as_str()), ("Body", "Body"));
+    let vectorcraft_doc::NodeKind::Text(text) = &d.node(NodeId(t.as_u64().unwrap())).unwrap().kind else { panic!("not text") };
+    assert_eq!((text.runs[0].style.size, text.runs[0].style.style_name.as_deref()), (31.0, Some("Body")));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -243,6 +337,61 @@ fn items_are_grouped_moved_and_ungrouped() {
     assert_eq!(run(&mut s, "library.get", json!({}))["graphics"].as_array().unwrap().len(), 1);
     assert_eq!(groups(&mut s), [("Logos".into(), vec![])]);
     assert_eq!(run(&mut s, "library.list", json!({}))["libraries"][0]["groups"], 1);
+}
+
+/// The names of the current library's `list` ("colors", "graphics"…), in their order.
+fn order(s: &mut Session, list: &str, key: &str) -> Vec<String> {
+    let got = run(s, "library.get", json!({}));
+    got[list].as_array().unwrap().iter().map(|v| v[key].as_str().unwrap().to_string()).collect()
+}
+
+/// Dragging in the Libraries panel: an item moves just before or after another of its kind, into
+/// that one's group or out of every group, and groups move to another place in the list.
+#[test]
+fn items_and_groups_are_reordered() {
+    let mut s = session();
+    run(&mut s, "library.create", json!({"name": "Brand"}));
+    for (name, color) in [("Red", "#ff0000"), ("Green", "#00ff00"), ("Blue", "#0000ff"), ("Gray", "#808080")] {
+        run(&mut s, "library.add", json!({"kind": "fillColor", "color": color, "name": name}));
+    }
+    // Before an item, and after one; on itself it stays.
+    run(&mut s, "library.moveItem", json!({"kind": "fillColor", "item": "Blue", "before": "Red"}));
+    assert_eq!(order(&mut s, "colors", "name"), ["Blue", "Red", "Green", "Gray"]);
+    run(&mut s, "library.moveItem", json!({"kind": "fillColor", "item": "Blue", "after": "Gray"}));
+    assert_eq!(order(&mut s, "colors", "name"), ["Red", "Green", "Gray", "Blue"]);
+    run(&mut s, "library.moveItem", json!({"kind": "fillColor", "item": "Red", "before": "Red"}));
+    assert_eq!(order(&mut s, "colors", "name"), ["Red", "Green", "Gray", "Blue"]);
+    // Into a group next to an item there: the group lists it next to that one too.
+    run(
+        &mut s,
+        "library.createGroup",
+        json!({"name": "Cool", "items": [{"kind": "fillColor", "item": "Green"}, {"kind": "fillColor", "item": "Blue"}]}),
+    );
+    let r = run(&mut s, "library.moveItem", json!({"kind": "fillColor", "item": "Gray", "group": "Cool", "before": "Blue"}));
+    assert_eq!(r["group"], "Cool");
+    assert_eq!(order(&mut s, "colors", "name"), ["Red", "Green", "Gray", "Blue"]);
+    assert_eq!(groups(&mut s), [("Cool".into(), refs(&[("color", "Green"), ("color", "Gray"), ("color", "Blue")]))]);
+    // Next to an ungrouped item, without a group: out of its group.
+    run(&mut s, "library.moveItem", json!({"kind": "fillColor", "item": "Blue", "before": "Red"}));
+    assert_eq!(order(&mut s, "colors", "name"), ["Blue", "Red", "Green", "Gray"]);
+    assert_eq!(groups(&mut s), [("Cool".into(), refs(&[("color", "Green"), ("color", "Gray")]))]);
+    // Wrong asks change nothing.
+    assert!(s.execute("library.moveItem", &json!({"kind": "fillColor", "item": "Red", "before": "Nope"})).is_err());
+    assert!(s.execute("library.moveItem", &json!({"kind": "fillColor", "item": "Red", "before": "Blue", "after": "Gray"})).is_err());
+    assert!(s.execute("library.moveItem", &json!({"kind": "charStyle", "item": "Red", "before": "Blue"})).is_err(), "not a style");
+    assert_eq!(order(&mut s, "colors", "name"), ["Blue", "Red", "Green", "Gray"]);
+    // Groups: to an index, past the end to the last place.
+    run(&mut s, "library.createGroup", json!({"name": "Warm"}));
+    run(&mut s, "library.createGroup", json!({"name": "Neutral"}));
+    let names = |s: &mut Session| groups(s).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+    assert_eq!(run(&mut s, "library.moveGroup", json!({"group": "neutral", "to": 0}))["to"], 0);
+    assert_eq!(names(&mut s), ["Neutral", "Cool", "Warm"]);
+    assert_eq!(run(&mut s, "library.moveGroup", json!({"group": "Neutral", "to": 99}))["to"], 2);
+    assert_eq!(names(&mut s), ["Cool", "Warm", "Neutral"]);
+    assert!(s.execute("library.moveGroup", &json!({"group": "Nope", "to": 0})).is_err());
+    assert!(s.execute("library.moveGroup", &json!({"group": "Cool", "to": -1})).is_err());
+    assert!(s.execute("library.moveGroup", &json!({"group": "Cool"})).is_err());
+    assert_eq!(groups(&mut s)[0].1, refs(&[("color", "Green"), ("color", "Gray")]), "a group keeps its items when it moves");
 }
 
 /// A library goes out to a file with its art and groups and comes back as a new library, numbered

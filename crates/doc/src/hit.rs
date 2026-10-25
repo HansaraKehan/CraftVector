@@ -1,11 +1,12 @@
 //! Hit testing over the document tree.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use vectorcraft_geom::hit::{fill_contains, stroke_contains};
-use vectorcraft_geom::{Point, Rect};
+use vectorcraft_geom::{BezPath, FillRule, Point, Rect};
 
-use crate::{Document, Node, NodeId, NodeKind, SymbolBoxes};
+use crate::{AppearanceItem, Document, Node, NodeId, NodeKind, SymbolBoxes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitKind {
@@ -62,12 +63,40 @@ pub struct HitOptions {
     /// (point type's baseline, area type's frame, type on a path's path), not anywhere in its
     /// bounds.
     pub type_path_only: bool,
+    /// Guide objects (paths made into guides) are not hittable: View › Guides › Lock Guides is
+    /// on or the guides are hidden.
+    pub skip_guides: bool,
+    /// The selection tools: a clip group's clipping path is hit on its outline, within the
+    /// tolerance, before the art it clips, so that the mask can be reached where the art covers
+    /// its edge. Off for the tools that act on what is drawn (sampling, type, gradients…);
+    /// [`hit_test_visible`] never does it.
+    pub clip_outlines: bool,
 }
 
 impl Default for HitOptions {
     fn default() -> Self {
-        Self { tol: 3.0, outline: false, path_only: false, type_path_only: false, scope: None }
+        Self { tol: 3.0, outline: false, path_only: false, type_path_only: false, skip_guides: false, clip_outlines: false, scope: None }
     }
+}
+
+/// The shapes that an image's own fills and strokes paint, each with its fill rule and the fill or
+/// stroke that paints it (none for fills and strokes that paint nothing). Effects are evaluated
+/// above this crate, so the engine registers one with [`set_image_paint`].
+pub type ImagePaint = fn(&Node) -> Vec<(BezPath, FillRule, AppearanceItem)>;
+
+static IMAGE_PAINT: OnceLock<ImagePaint> = OnceLock::new();
+
+/// Register how the shapes of an image's own fills and strokes are found (the first registration
+/// stays).
+pub fn set_image_paint(f: ImagePaint) {
+    // Already set: the same engine, registered by another session.
+    let _ = IMAGE_PAINT.set(f);
+}
+
+/// The shapes that the image `n`'s own fills and strokes paint ([`set_image_paint`]), none while
+/// nothing is registered.
+pub(crate) fn image_paint(n: &Node) -> Vec<(BezPath, FillRule, AppearanceItem)> {
+    IMAGE_PAINT.get().map_or_else(Vec::new, |f| f(n))
 }
 
 /// Topmost editable object under `p`.
@@ -110,6 +139,11 @@ pub fn objects_at(doc: &Document, p: Point, opt: HitOptions, scope: Option<NodeI
             return objects_at_repeated(doc, p, opt, scope);
         }
     }
+    // The objects on a locked artboard can't be selected, as `hit_test_skipping` passes over them.
+    let locks = doc.locked_artboards();
+    if !locks.is_empty() {
+        tops.retain(|id| !doc.node(*id).is_some_and(|n| locks.holds(n)));
+    }
     tops
 }
 
@@ -119,8 +153,16 @@ pub fn objects_at(doc: &Document, p: Point, opt: HitOptions, scope: Option<NodeI
 /// measured by their art ([`Node::geometric_bounds_with`]).
 fn objects_at_layer(layer: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes, tops: &mut Vec<NodeId>, seen: &mut HashSet<NodeId>) -> bool {
     let Some(children) = layer.children() else { return true };
-    if layer.clips() && children.first().is_some_and(|clip| !clip_contains(clip, p)) {
-        return true;
+    if layer.clips()
+        && let Some(clip) = children.first()
+    {
+        // As the hit test does: the clipping mask's outline first, then only inside the mask.
+        if clip_outline_hit(layer, clip, p, opt, symbols, true).is_some() && seen.insert(clip.id) {
+            tops.push(clip.id);
+        }
+        if !clip_contains(clip, p) {
+            return true;
+        }
     }
     let opt = if matches!(layer.kind, NodeKind::Layer { preview: false, .. }) { HitOptions { outline: true, ..opt } } else { opt };
     for (i, c) in children.iter().enumerate().rev() {
@@ -243,14 +285,24 @@ fn locked_hit(n: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes) -> boo
     }
 }
 
-/// [`hit_test`] passing over the nodes `skip` names (and their contents). Symbol instances are
-/// measured by their art ([`Node::geometric_bounds_with`]).
+/// [`hit_test`] passing over the nodes `skip` names (and their contents), and with
+/// `editable_only` over the objects of layers and sublayers on a locked artboard, and over all of
+/// an isolated group on one ([`crate::LockedArtboards::holds`]). Symbol instances are measured by their art
+/// ([`Node::geometric_bounds_with`]).
 fn hit_test_skipping(doc: &Document, p: Point, opt: HitOptions, skip: &dyn Fn(NodeId) -> bool, editable_only: bool) -> Option<Hit> {
     let finish = |mut h: Hit| {
         h.contents_of = h.ancestry.iter().rev().copied().find(|a| doc.node(*a).is_some_and(edits_contents));
         h.layers = h.ancestry.iter().take_while(|a| doc.node(**a).is_some_and(Node::is_layer)).count();
         h
     };
+    let locks = doc.locked_artboards();
+    let on_locked = |id: NodeId| {
+        editable_only
+            && !locks.is_empty()
+            && doc.parent_of(id).and_then(|l| doc.node(l)).is_some_and(Node::is_layer)
+            && doc.node(id).is_some_and(|n| locks.holds(n))
+    };
+    let skip = &|id| skip(id) || on_locked(id);
     let symbols = doc.symbol_boxes();
     // Isolation mode: only what is inside the isolated container hits. The art around it is
     // locked, and clicks pass through it (#833).
@@ -259,6 +311,10 @@ fn hit_test_skipping(doc: &Document, p: Point, opt: HitOptions, skip: &dyn Fn(No
         && let Some(isolated) = doc.node(scope)
         && let Some(mut chain) = doc.ancestry(scope)
     {
+        // Isolated before its artboard was locked: nothing in it hits.
+        if locks.holds_id(scope) {
+            return None;
+        }
         if isolated.is_container() {
             return hit_children(isolated, p, opt, &symbols, skip, &mut chain, editable_only).map(finish);
         }
@@ -294,29 +350,74 @@ fn edits_contents(n: &Node) -> bool {
 /// Is `p` inside the region `clip` clips to ([`Node::clip_shapes`])? Text counts by its frame:
 /// glyph outlines need the font engine, above this crate.
 fn clip_contains(clip: &Node, p: Point) -> bool {
+    clip_regions(clip).iter().any(|(bp, rule)| fill_contains(bp, *rule, p))
+}
+
+/// The regions `clip` clips to ([`Node::clip_shapes`]), text counted by its frame as in
+/// [`clip_contains`].
+fn clip_regions(clip: &Node) -> Vec<(vectorcraft_geom::BezPath, vectorcraft_geom::FillRule)> {
     let frame = |n: &Node| {
         let b = n.geometric_bounds()?;
         Some(Node::path(n.id, vectorcraft_geom::shapes::rectangle(b), Default::default()))
     };
-    clip.clip_shapes(Some(&frame)).iter().any(|(bp, rule)| fill_contains(bp, *rule, p))
+    clip.clip_shapes(Some(&frame))
 }
 
 /// Can a click at `p` hit `c`, the child `i` of `parent`, or something inside it? Not when it is
 /// hidden, when it can't be edited (`editable_only`), when it is the part of a Shaper group that
 /// isn't shown, or when `p` is outside its reach.
 fn may_hit(parent: &Node, i: usize, c: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes, editable_only: bool) -> bool {
-    let source_isolated = |n: &Node| n.children().and_then(|children| children.first()).is_some_and(|source| Some(source.id) == opt.scope);
-    if parent.extras().shaper.is_some() && (i == 0) != source_isolated(parent) {
+    if shaper_hides(parent, i, opt.scope) {
         return false;
     }
     // Read-only samples can read locked/template art; hidden art never participates.
     if !c.visible || editable_only && (c.locked || c.is_template()) {
         return false;
     }
+    if opt.skip_guides && matches!(c.kind, NodeKind::Path { guide: true, .. }) {
+        return false;
+    }
     // (An envelope's content sits where it was, not where the envelope draws it.)
     edits_contents(c)
-        || c.extras().shaper.is_some() && source_isolated(c)
+        || c.extras().shaper.is_some() && source_of(c, opt.scope)
         || c.reach_bounds_with(symbols).is_none_or(|b| b.inflate(opt.tol, opt.tol).contains(p))
+}
+
+/// Is the first child of `n` the isolated container `scope`?
+fn source_of(n: &Node, scope: Option<NodeId>) -> bool {
+    n.children().and_then(|children| children.first()).is_some_and(|source| Some(source.id) == scope)
+}
+
+/// Do clicks and marquees skip the child `i` of `parent` with `scope` isolated? For a Shaper
+/// Group that is its original shapes (its first child), or, in Construction mode, when they are
+/// isolated, the art the group shows.
+fn shaper_hides(parent: &Node, i: usize, scope: Option<NodeId>) -> bool {
+    parent.extras().shaper.is_some() && (i == 0) != source_of(parent, scope)
+}
+
+/// A press on the outline of clipping path `clip` (a path or a compound path; type clips by its
+/// glyphs, which this crate cannot outline), within the tolerance.
+fn clip_outline(clip: &Node, p: Point, opt: HitOptions) -> Option<HitKind> {
+    let bp = match &clip.kind {
+        NodeKind::Path { path, .. } => path.to_bezpath(),
+        NodeKind::Compound { .. } => clip.stroke_path()?,
+        _ => return None,
+    };
+    stroke_contains(&bp, 0.0, opt.tol, p).then_some(HitKind::Outline)
+}
+
+/// For the selection tools ([`HitOptions::clip_outlines`]), a press on the outline of `clip`, the
+/// clipping path of `parent` (a clip group or a layer with a clipping mask), within the tolerance:
+/// it is hit before the art it clips. There Direct Selection takes its segments, and the
+/// Selection tool the clip group. The reference app reshapes a clipping path with Direct Selection
+/// (<https://helpx.adobe.com/illustrator/desktop/manage-objects/edit-objects/edit-clipping-masks.html>);
+/// without this, art drawn over the path's edge is hit first and its segments can't be dragged.
+/// The clipping path must be one a click may hit ([`may_hit`]: visible, editable, within reach).
+fn clip_outline_hit(parent: &Node, clip: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes, editable_only: bool) -> Option<HitKind> {
+    if !opt.clip_outlines || !editable_only || !may_hit(parent, 0, clip, p, opt, symbols, editable_only) {
+        return None;
+    }
+    clip_outline(clip, p, opt)
 }
 
 fn hit_children(
@@ -329,12 +430,17 @@ fn hit_children(
     editable_only: bool,
 ) -> Option<Hit> {
     let children = parent.children()?;
-    // A clip group (or a layer with a clipping mask) only hits inside its clipping path.
     if parent.clips()
         && let Some(clip) = children.first()
-        && !clip_contains(clip, p)
     {
-        return None;
+        if let Some(kind) = clip_outline_hit(parent, clip, p, opt, symbols, editable_only).filter(|_| !skip(clip.id)) {
+            chain.push(clip.id);
+            return Some(Hit { leaf: clip.id, ancestry: chain.clone(), kind, contents_of: None, layers: 1 });
+        }
+        // Elsewhere a clip group (or a layer with a clipping mask) only hits inside it.
+        if !clip_contains(clip, p) {
+            return None;
+        }
     }
     for i in hit_order(parent, children, p) {
         let Some(c) = children.get(i) else { continue };
@@ -416,13 +522,32 @@ fn hit_leaf(n: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes) -> Optio
             n.geometric_bounds().filter(|b| b.inflate(opt.tol, opt.tol).contains(p))?;
             on_type_path(n, t, p, opt.tol).then_some(HitKind::Outline)
         }
-        NodeKind::Text(_)
-        | NodeKind::Image(_)
-        | NodeKind::PlacedDocument(_)
-        | NodeKind::SymbolInstance { .. }
-        | NodeKind::Blend { .. }
-        | NodeKind::Envelope { .. } => n.geometric_bounds_with(symbols).filter(|b| b.inflate(opt.tol, opt.tol).contains(p)).map(|_| HitKind::Bounds),
-        NodeKind::Repeat(r) => r.expand().iter().find_map(|g| hit_any(g, p, opt, symbols)),
+        // An image is hit within its frame (on the frame's edge only with Selection by Path Only,
+        // #3291), and where its own fills and strokes paint ([`image_paint`]) except in outline
+        // mode.
+        NodeKind::Image(im) => {
+            if opt.path_only {
+                use vectorcraft_geom::kurbo::Shape;
+                let mut frame = Rect::new(0.0, 0.0, f64::from(im.width), f64::from(im.height)).to_path(0.1);
+                frame.apply_affine(im.xf);
+                if stroke_contains(&frame, 0.0, opt.tol, p) {
+                    return Some(HitKind::Outline);
+                }
+            } else if n.geometric_bounds_with(symbols).is_some_and(|b| b.inflate(opt.tol, opt.tol).contains(p)) {
+                return Some(HitKind::Bounds);
+            }
+            if opt.outline {
+                return None;
+            }
+            image_paint(n).iter().rev().find_map(|(bp, rule, item)| match item {
+                AppearanceItem::Stroke(s) => s.hits(bp, *rule, p, opt.tol).then_some(HitKind::Stroke),
+                AppearanceItem::Fill(_) => (!opt.path_only && fill_contains(bp, *rule, p)).then_some(HitKind::Fill),
+            })
+        }
+        NodeKind::Text(_) | NodeKind::PlacedDocument(_) | NodeKind::SymbolInstance { .. } | NodeKind::Blend { .. } | NodeKind::Envelope { .. } => {
+            n.geometric_bounds_with(symbols).filter(|b| b.inflate(opt.tol, opt.tol).contains(p)).map(|_| HitKind::Bounds)
+        }
+        NodeKind::Repeat(r) => r.expand(Some(symbols.document())).iter().find_map(|g| hit_any(g, p, opt, symbols)),
         NodeKind::Mesh(m) => {
             let bp = m.outline().to_bezpath();
             if stroke_contains(&bp, 0.0, opt.tol, p) {
@@ -464,15 +589,40 @@ fn hit_any(n: &Node, p: Point, opt: HitOptions, symbols: &SymbolBoxes) -> Option
     }
 }
 
-/// Objects (children of layers, or of `scope` in isolation mode) touched by a marquee rect. Symbol
-/// instances are measured by their art ([`Node::geometric_bounds_with`]).
+/// The path of compound path `n` under `p`, for the Group Selection tool: the one whose outline is
+/// within `tol`, else the innermost one whose area holds `p` (a hole inside an outer shape, an
+/// island inside a hole). `None` when `n` isn't a compound path or no part is under `p`.
+pub fn compound_part_at(n: &Node, p: Point, tol: f64) -> Option<NodeId> {
+    let NodeKind::Compound { children, rule } = &n.kind else { return None };
+    let parts: Vec<_> = children.iter().rev().filter_map(|c| c.path_data().map(|pd| (c.id, pd.to_bezpath(), pd.bounds()))).collect();
+    if let Some((id, ..)) = parts.iter().find(|(_, bp, _)| stroke_contains(bp, 0.0, tol, p)) {
+        return Some(*id);
+    }
+    // The innermost by the size of its box.
+    let size = |b: &Option<Rect>| b.map_or(f64::INFINITY, |b| b.area());
+    parts.iter().filter(|(_, bp, _)| fill_contains(bp, *rule, p)).min_by(|a, b| size(&a.2).total_cmp(&size(&b.2))).map(|(id, ..)| *id)
+}
+
+/// Objects (children of layers, or of `scope` in isolation mode) touched by a marquee rect, leaving
+/// out those on a locked artboard ([`crate::LockedArtboards::holds_id`]). Symbol instances are measured
+/// by their art ([`Node::geometric_bounds_with`]). The art of a clip group or of a layer with a
+/// clipping mask counts only when the marquee meets the region its clipping path clips to, and then
+/// only within that region's bounds.
 pub fn marquee(doc: &Document, r: Rect, scope: Option<NodeId>, leaves: bool) -> Vec<NodeId> {
     let mut out = Vec::new();
-    let tops: Vec<&std::sync::Arc<Node>> = match scope.and_then(|s| doc.node(s)) {
-        Some(s) => match s.children() {
-            Some(c) => c.iter().collect(),
+    // `tops` pairs each object with the part of `r` in which the marquee can touch it.
+    let tops: Vec<(&std::sync::Arc<Node>, Rect)> = match scope.and_then(|s| doc.node(s)) {
+        Some(s) => match (s.children(), marquee_in(s, r)) {
+            (Some(c), Some(r)) => c.iter().enumerate().filter(|(i, _)| !shaper_hides(s, *i, scope)).map(|(_, c)| (c, r)).collect(),
+            (Some(_), None) => vec![],
             // A single object isolated: only it.
-            None => doc.parent_of(s.id).and_then(|p| doc.node(p)).and_then(Node::children).into_iter().flatten().filter(|c| c.id == s.id).collect(),
+            (None, _) => doc
+                .parent_of(s.id)
+                .and_then(|p| doc.node(p))
+                .and_then(|p| Some((p.children()?, marquee_in(p, r)?)))
+                .into_iter()
+                .flat_map(|(c, r)| c.iter().filter(|c| c.id == s.id).map(move |c| (c, r)))
+                .collect(),
         },
         // The objects of the layers, looking through sublayers (hidden, locked and template ones
         // are left out).
@@ -480,28 +630,36 @@ pub fn marquee(doc: &Document, r: Rect, scope: Option<NodeId>, leaves: bool) -> 
             .layers
             .iter()
             .filter(|l| l.visible && !l.locked && !l.is_template() && doc.pattern_edit.as_ref().is_none_or(|e| e.layer == l.id))
-            .flat_map(|l| layer_objects(l))
+            .flat_map(|l| layer_objects(l, r))
             .collect(),
     };
-    fn layer_objects(l: &Node) -> Vec<&std::sync::Arc<Node>> {
+    /// The objects of layer `l`, each with the part of `r` that the clipping masks of `l` and of
+    /// the sublayers it is in leave.
+    fn layer_objects(l: &Node, r: Rect) -> Vec<(&std::sync::Arc<Node>, Rect)> {
         let mut out = vec![];
+        let Some(r) = marquee_in(l, r) else { return out };
         for c in l.children().into_iter().flatten() {
             if c.is_layer() {
                 if c.visible && !c.locked && !c.is_template() {
-                    out.extend(layer_objects(c));
+                    out.extend(layer_objects(c, r));
                 }
             } else {
-                out.push(c);
+                out.push((c, r));
             }
         }
         out
     }
-    fn touches(n: &Node, s: &SymbolBoxes, r: Rect) -> bool {
+    /// Does the marquee `r` touch `n`? It skips the children of a Shaper Group that clicks skip
+    /// ([`shaper_hides`]). An Intertwine group is touched by its members, and a repeat is touched
+    /// by the copies it draws, as clicks hit them. Objects of every other kind except paths,
+    /// compound paths, layers and groups are touched by their box.
+    fn touches(n: &Node, s: &SymbolBoxes, r: Rect, scope: Option<NodeId>) -> bool {
         match &n.kind {
             NodeKind::Path { path, .. } => vectorcraft_geom::hit::intersects_rect(path, r),
-            NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } | NodeKind::Compound { children, .. } => {
-                children.iter().any(|c| c.visible && touches(c, s, r))
-            }
+            NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } | NodeKind::Intertwine { children } => marquee_in(n, r)
+                .is_some_and(|r| children.iter().enumerate().any(|(i, c)| c.visible && !shaper_hides(n, i, scope) && touches(c, s, r, scope))),
+            NodeKind::Compound { children, .. } => children.iter().any(|c| c.visible && touches(c, s, r, scope)),
+            NodeKind::Repeat(spec) => spec.expand(Some(s.document())).iter().any(|copy| touches(copy, s, r, scope)),
             // A box with no width or no height (an instance of a symbol that draws a straight
             // line) is touched where the marquee crosses it.
             _ => n.geometric_bounds_with(s).is_some_and(|b| {
@@ -510,34 +668,66 @@ pub fn marquee(doc: &Document, r: Rect, scope: Option<NodeId>, leaves: bool) -> 
             }),
         }
     }
-    fn collect_leaves(n: &Node, s: &SymbolBoxes, r: Rect, out: &mut Vec<NodeId>) {
+    fn collect_leaves(n: &Node, s: &SymbolBoxes, r: Rect, scope: Option<NodeId>, out: &mut Vec<NodeId>) {
         match &n.kind {
-            NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } => {
-                for c in children {
-                    if c.visible && !c.locked {
-                        collect_leaves(c, s, r, out);
+            NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } | NodeKind::Intertwine { children } => {
+                let Some(r) = marquee_in(n, r) else { return };
+                for (i, c) in children.iter().enumerate() {
+                    if c.visible && !c.locked && !shaper_hides(n, i, scope) {
+                        collect_leaves(c, s, r, scope, out);
                     }
                 }
             }
             _ => {
-                if touches(n, s, r) {
+                if touches(n, s, r, scope) {
                     out.push(n.id);
                 }
             }
         }
     }
     let symbols = doc.symbol_boxes();
-    for t in tops {
-        if !t.visible || t.locked {
+    let locks = doc.locked_artboards();
+    for (t, r) in tops {
+        if !t.visible || t.locked || locks.holds_id(t.id) {
             continue;
         }
         if leaves {
-            collect_leaves(t, &symbols, r, &mut out);
-        } else if touches(t, &symbols, r) {
+            collect_leaves(t, &symbols, r, scope, &mut out);
+        } else if touches(t, &symbols, r, scope) {
             out.push(t.id);
         }
     }
     out
+}
+
+/// The part of a marquee `r` in which it can touch the children of `parent`. For a clip group or a
+/// layer with a clipping mask, this is what [`marquee_in_clip`] returns for its clipping path (None
+/// when the marquee misses it); otherwise it is all of `r`.
+fn marquee_in(parent: &Node, r: Rect) -> Option<Rect> {
+    match parent.children().and_then(|c| c.first()) {
+        Some(clip) if parent.clips() => marquee_in_clip(clip, r),
+        _ => Some(r),
+    }
+}
+
+/// The part of a marquee `r` in which it can touch the art that `clip` clips (the clipping path of
+/// a clip group or of a layer with a clipping mask): `r` cut to the bounds of the regions `clip`
+/// clips to ([`clip_regions`]), or `None` when `r` meets none of those regions. Within those
+/// bounds, art outside a region that is not a rectangle still counts.
+fn marquee_in_clip(clip: &Node, r: Rect) -> Option<Rect> {
+    use vectorcraft_geom::kurbo::Shape;
+    let regions = clip_regions(clip);
+    // The edge of a region is its outline with each open subpath closed, as `fill_contains` fills it.
+    let meets = |(bp, rule): &(vectorcraft_geom::BezPath, vectorcraft_geom::FillRule)| {
+        let mut edge = vectorcraft_geom::PathData::from_bezpath(bp);
+        edge.subpaths.iter_mut().for_each(|sp| sp.closed = true);
+        fill_contains(bp, *rule, r.center()) || vectorcraft_geom::hit::intersects_rect(&edge, r)
+    };
+    if !regions.iter().any(meets) {
+        return None;
+    }
+    let bounds = regions.iter().map(|(bp, _)| bp.bounding_box()).reduce(|a, b| a.union(b))?;
+    Some(r.intersect(bounds))
 }
 
 #[cfg(test)]
@@ -613,6 +803,299 @@ mod tests {
         assert!(marquee(&d, Rect::new(100.0, 100.0, 105.0, 105.0), None, false).is_empty());
     }
 
+    /// The art of a 200 pt wide rectangle clipped to its left half (0..100 × 0..100): the mask and
+    /// the art, in that order.
+    fn half_clipped(d: &mut Document) -> (Node, Node) {
+        let mask = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0)), Appearance::default());
+        let art = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 0.0, 200.0, 100.0)), Appearance::default_art());
+        (mask, art)
+    }
+
+    /// #2345: a marquee touches a clip group only where its art shows. Over the clipped-away
+    /// half alone it selects nothing, and around a rectangle drawn beside the group's mask it
+    /// takes that rectangle alone; reaching into the mask takes the group. The same holds for
+    /// Group Selection's leaves and in isolation mode.
+    #[test]
+    fn a_marquee_leaves_a_clip_group_by_its_clipped_away_art() {
+        let mut d = Document::new(300.0, 200.0);
+        let l = d.layers[0].id;
+        let (mask, art) = half_clipped(&mut d);
+        let (g, art_id, beside) = (d.alloc_id(), art.id, d.alloc_id());
+        let mut clip = Node::group(g, vec![Arc::new(mask), Arc::new(art)]);
+        clip.set_clips(true);
+        d.insert(Some(l), 0, clip).unwrap();
+        d.insert(Some(l), 1, Node::path(beside, shapes::rectangle(Rect::new(150.0, 80.0, 190.0, 130.0)), Appearance::default_art())).unwrap();
+        // This marquee crosses only the hidden art's top and right edges.
+        let hidden = Rect::new(150.0, -10.0, 210.0, 50.0);
+        assert!(marquee(&d, hidden, None, false).is_empty());
+        assert!(marquee(&d, hidden, None, true).is_empty());
+        assert!(marquee(&d, hidden, Some(g), false).is_empty());
+        assert!(marquee(&d, hidden, Some(art_id), false).is_empty());
+        // This marquee surrounds the rectangle beside and crosses the hidden art's bottom edge.
+        assert_eq!(marquee(&d, Rect::new(140.0, 70.0, 195.0, 140.0), None, false), vec![beside]);
+        // This marquee crosses the shown half's top edge and goes on into the hidden half.
+        let shown = Rect::new(50.0, -10.0, 160.0, 10.0);
+        assert_eq!(marquee(&d, shown, None, false), vec![g]);
+        assert!(marquee(&d, shown, None, true).contains(&art_id));
+        assert_eq!(marquee(&d, shown, Some(g), false).len(), 2, "the mask and the art");
+    }
+
+    /// #2345: in the corner of a diamond mask's box, outside the diamond, a marquee over the
+    /// clipped art's corner leaves the clip group. An open mask clips to its area closed by a
+    /// straight line, and a marquee across that line takes the art it reaches inside.
+    #[test]
+    fn a_marquee_must_meet_the_clipping_path_itself() {
+        // A clip group of a mask through `pts` (closed or open) over the art `art`.
+        let clipped = |pts: &[(f64, f64)], closed: bool, art: Rect| {
+            let mut d = Document::new(200.0, 200.0);
+            let l = d.layers[0].id;
+            let mut mask = vectorcraft_geom::BezPath::new();
+            mask.move_to(pts[0]);
+            for &p in &pts[1..] {
+                mask.line_to(p);
+            }
+            if closed {
+                mask.close_path();
+            }
+            let mask = Node::path(d.alloc_id(), vectorcraft_geom::PathData::from_bezpath(&mask), Appearance::default());
+            let art = Node::path(d.alloc_id(), shapes::rectangle(art), Appearance::default_art());
+            let g = d.alloc_id();
+            let mut clip = Node::group(g, vec![Arc::new(mask), Arc::new(art)]);
+            clip.set_clips(true);
+            d.insert(Some(l), 0, clip).unwrap();
+            (d, g)
+        };
+        let (d, g) = clipped(&[(50.0, 0.0), (100.0, 50.0), (50.0, 100.0), (0.0, 50.0)], true, Rect::new(0.0, 0.0, 100.0, 100.0));
+        assert!(marquee(&d, Rect::new(-10.0, -10.0, 10.0, 10.0), None, false).is_empty());
+        assert_eq!(marquee(&d, Rect::new(-10.0, 40.0, 10.0, 60.0), None, false), vec![g], "over the diamond's left point");
+        // The mask is the triangle above the line from (0, 0) to (100, 100), and the art lies inside it.
+        let (d, g) = clipped(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)], false, Rect::new(55.0, 40.0, 70.0, 50.0));
+        assert_eq!(marquee(&d, Rect::new(40.0, 45.0, 60.0, 70.0), None, false), vec![g]);
+    }
+
+    /// #2345: the objects of a layer or sublayer with a clipping mask are touched only where the
+    /// mask shows them, as in a clip group.
+    #[test]
+    fn a_marquee_leaves_art_a_layer_clips_away() {
+        for sublayer in [false, true] {
+            let mut d = Document::new(300.0, 200.0);
+            let l = d.layers[0].id;
+            let beside = d.alloc_id();
+            d.insert(Some(l), 0, Node::path(beside, shapes::rectangle(Rect::new(150.0, 80.0, 190.0, 130.0)), Appearance::default_art())).unwrap();
+            let masked = d.alloc_id();
+            let mut layer = Node::layer(masked, "Masked", crate::LayerColor::Preset(2));
+            layer.set_clips(true);
+            d.insert(sublayer.then_some(l), 9, layer).unwrap();
+            let (mask, art) = half_clipped(&mut d);
+            let (mask_id, art_id) = (mask.id, art.id);
+            d.insert(Some(masked), 0, mask).unwrap();
+            d.insert(Some(masked), 1, art).unwrap();
+            assert!(marquee(&d, Rect::new(150.0, -10.0, 210.0, 50.0), None, false).is_empty(), "sublayer: {sublayer}");
+            assert_eq!(marquee(&d, Rect::new(140.0, 70.0, 195.0, 140.0), None, false), vec![beside], "sublayer: {sublayer}");
+            assert_eq!(marquee(&d, Rect::new(50.0, -10.0, 160.0, 10.0), None, false), vec![mask_id, art_id], "sublayer: {sublayer}");
+        }
+    }
+
+    /// A marquee touches a Shaper Group only by the art it shows, as clicks do ([`may_hit`]): over
+    /// the original shape of a face the group erased it selects nothing, with Group Selection's
+    /// leaves too, and over a face it shows it takes the group. With the original shapes isolated
+    /// (Construction mode) it takes the original shape it reaches.
+    #[test]
+    fn a_marquee_leaves_a_shaper_group_by_its_original_shapes() {
+        let mut d = Document::new(300.0, 200.0);
+        let l = d.layers[0].id;
+        // Two original squares, 0..100 and 50..150; the group shows only the first one's face.
+        let square = |x: f64| shapes::rectangle(Rect::new(x, 0.0, x + 100.0, 100.0));
+        let a = Node::path(d.alloc_id(), square(0.0), Appearance::default_art());
+        let b = Node::path(d.alloc_id(), square(50.0), Appearance::default_art());
+        let b_id = b.id;
+        let mut sources = Node::group(d.alloc_id(), vec![Arc::new(a), Arc::new(b)]);
+        sources.name = Some(crate::shaper::SOURCES.into());
+        sources.opacity = 0.0;
+        let sources_id = sources.id;
+        let mut face = Node::path(d.alloc_id(), square(0.0), Appearance::default_art());
+        face.name = Some(format!("{}0", crate::shaper::FILL_PREFIX));
+        let face_id = face.id;
+        let g = d.alloc_id();
+        let mut group = Node::group(g, vec![Arc::new(sources), Arc::new(face)]);
+        group.extras_mut().shaper = Some(Box::default());
+        d.insert(Some(l), 0, group).unwrap();
+        // This marquee crosses only the right edge of the second square, whose face is erased.
+        let erased = Rect::new(140.0, 40.0, 160.0, 60.0);
+        assert!(hit_test(&d, Point::new(150.0, 50.0), HitOptions::default()).is_none(), "a click there misses");
+        assert!(marquee(&d, erased, None, false).is_empty());
+        assert!(marquee(&d, erased, None, true).is_empty());
+        assert!(marquee(&d, erased, Some(g), false).is_empty());
+        // This marquee crosses the shown face's left edge.
+        let shown = Rect::new(-10.0, 40.0, 10.0, 60.0);
+        assert_eq!(marquee(&d, shown, None, false), vec![g]);
+        assert_eq!(marquee(&d, shown, None, true), vec![face_id]);
+        assert_eq!(marquee(&d, shown, Some(g), false), vec![face_id]);
+        // Construction mode: the original shapes are the objects.
+        assert_eq!(marquee(&d, erased, Some(sources_id), false), vec![b_id]);
+    }
+
+    /// A marquee touches an Intertwine group by its members, as it touches a plain group (#1103) and
+    /// as clicks do: in the gap between two members, or inside one member's fill, it selects nothing.
+    /// Across a member's edge it selects the group, and with the leaves that Direct and Group
+    /// Selection take, or in isolation mode, it selects the member.
+    #[test]
+    fn a_marquee_meets_an_intertwine_group_by_its_members() {
+        let mut d = Document::new(300.0, 200.0);
+        let l = d.layers[0].id;
+        // Two squares, 0..100 and 150..250, with a gap between them inside the group's box.
+        let square = |x: f64| shapes::rectangle(Rect::new(x, 0.0, x + 100.0, 100.0));
+        let mut a = Node::path(d.alloc_id(), square(0.0), Appearance::default_art());
+        a.extras_mut().intertwine = Some(Box::new(shapes::rectangle(Rect::new(50.0, 0.0, 100.0, 100.0))));
+        let b = Node::path(d.alloc_id(), square(150.0), Appearance::default_art());
+        let (a_id, g) = (a.id, d.alloc_id());
+        d.insert(Some(l), 0, Node::new(g, NodeKind::Intertwine { children: vec![Arc::new(a), Arc::new(b)] })).unwrap();
+        let gap = Rect::new(110.0, 40.0, 140.0, 60.0);
+        assert!(hit_test(&d, gap.center(), HitOptions::default()).is_none(), "a click in the gap misses");
+        assert!(marquee(&d, gap, None, false).is_empty());
+        assert!(marquee(&d, gap, None, true).is_empty());
+        assert!(marquee(&d, gap, Some(g), false).is_empty());
+        assert!(marquee(&d, Rect::new(20.0, 20.0, 40.0, 40.0), None, false).is_empty(), "inside a member's fill");
+        // This marquee crosses the first square's left edge.
+        let edge = Rect::new(-10.0, 40.0, 10.0, 60.0);
+        assert_eq!(marquee(&d, edge, None, false), vec![g]);
+        assert_eq!(marquee(&d, edge, None, true), vec![a_id]);
+        assert_eq!(marquee(&d, edge, Some(g), false), vec![a_id]);
+    }
+
+    /// A marquee touches a repeat by the copies it draws, as clicks do: between two copies of a
+    /// grid repeat it selects nothing, and across a copy's edge it takes the repeat.
+    #[test]
+    fn a_marquee_meets_a_repeat_by_its_copies() {
+        let mut d = Document::new(300.0, 200.0);
+        let l = d.layers[0].id;
+        let source = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 0.0, 20.0, 20.0)), Appearance::default_art());
+        // Copies at 0..20, 40..60 and 80..100.
+        let kind = crate::pattern::RepeatKind::Grid {
+            h_spacing: 20.0,
+            v_spacing: 20.0,
+            rows: 1,
+            cols: 3,
+            grid_type: crate::pattern::TileType::Grid,
+            flip_rows: false,
+            flip_cols: false,
+        };
+        let r = d.alloc_id();
+        d.insert(Some(l), 0, Node::new(r, NodeKind::Repeat(crate::pattern::RepeatSpec { kind, source: vec![Arc::new(source)] }))).unwrap();
+        let gap = Rect::new(25.0, 5.0, 35.0, 15.0);
+        assert!(hit_test(&d, gap.center(), HitOptions::default()).is_none(), "a click between copies misses");
+        assert!(marquee(&d, gap, None, false).is_empty());
+        assert!(marquee(&d, gap, None, true).is_empty());
+        assert_eq!(marquee(&d, Rect::new(35.0, 5.0, 45.0, 15.0), None, false), vec![r], "across the second copy's left edge");
+        assert_eq!(marquee(&d, Rect::new(35.0, 5.0, 45.0, 15.0), None, true), vec![r]);
+    }
+
+    /// A blend and an envelope are clicked anywhere in their box, and a marquee touches them there
+    /// too: inside the box, away from every key object's and the content's outline, it takes them.
+    #[test]
+    fn a_marquee_meets_blends_and_envelopes_by_their_box() {
+        let mut d = Document::new(300.0, 300.0);
+        let l = d.layers[0].id;
+        let square = |id, x: f64, y: f64| Arc::new(Node::path(id, shapes::rectangle(Rect::new(x, y, x + 20.0, y + 20.0)), Appearance::default_art()));
+        let blend = d.alloc_id();
+        let keys = vec![square(d.alloc_id(), 0.0, 0.0), square(d.alloc_id(), 100.0, 0.0)];
+        d.insert(Some(l), 0, Node::new(blend, NodeKind::Blend { children: keys, spec: Default::default() })).unwrap();
+        let envelope = d.alloc_id();
+        let content = vec![Arc::new(Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 150.0, 100.0, 250.0)), Appearance::default_art()))];
+        let e = Node::new(
+            envelope,
+            NodeKind::Envelope {
+                content,
+                kind: Box::new(crate::live::EnvelopeKind::Warp { style: "arc".to_string(), bend: 0.0, h: 0.0, v: 0.0, horizontal: true }),
+                fidelity: 100.0,
+                editing: false,
+                options: Default::default(),
+                frame: Box::new(vectorcraft_geom::Affine::IDENTITY),
+            },
+        );
+        d.insert(Some(l), 1, e).unwrap();
+        for (r, id) in [(Rect::new(50.0, 5.0, 60.0, 15.0), blend), (Rect::new(40.0, 190.0, 60.0, 210.0), envelope)] {
+            assert_eq!(hit_test(&d, r.center(), HitOptions::default()).map(|h| h.leaf), Some(id));
+            assert_eq!(marquee(&d, r, None, false), vec![id]);
+            assert_eq!(marquee(&d, r, None, true), vec![id]);
+        }
+    }
+
+    /// A rectangle (40, 40)–(140, 140) clipping a filled 200 × 200 square drawn over its edges, in a
+    /// clip group (or, `layer`, as the first layer's clipping mask): the group (or the layer), the
+    /// clipping path and the art.
+    fn masked_square(layer: bool) -> (Document, NodeId, NodeId, NodeId) {
+        let mut d = Document::new(200.0, 200.0);
+        let l = d.layers[0].id;
+        let (g, clip, art) = (d.alloc_id(), d.alloc_id(), d.alloc_id());
+        let mut path = Node::path(clip, shapes::rectangle(Rect::new(40.0, 40.0, 140.0, 140.0)), Appearance::basic(Paint::None, Paint::None, 0.0));
+        if let NodeKind::Path { clipping, .. } = &mut path.kind {
+            *clipping = true;
+        }
+        let picture = Node::path(art, shapes::rectangle(Rect::new(0.0, 0.0, 200.0, 200.0)), Appearance::default_art());
+        if layer {
+            d.insert(Some(l), 0, path).unwrap();
+            d.insert(Some(l), 1, picture).unwrap();
+            d.node_mut(l).unwrap().set_clips(true);
+            (d, l, clip, art)
+        } else {
+            d.insert(Some(l), 0, Node::new(g, NodeKind::Group { children: vec![Arc::new(path), Arc::new(picture)], clip: true })).unwrap();
+            (d, g, clip, art)
+        }
+    }
+
+    const SELECTING: HitOptions =
+        HitOptions { tol: 3.0, outline: false, path_only: false, type_path_only: false, skip_guides: false, clip_outlines: true, scope: None };
+
+    /// For the selection tools a clip group's clipping path is hit on its outline, within the
+    /// tolerance, before the art it clips and just outside it too; inside, the art is hit.
+    #[test]
+    fn a_clipping_path_is_hit_on_its_outline_before_its_art() {
+        let (d, g, clip, art) = masked_square(false);
+        for (x, y) in [(140.0, 90.0), (141.5, 90.0), (138.5, 90.0), (90.0, 40.0)] {
+            let h = hit_test(&d, Point::new(x, y), SELECTING).unwrap();
+            assert_eq!((h.leaf, h.kind, h.top_object(None)), (clip, HitKind::Outline, g), "at {x}, {y}");
+        }
+        let h = hit_test(&d, Point::new(90.0, 90.0), SELECTING).unwrap();
+        assert_eq!((h.leaf, h.top_object(None)), (art, g));
+        // Beyond the tolerance outside it, the clipped art is not there to hit.
+        assert!(hit_test(&d, Point::new(150.0, 90.0), SELECTING).is_none());
+    }
+
+    /// Without `clip_outlines` (the tools that act on what is drawn) and for read-only sampling
+    /// (the eyedropper), the art is hit on the mask's edge, as before: the clipping path paints
+    /// nothing there.
+    #[test]
+    fn only_the_selection_tools_hit_a_clipping_path_on_its_outline() {
+        let (d, _, clip, art) = masked_square(false);
+        let p = Point::new(138.5, 90.0);
+        assert_eq!(hit_test(&d, p, HitOptions::default()).map(|h| h.leaf), Some(art));
+        assert_eq!(hit_test_visible(&d, p, HitOptions::default()).map(|h| h.leaf), Some(art));
+        assert_eq!(hit_test_visible(&d, p, SELECTING).map(|h| h.leaf), Some(art));
+        assert_eq!(hit_test(&d, p, SELECTING).map(|h| h.leaf), Some(clip));
+        // A hidden or locked clipping path is passed over.
+        for change in [|n: &mut Node| n.visible = false, |n: &mut Node| n.locked = true] {
+            let mut d = d.clone();
+            change(d.node_mut(clip).unwrap());
+            assert_ne!(hit_test(&d, p, SELECTING).map(|h| h.leaf), Some(clip));
+        }
+    }
+
+    /// A layer's clipping mask is hit on its outline too, and Select Behind lists what the
+    /// repeated hit test finds: the mask on and just outside its edge, then the art inside it;
+    /// well inside, the art alone (the mask paints nothing there).
+    #[test]
+    fn select_behind_takes_a_layer_masks_outline_first() {
+        let (d, _, clip, art) = masked_square(true);
+        for (x, want) in [(140.0, vec![clip]), (141.5, vec![clip]), (138.5, vec![clip, art]), (90.0, vec![art])] {
+            let p = Point::new(x, 90.0);
+            assert_eq!(objects_at(&d, p, SELECTING, None), want, "x = {x}");
+            assert_eq!(objects_at_repeated(&d, p, SELECTING, None), want, "x = {x}");
+        }
+        // Without clip_outlines, as before.
+        assert_eq!(objects_at(&d, Point::new(138.5, 90.0), HitOptions::default(), None), vec![art, clip]);
+    }
+
     /// Art in a sublayer is an object of its own: a click or a marquee takes it, not the
     /// sublayer; hidden, locked and template sublayers block both.
     #[test]
@@ -678,6 +1161,28 @@ mod tests {
             assert!(hit_test(&d, inside, path_only).is_none(), "path only: the fill of {id:?} doesn't hit");
             assert_eq!(hit_test(&d, edge, path_only).map(|h| h.leaf), Some(id), "path only: the outline does");
         }
+    }
+
+    /// #3291: with Object Selection by Path Only, a placed image is picked on its frame's edge, so
+    /// a path under it can be picked through it.
+    #[test]
+    fn path_only_picks_paths_through_images() {
+        let mut d = Document::new(200.0, 200.0);
+        let l = d.layers[0].id;
+        let (path, image) = (d.alloc_id(), d.alloc_id());
+        d.insert(Some(l), 0, Node::path(path, shapes::rectangle(Rect::new(20.0, 20.0, 60.0, 60.0)), Appearance::default_art())).unwrap();
+        // 100×50 pixels, scaled to 100×100 and moved to (10, 10): over the whole path.
+        let xf = vectorcraft_geom::Affine::translate((10.0, 10.0)) * vectorcraft_geom::Affine::scale_non_uniform(1.0, 2.0);
+        let im = crate::ImageObject { key: "k".into(), width: 100, height: 50, xf, link: None, placement: Default::default(), pixels: None };
+        d.insert(Some(l), 1, Node::new(image, NodeKind::Image(Box::new(im)))).unwrap();
+        let path_only = HitOptions { path_only: true, ..Default::default() };
+        let hit = |p: Point, opt| hit_test(&d, p, opt).map(|h| h.leaf);
+        let (path_edge, inside, image_edge) = (Point::new(20.5, 40.0), Point::new(80.0, 80.0), Point::new(80.0, 109.5));
+        assert_eq!(hit(path_edge, HitOptions::default()), Some(image), "the image covers the path");
+        assert_eq!(hit(inside, HitOptions::default()), Some(image));
+        assert_eq!(hit(path_edge, path_only), Some(path), "path only: the path through the image");
+        assert_eq!(hit(inside, path_only), None, "path only: not inside the image");
+        assert_eq!(hit(image_edge, path_only), Some(image), "path only: the image's frame");
     }
 
     /// Type Object Selection by Path Only: point type is picked on its baseline, area type on its
@@ -907,9 +1412,16 @@ world",
             let mut d = Document::new(120.0, 120.0);
             let layer = d.layers[0].id;
             fill(&mut d, layer, 0, &mut next);
+            // A clipping mask on the layer, or on a sublayer, now and then.
+            let sublayers: Vec<NodeId> = d.layers[0].children().into_iter().flatten().filter(|n| n.is_layer()).map(|n| n.id).collect();
+            for id in std::iter::once(layer).chain(sublayers) {
+                if next(3) == 0 {
+                    d.node_mut(id).unwrap().set_clips(true);
+                }
+            }
             for _ in 0..12 {
                 let p = Point::new(f64::from(next(120)), f64::from(next(120)));
-                let opt = HitOptions { outline: next(5) == 0, path_only: next(5) == 0, ..Default::default() };
+                let opt = HitOptions { outline: next(5) == 0, path_only: next(5) == 0, clip_outlines: next(2) == 0, ..Default::default() };
                 assert_eq!(objects_at(&d, p, opt, None), objects_at_repeated(&d, p, opt, None), "round {round}, {p:?}, {opt:?}");
             }
         }

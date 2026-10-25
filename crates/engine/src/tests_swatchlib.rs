@@ -189,6 +189,38 @@ fn libraries_saved_in_the_user_folder_are_user_defined() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A library kind whose reader panics on a file that holds `trap`, as a parser bug would.
+#[derive(Default)]
+struct Trap(String);
+
+impl cmd::swatchlib::LibraryFile for Trap {
+    const EXTS: &'static [&'static str] = &["trap"];
+    fn read(bytes: &[u8], stem: &str) -> std::result::Result<Self, String> {
+        if bytes == b"trap" {
+            panic!("a parser bug");
+        }
+        Ok(Self(stem.to_string()))
+    }
+    fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// When reading one file of the user library folder panics, `set_user_dir` (as the desktop app
+/// calls it at launch) skips that file and lists the other one.
+#[test]
+fn a_user_library_file_whose_reading_panics_is_skipped() {
+    let dir = temp_dir("user-panic");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Calm.trap"), "calm").unwrap();
+    std::fs::write(dir.join("Loud.trap"), "trap").unwrap();
+    let mut libraries = cmd::swatchlib::Libraries::<Trap>::default();
+    libraries.set_user_dir(Some(dir.to_string_lossy().to_string()));
+    let names: Vec<&str> = libraries.infos().map(|l| l.name.as_str()).collect();
+    assert_eq!(names, ["Calm"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn another_documents_swatches_load_as_a_library() {
     let mut s = session();
@@ -389,6 +421,96 @@ fn loaded_libraries_copy_into_the_user_folder_without_replacing_files() {
     let loaded = run(&mut headless, "swatch.library.load", json!({"dataBase64": kit, "name": "Kit.ase"}))["library"].clone();
     let e = headless.execute("swatch.library.copyToUser", &json!({ "library": loaded })).unwrap_err().to_string();
     assert!(e.contains("no user library folder"), "{e}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A color book opened from a host temporary path (macOS sandbox copies) is stored under its title
+/// when copied into the user library folder (#2996).
+#[test]
+fn copying_a_color_book_from_a_temporary_path_uses_its_title() {
+    fn acb_str(out: &mut Vec<u8>, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        out.extend((units.len() as u32).to_be_bytes());
+        units.iter().for_each(|u| out.extend(u.to_be_bytes()));
+    }
+    let mut bytes = b"8BCB".to_vec();
+    bytes.extend(1u16.to_be_bytes());
+    bytes.extend(3000u16.to_be_bytes());
+    for s in ["$$$/colorbook/Test/title=Test Book^R", "TEST ", " C", "a book"] {
+        acb_str(&mut bytes, s);
+    }
+    bytes.extend(1u16.to_be_bytes());
+    bytes.extend(7u16.to_be_bytes());
+    bytes.extend(0u16.to_be_bytes());
+    bytes.extend(0u16.to_be_bytes());
+    acb_str(&mut bytes, "185");
+    bytes.extend(b"TST001");
+    bytes.extend([228, 0, 43]);
+    bytes.extend(b"spflspot");
+
+    let dir = temp_dir("acb-temp");
+    let user = dir.join("user");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let source = elsewhere.join("tmp1F2C.tmp.acb");
+    std::fs::write(&source, &bytes).unwrap();
+    let source = source.to_string_lossy().to_string();
+
+    let mut s = session();
+    s.swatch_libraries.set_user_dir(Some(user.to_string_lossy().to_string()));
+    let loaded = run(&mut s, "swatch.library.load", json!({ "path": source }))["library"].clone();
+    assert_eq!(run(&mut s, "swatch.library.get", json!({ "library": loaded }))["name"], "Test Book®");
+    let r = run(&mut s, "swatch.library.copyToUser", json!({ "library": loaded }));
+    assert_eq!((r["library"].as_str(), r["name"].as_str(), r["copied"].as_bool()), (Some("user/Test Book®.acb"), Some("Test Book®"), Some(true)));
+    assert_eq!(r["path"], user.join("Test Book®.acb").to_string_lossy().to_string());
+    assert_eq!(std::fs::read(user.join("Test Book®.acb")).unwrap(), bytes);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Color books in the user library folder and opened by path show the file name as the tab title
+/// (#3395), not only the title stored inside the book.
+#[test]
+fn color_book_tab_titles_use_the_file_name() {
+    fn acb_bytes(title: &str) -> Vec<u8> {
+        fn acb_str(out: &mut Vec<u8>, s: &str) {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            out.extend((units.len() as u32).to_be_bytes());
+            units.iter().for_each(|u| out.extend(u.to_be_bytes()));
+        }
+        let mut bytes = b"8BCB".to_vec();
+        bytes.extend(1u16.to_be_bytes());
+        bytes.extend(3000u16.to_be_bytes());
+        for s in [title, "PANTONE ", " C", ""] {
+            acb_str(&mut bytes, s);
+        }
+        bytes.extend(1u16.to_be_bytes());
+        bytes.extend(7u16.to_be_bytes());
+        bytes.extend(0u16.to_be_bytes());
+        bytes.extend(0u16.to_be_bytes());
+        acb_str(&mut bytes, "185");
+        bytes.extend(b"TST001");
+        bytes.extend([228, 0, 43]);
+        bytes.extend(b"spflspot");
+        bytes
+    }
+    let dir = temp_dir("acb-name");
+    let user = dir.join("user");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let on_disk = user.join("PANTONE Solid Coated.acb");
+    std::fs::write(&on_disk, acb_bytes("Internal Book Title")).unwrap();
+    let named = elsewhere.join("Brand Colors.acb");
+    std::fs::write(&named, acb_bytes("Another Internal Title")).unwrap();
+
+    let mut s = session();
+    s.swatch_libraries.set_user_dir(Some(user.to_string_lossy().to_string()));
+    assert_eq!(run(&mut s, "swatch.library.get", json!({ "library": "user/PANTONE Solid Coated.acb" }))["name"], "PANTONE Solid Coated");
+    let loaded = run(&mut s, "swatch.library.load", json!({ "path": named.to_string_lossy() }))["library"].clone();
+    assert_eq!(run(&mut s, "swatch.library.get", json!({ "library": loaded }))["name"], "Brand Colors");
+    let r = run(&mut s, "swatch.library.copyToUser", json!({ "library": loaded }));
+    assert_eq!((r["library"].as_str(), r["name"].as_str(), r["copied"].as_bool()), (Some("user/Brand Colors.acb"), Some("Brand Colors"), Some(true)));
     let _ = std::fs::remove_dir_all(dir);
 }
 

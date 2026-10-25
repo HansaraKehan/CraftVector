@@ -16,6 +16,7 @@
 
 mod backend;
 mod headless;
+mod intake;
 pub mod logging;
 mod prompts;
 mod resources;
@@ -36,6 +37,8 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7979";
 mod tests;
 #[cfg(test)]
 mod tests_batchdraw;
+#[cfg(test)]
+mod tests_concurrency;
 #[cfg(test)]
 mod tests_conventions;
 #[cfg(test)]

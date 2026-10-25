@@ -1,6 +1,7 @@
 //! Screen modes and Presentation Mode (#472): Escape leaves Presentation Mode, F cycles the three
 //! screen modes, and no screen mode is saved with the preferences. In Presentation Mode, ← and →
-//! and a click go between the artboards.
+//! and a click go between the artboards, no other key acts, a right click opens no context menu and
+//! the pointer is the default one.
 
 use serde_json::json;
 use vectorcraft_engine::Session;
@@ -8,7 +9,7 @@ use vectorcraft_engine::Session;
 use crate::VectorcraftApp;
 
 /// One headless frame of the whole window with `events`.
-fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
     let raw =
         egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), events, ..Default::default() };
     let mut out = ctx.run_ui(raw, |ui| {
@@ -16,6 +17,7 @@ fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<egui::Event>
         app.ui(ui);
     });
     out.textures_delta.clear();
+    out
 }
 
 fn escape() -> Vec<egui::Event> {
@@ -119,8 +121,8 @@ fn arrow_keys_go_between_artboards_in_presentation_mode() {
 /// Next does, and the tool gets no press: a click on the rectangle with the Selection tool selects
 /// nothing, and with the Rectangle tool a drag draws nothing and a click pressed and released in
 /// one frame opens no dialog. A drag, also with the middle button or with Space held, leaves the
-/// view as it is, the press that closes the context menu goes to no other artboard, and on the last
-/// artboard a click leaves the view as it is.
+/// view as it is, a right click opens no context menu and goes to no other artboard, and on the
+/// last artboard a click leaves the view as it is.
 #[test]
 fn a_click_goes_to_the_next_artboard_in_presentation_mode() {
     let ctx = egui::Context::default();
@@ -136,10 +138,8 @@ fn a_click_goes_to_the_next_artboard_in_presentation_mode() {
     for e in [vec![right(true)], vec![right(false)], vec![]] {
         frame(&mut app, &ctx, e);
     }
-    assert!(egui::Popup::is_any_open(&ctx), "a right click opens the context menu");
-    click(&mut app, &ctx, middle - egui::vec2(150.0, 0.0));
-    assert!(!egui::Popup::is_any_open(&ctx), "a click closes it");
-    assert_eq!(view(&app).0, 1, "the click that closes the context menu");
+    assert!(!egui::Popup::is_any_open(&ctx), "a right click opens no context menu");
+    assert_eq!(view(&app).0, 1, "a right click");
     app.select_tool("rectangle");
     let button = |button, pos, pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() };
     let to = middle + egui::vec2(80.0, 60.0);
@@ -171,8 +171,8 @@ fn a_click_goes_to_the_next_artboard_in_presentation_mode() {
     assert!(unchanged(&app), "nothing was selected or drawn");
 }
 
-/// In Presentation Mode a tap goes to the next artboard. A tap of two fingers undoes (Enable Touch
-/// Gestures) and goes to no other artboard.
+/// In Presentation Mode a tap goes to the next artboard. A tap of two fingers, which undoes in the
+/// other screen modes (Enable Touch Gestures), undoes nothing and goes to no other artboard.
 #[test]
 fn a_tap_goes_to_the_next_artboard_in_presentation_mode() {
     let ctx = egui::Context::default();
@@ -192,16 +192,75 @@ fn a_tap_goes_to_the_next_artboard_in_presentation_mode() {
     tap(&mut app, 1);
     assert_eq!((view(&app).0, objects(&app)), (1, 1), "a tap");
     tap(&mut app, 2);
-    assert_eq!((view(&app).0, objects(&app)), (1, 0), "two fingers undo the rectangle");
+    assert_eq!((view(&app).0, objects(&app)), (1, 1), "two fingers undo nothing");
+}
+
+/// In Presentation Mode no key but ←, → and Escape acts: Cmd/Ctrl+A selects nothing, P and V pick
+/// no tool, Delete and Backspace delete nothing, Cmd/Ctrl+Z undoes nothing, Enter opens no dialog,
+/// Tab hides no panel and F keeps the screen mode. Escape still leaves the mode, also with a tool
+/// that claims Escape.
+#[test]
+fn no_other_key_works_in_presentation_mode() {
+    use egui::{Key, Modifiers};
+    let ctx = egui::Context::default();
+    let mut app = presenting(&ctx);
+    // A press and release of `key` with `modifiers` held, and the text it types.
+    let press = |key, modifiers: Modifiers, text: Option<&str>| {
+        let k = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+        let mut events = vec![egui::Event::ModifiersChanged(modifiers), k(true)];
+        events.extend(text.map(|t| egui::Event::Text(t.into())));
+        events.extend([k(false), egui::Event::ModifiersChanged(Modifiers::NONE)]);
+        events
+    };
+    app.run("select.none", json!({})).unwrap();
+    frame(&mut app, &ctx, press(Key::A, Modifiers::COMMAND, None));
+    assert!(app.session.active().unwrap().selection.objects.is_empty(), "Cmd/Ctrl+A selected the rectangle");
+    app.run("select.all", json!({})).unwrap();
+    let unchanged = snapshot(&app);
+    let panels = (app.ui.dock, app.ui.toolbar);
+    for (what, events) in [
+        ("Delete", press(Key::Delete, Modifiers::NONE, None)),
+        ("Backspace", press(Key::Backspace, Modifiers::NONE, None)),
+        ("Cmd/Ctrl+Z", press(Key::Z, Modifiers::COMMAND, None)),
+        ("Enter", press(Key::Enter, Modifiers::NONE, None)),
+        ("Tab", press(Key::Tab, Modifiers::NONE, None)),
+        ("F", press(Key::F, Modifiers::NONE, Some("f"))),
+        ("P", press(Key::P, Modifiers::NONE, Some("p"))),
+    ] {
+        frame(&mut app, &ctx, events);
+        assert!(unchanged(&app), "{what} changed the document, the selection or the undo steps");
+        let state = (app.session.tool_id(), app.ui.dialog.is_none(), app.ui.screen_mode, (app.ui.dock, app.ui.toolbar));
+        assert_eq!(state, ("selection", true, 3, panels), "{what}");
+    }
+    app.select_tool("rectangle");
+    frame(&mut app, &ctx, press(Key::V, Modifiers::NONE, Some("v")));
+    assert_eq!(app.session.tool_id(), "rectangle", "V");
+    // The Intertwine tool claims Escape in the other screen modes.
+    app.select_tool("intertwine");
+    frame(&mut app, &ctx, escape());
+    assert_eq!(app.ui.screen_mode, 0, "Escape leaves Presentation Mode");
+}
+
+/// In Presentation Mode the pointer over the canvas is the system's default pointer, not the
+/// tool's cursor.
+#[test]
+fn the_pointer_is_the_default_one_in_presentation_mode() {
+    let ctx = egui::Context::default();
+    let mut app = presenting(&ctx);
+    app.select_tool("rectangle");
+    let middle = app.canvas_rect.unwrap().center();
+    let out = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(middle)]);
+    assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::Default);
+    assert!(out.platform_output.cursor_image.is_none(), "no tool cursor bitmap");
 }
 
 #[test]
-fn f_cycles_the_screen_modes_and_leaves_presentation_mode() {
+fn f_cycles_the_screen_modes_and_the_command_leaves_presentation_mode() {
     let mut app = VectorcraftApp::new(Session::new(), crate::Services::default());
     let modes: Vec<u64> = (0..4).map(|_| app.run("view.screenMode", json!({})).unwrap().as_u64().unwrap()).collect();
     assert_eq!(modes, [1, 2, 0, 1]);
     app.run("view.presentation", json!({})).unwrap();
-    assert_eq!(app.run("view.screenMode", json!({})).unwrap(), json!(0), "from Presentation Mode, F goes back to Normal");
+    assert_eq!(app.run("view.screenMode", json!({})).unwrap(), json!(0), "from Presentation Mode, view.screenMode goes back to Normal");
 }
 
 #[test]

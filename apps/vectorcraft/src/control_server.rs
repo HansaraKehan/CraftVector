@@ -67,8 +67,29 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     eprintln!("vectorcraft: control server listening on 127.0.0.1:{port}");
+    #[cfg(target_os = "macos")]
+    keep_answering();
     std::thread::spawn(move || accept_loop(listener, tx, ctx));
     rx
+}
+
+/// The activity the control channel holds on macOS: work the user asked for, which may let the
+/// system sleep when idle, with full timer precision. Without it, App Nap lowers every thread to
+/// the lowest priority within about a minute of the window no longer being visible.
+#[cfg(target_os = "macos")]
+fn activity_options() -> objc2_foundation::NSActivityOptions {
+    use objc2_foundation::NSActivityOptions;
+    NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical
+}
+
+/// Begins the control channel's activity. It lasts until the process ends.
+#[cfg(target_os = "macos")]
+fn keep_answering() {
+    use objc2_foundation::{NSProcessInfo, NSString};
+    let reason = NSString::from_str("Answering control requests");
+    let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(activity_options(), &reason);
+    // The token is never released or passed to `endActivity`, so the activity lasts for the process's lifetime.
+    std::mem::forget(activity);
 }
 
 fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
@@ -383,7 +404,10 @@ mod tests {
         });
         let mut reader = BufReader::new(client.try_clone().unwrap());
         for id in [1, 2] {
-            writeln!(client, "{}", json!({"id": id, "method": "inspect"})).unwrap();
+            // The client sends each line in one write. `writeln!` on the socket sends the JSON in many
+            // small writes, and when the machine is busy, a pause of more than the 120 ms line deadline
+            // between two of them closes the connection.
+            client.write_all(format!("{}\n", json!({"id": id, "method": "inspect"})).as_bytes()).unwrap();
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), json!({"id": id, "ok": true}));
@@ -638,5 +662,18 @@ mod tests {
         BufReader::new(&mut extra).read_line(&mut line).unwrap();
         assert!(line.contains("too many control connections"), "{line}");
         drop(held);
+    }
+
+    // A test process is not an app that App Nap applies to, so this checks the activity the
+    // channel asks for; the throttling itself shows only in a running app with its window hidden.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_control_channel_keeps_the_app_at_full_priority_on_macos() {
+        use objc2_foundation::NSActivityOptions;
+        let options = activity_options();
+        assert!(options.contains(NSActivityOptions::LatencyCritical), "without it App Nap still lowers the priority to 20");
+        assert!(options.contains(NSActivityOptions::UserInitiatedAllowingIdleSystemSleep));
+        assert!(!options.contains(NSActivityOptions::IdleSystemSleepDisabled), "the channel must not keep the Mac awake");
+        keep_answering();
     }
 }

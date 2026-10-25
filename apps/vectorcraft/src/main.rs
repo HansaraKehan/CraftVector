@@ -1,6 +1,6 @@
 //! VectorCraft desktop app.
 //!
-//! Usage: `vectorcraft [--control <port> [--automation-read-root <dir>] [--automation-write-root <dir>]]
+//! Usage: `vectorcraft [--control <port> [--automation-read-root <dir>]... [--automation-write-root <dir>]...]
 //! [--in-window-menus] [files…]`, `vectorcraft --version`, `vectorcraft --help` (or `-h`)
 //!
 //! `--in-window-menus` (or `VECTORCRAFT_IN_WINDOW_MENUS=1`) keeps the menus inside the window on
@@ -27,25 +27,35 @@ mod clipboard;
 #[cfg(feature = "wgpu")]
 mod compositor_gpu;
 mod control_server;
+mod cursor_theme;
 #[cfg(feature = "wgpu")]
 mod gpu;
+#[cfg(target_os = "linux")]
+mod linux_stylus;
 mod logging;
 #[cfg(target_os = "macos")]
 mod mac_fonts;
 #[cfg(target_os = "macos")]
 mod mac_menu;
 #[cfg(target_os = "macos")]
+mod mac_save_format;
+#[cfg(target_os = "macos")]
 mod mac_screen_color;
+mod mac_tablet;
 #[cfg(target_os = "macos")]
 mod mac_window;
 #[cfg(target_os = "macos")]
 mod open_documents;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd", test))]
+mod portal_save;
 mod prefs_dir;
 mod printing;
 #[cfg(all(windows, not(target_vendor = "win7")))]
 mod system_fonts;
+mod tablet;
 mod window;
 mod window_frame;
+mod windows_stylus;
 mod xwayland;
 
 use vectorcraft_engine::Session;
@@ -65,6 +75,12 @@ struct App {
     frames: u64,
     /// Keeps the custom title bar's window borderless (Windows, #1758).
     window_frame: Option<window_frame::WindowFrameFn>,
+    /// The main window; used to read and set maximized state the UI layer does not see on Linux (#3635).
+    winit_window: Option<std::sync::Arc<winit::window::Window>>,
+    /// A saved or fitted geometry asked for maximize once the window is mapped (Linux).
+    pending_maximize: bool,
+    /// Frames left to retry [`window::apply_pending_maximize`].
+    maximize_tries: u8,
 }
 
 impl eframe::App for App {
@@ -84,6 +100,9 @@ impl eframe::App for App {
         if self.app.services.native_menu.is_some() {
             mac_menu::raw_input_hook(raw);
         }
+        // A pen contact with the barrel button held presses the secondary button (Windows Ink).
+        #[cfg(all(windows, not(target_vendor = "win7")))]
+        windows_stylus::raw_input_hook(raw);
         file_access::unconfined(|| self.app.raw_input_hook(raw));
     }
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -139,14 +158,22 @@ impl App {
         // again on its document when it answers.
         #[cfg(target_os = "macos")]
         if !self.app.file_dialog_open() {
-            // Files from the Finder and the Dock wait while a file dialog is open: what asked for it runs
-            // again on its document when it answers.
-            if !self.app.file_dialog_open() {
-                open_files(&mut self.app, open_documents::take());
+            let files = open_documents::take();
+            if !files.is_empty() {
+                bring_window_forward(ctx);
             }
+            open_files(&mut self.app, files);
         }
         self.app.logic(ctx);
-        window::track(ctx, &mut self.app.ui.window);
+        if self.pending_maximize {
+            if let Some(w) = &self.winit_window {
+                self.pending_maximize = window::apply_pending_maximize(w, true, &mut self.maximize_tries);
+            } else {
+                self.pending_maximize = false;
+            }
+        }
+        let host_maximized = self.winit_window.as_ref().map(|w| w.is_maximized());
+        window::track(ctx, &mut self.app.ui.window, host_maximized);
         if self.app.ui.status == "quit" {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -167,6 +194,14 @@ fn end_before_teardown(frames: u64) {
         log::logger().flush();
         std::process::exit(0);
     }
+}
+
+/// Show the window when files are opened from the Finder or the Dock: a minimized window comes back
+/// out of the Dock and the app takes focus, as a document-based Mac app does (#3769).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bring_window_forward(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 }
 
 /// Open files handed to the app (command line, macOS Finder and Dock) as documents. A file that
@@ -246,10 +281,13 @@ fn decode_saved_prefs(bytes: &[u8]) -> Option<vectorcraft_ui_egui::UiState> {
     let mut value: Value = serde_json::from_slice(bytes).ok()?;
     let object = value.as_object_mut()?;
     recover(object, "docking_hidden");
-    if let Some(Value::Array(workspaces)) = object.get_mut("custom_workspaces") {
-        for workspace in workspaces {
-            if let Some(object) = workspace.as_object_mut() {
-                recover(object, "dockingHidden");
+    // Saved workspaces and the layout changes kept for each workspace carry the same layouts.
+    for key in ["custom_workspaces", "workspace_changes"] {
+        if let Some(Value::Array(workspaces)) = object.get_mut(key) {
+            for workspace in workspaces {
+                if let Some(object) = workspace.as_object_mut() {
+                    recover(object, "dockingHidden");
+                }
             }
         }
     }
@@ -272,13 +310,18 @@ fn save_prefs(app: &VectorcraftApp) {
     }
     if let Some(p) = prefs_path() {
         let _ = std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new(".")));
-        let mut ui = app.ui.clone();
-        ui.engine_prefs = app.session.prefs.to_json();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&ui) {
+        if let Ok(bytes) = prefs_bytes(app) {
             // Preferences are best effort: a failed write keeps the previous file.
             let _ = fileio::write_atomic(&p, &bytes);
         }
     }
+}
+
+/// The preferences file's contents: the UI state with the engine preferences.
+fn prefs_bytes(app: &VectorcraftApp) -> serde_json::Result<Vec<u8>> {
+    let mut ui = app.ui.clone();
+    ui.engine_prefs = app.session.prefs.to_json();
+    serde_json::to_vec_pretty(&ui)
 }
 
 /// The window file dialogs belong to.
@@ -288,7 +331,7 @@ type Parent = Option<std::sync::Arc<winit::window::Window>>;
 trait DialogSettings: Sized {
     fn parent(self, window: &winit::window::Window) -> Self;
     fn title(self, title: &str) -> Self;
-    fn filter(self, name: &str, exts: &[&str]) -> Self;
+    fn filter(self, name: &str, exts: &[impl ToString]) -> Self;
     fn folder(self, folder: &str) -> Self;
     fn file_name(self, name: &str) -> Self;
 }
@@ -302,7 +345,7 @@ macro_rules! dialog_settings {
             fn title(self, title: &str) -> Self {
                 self.set_title(title)
             }
-            fn filter(self, name: &str, exts: &[&str]) -> Self {
+            fn filter(self, name: &str, exts: &[impl ToString]) -> Self {
                 self.add_filter(name, exts)
             }
             fn folder(self, folder: &str) -> Self {
@@ -328,10 +371,9 @@ fn dialog_for<D: DialogSettings>(d: D, request: &PickRequest) -> D {
         }
         PickRequest::Folder => return d,
     };
-    let d = pick
-        .filters
-        .iter()
-        .fold(d, |d, (name, exts)| d.filter(vectorcraft_ui_egui::i18n::tr_ctx(vectorcraft_ui_egui::i18n::current(), "file-filter", name), exts));
+    let d = pick.filters.iter().fold(d, |d, (name, exts)| {
+        d.filter(vectorcraft_ui_egui::i18n::tr_ctx(vectorcraft_ui_egui::i18n::current(), "file-filter", name.as_str()), exts)
+    });
     let d = match &pick.folder {
         Some(folder) => d.folder(folder),
         None => d,
@@ -356,10 +398,20 @@ fn make_folder(request: &PickRequest) {
     }
 }
 
-/// Show `dialog` for `request` (on the calling thread, until it closes) → the paths picked.
+/// Show `dialog` for `request` (on the calling thread, until it closes) → the paths picked. On
+/// Linux and the BSDs a save dialog with two or more file types is the desktop portal's, over
+/// `parent`, and its answer also names the file type picked ([`portal_save`]); `dialog` shows when
+/// the portal can't.
 #[cfg(not(target_os = "macos"))]
-fn show_dialog(dialog: rfd::FileDialog, request: &PickRequest) -> Vec<String> {
+#[cfg_attr(windows, allow(unused_variables))]
+fn show_dialog(dialog: rfd::FileDialog, request: &PickRequest, parent: &Parent) -> Vec<String> {
     make_folder(request);
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
+    if let PickRequest::Save(pick) = request
+        && let Some(answer) = portal_save::pick(pick, parent.as_deref())
+    {
+        return answer;
+    }
     let paths = match request {
         PickRequest::Open(_) => dialog.pick_file().into_iter().collect(),
         PickRequest::OpenMany => dialog.pick_files().unwrap_or_default(),
@@ -372,7 +424,7 @@ fn show_dialog(dialog: rfd::FileDialog, request: &PickRequest) -> Vec<String> {
 /// Show the dialog for `request` over `parent` now → the paths picked.
 #[cfg(not(target_os = "macos"))]
 fn pick_now(request: PickRequest, parent: &Parent) -> Vec<String> {
-    show_dialog(file_dialog(&request, parent), &request)
+    show_dialog(file_dialog(&request, parent), &request, parent)
 }
 
 /// macOS shows no dialog in line: its modal loop would run inside winit's event handler, and an
@@ -386,6 +438,7 @@ fn pick_now(request: PickRequest, _parent: &Parent) -> Vec<String> {
 
 /// File → Show in Folder: select `path` in Finder / Explorer, or open its folder elsewhere.
 fn reveal(path: &str) -> Result<(), String> {
+    explorer_safe(path)?;
     reveal_command(path).spawn().map(|_| ()).map_err(|e| format!("can't show {path}: {e}"))
 }
 
@@ -427,11 +480,12 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
     let dialog = file_dialog(&request, parent);
     let (tx, rx) = std::sync::mpsc::channel();
     let ui = ui.clone();
+    let parent = parent.clone();
     std::thread::Builder::new()
         .name("file-dialog".into())
         .spawn(move || {
             // The app gone meanwhile has no use for the answer.
-            let _ = tx.send(show_dialog(dialog, &request));
+            let _ = tx.send(show_dialog(dialog, &request, &parent));
             ui.request_repaint();
         })
         .ok()?;
@@ -473,7 +527,7 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
         })
         .ok()?;
     make_folder(&request);
-    // rfd builds the panel and begins the sheet here, on the main thread (as it must).
+    // The panel is built and the sheet is begun below, on the main thread (as it must).
     let dialog = dialog_for(rfd::AsyncFileDialog::new().parent(window), &request);
     let path = |f: &rfd::FileHandle| f.path().to_string_lossy().to_string();
     let answer: SheetAnswer = match request {
@@ -485,12 +539,18 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
             let picked = dialog.pick_files();
             Box::pin(async move { picked.await.unwrap_or_default().iter().map(path).collect() })
         }
-        PickRequest::Save(_) => {
-            // Nothing is added to the sheet once rfd has begun it: an accessory view set then made
-            // recent macOS versions dismiss the sheet at once, so nothing could be saved (#1800).
-            let picked = dialog.save_file();
-            Box::pin(async move { picked.await.iter().map(path).collect() })
-        }
+        // A save panel with two or more named file types is built by `mac_save_format`, which sets
+        // up its Format menu before the sheet begins (#866); rfd shows the others.
+        PickRequest::Save(pick) => match mac_save_format::begin(window, &pick) {
+            // The dialog thread blocks here until the sheet answers.
+            Some(picked) => Box::pin(async move { picked.recv().unwrap_or_default() }),
+            None => {
+                // Nothing is added to the sheet once rfd has begun it: an accessory view set then
+                // made recent macOS versions dismiss the sheet at once (#1800).
+                let picked = dialog.save_file();
+                Box::pin(async move { picked.await.iter().map(path).collect() })
+            }
+        },
         PickRequest::Folder => {
             let picked = dialog.pick_folder();
             Box::pin(async move { picked.await.iter().map(path).collect() })
@@ -505,6 +565,12 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
 fn services(parent: Parent, ui: egui::Context) -> Services {
     use winit::raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
     let wayland = parent.as_ref().and_then(|w| w.window_handle().ok()).is_some_and(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)));
+    // A window on X11 (XWayland included) reads a tablet pen's pressure itself (#764).
+    #[cfg(target_os = "linux")]
+    let x11 = parent
+        .as_ref()
+        .and_then(|w| w.window_handle().ok())
+        .is_some_and(|h| matches!(h.as_raw(), RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)));
     let (p1, p2, p3, p4, p5) = (parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent);
     #[cfg(target_os = "macos")]
     let sampled_ui = ui.clone();
@@ -517,8 +583,15 @@ fn services(parent: Parent, ui: egui::Context) -> Services {
         start_pick: cfg!(unix).then(|| Box::new(move |request: PickRequest| start_pick(request, &p5, &ui)) as vectorcraft_ui_egui::picks::StartPick),
         dialogs_are_sheets: cfg!(target_os = "macos"),
         wayland,
+        no_cursor_theme: wayland && cursor_theme::theme_missing(),
+        #[cfg(target_os = "linux")]
+        stylus: if x11 { tablet::start() } else { None },
+        // macOS reads it from AppKit's events (#852).
+        #[cfg(target_os = "macos")]
+        stylus: mac_tablet::start(),
         read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
         write: Some(Box::new(write_file)),
+        exists: Some(Box::new(|p: &str| std::path::Path::new(p).exists())),
         // Background Save and Export write from a worker thread.
         write_shared: Some(std::sync::Arc::new(write_file)),
         // Native saves stream into the file as they are encoded.
@@ -548,8 +621,15 @@ fn services(parent: Parent, ui: egui::Context) -> Services {
     }
 }
 
+/// Windows passes `path` to Explorer inside quotes it adds itself, so a path holding a quote (which
+/// no Windows file name has) is refused rather than split into other arguments.
+fn explorer_safe(path: &str) -> Result<(), String> {
+    if cfg!(windows) && path.contains('"') { Err(format!("can't open {path}: the path contains a quotation mark")) } else { Ok(()) }
+}
+
 /// Edit Original, Show Package: open `path` (a file or a folder) in the system's default app for it.
 fn open_file(path: &str) -> Result<(), String> {
+    explorer_safe(path)?;
     #[cfg(windows)]
     let mut c = {
         use std::os::windows::process::CommandExt as _;
@@ -597,13 +677,73 @@ fn adapter_summary(info: &eframe::wgpu::AdapterInfo) -> String {
 
 /// Windows and Linux: no OS title bar; the app bar is the title bar (`vectorcraft_ui_egui::titlebar`).
 /// macOS keeps its traffic lights over the integrated title strip.
+///
+/// Used on macOS and Windows (where VectorCraft keeps today's frame regardless of the
+/// `craft-window` probe) and by the tests; Linux and the BSDs take the decision from the probe.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 const CUSTOM_TITLEBAR: bool = !cfg!(target_os = "macos");
 
-/// Whether this start draws its own title bar: Windows and Linux do, unless Preferences ›
-/// User Interface › System Title Bar asks for the system's. Read from the saved preferences
-/// before the window opens; a missing or unreadable value keeps the default.
+/// Whether the user asked for the system title bar in Preferences › User Interface › System Title
+/// Bar. Read from the saved preferences before the window opens; a missing or unreadable value is
+/// `false` (the default). This preference forces the desktop/native frame back on.
+fn opted_into_system_title_bar(saved: Option<&vectorcraft_ui_egui::UiState>) -> bool {
+    saved.map(|ui| ui.engine_prefs.get("systemTitleBar").and_then(serde_json::Value::as_bool).unwrap_or(false)).unwrap_or(false)
+}
+
+/// Whether this start draws its own title bar, given the frame the shared `craft-window` crate
+/// decided and the user's System Title Bar preference.
+///
+/// The suite-wide rule (`craft_window::Choice`) is: the desktop draws the frame
+/// ([`craft_window::Frame::Desktop`]) on macOS, Windows, X11 and any Wayland compositor with
+/// server-side decorations (KDE, Sway, Hyprland, COSMIC); the app draws it
+/// ([`craft_window::Frame::App`]) only where the compositor leaves it to the app (GNOME's Mutter),
+/// or when `VECTORCRAFT_TITLEBAR` overrides the probe. VectorCraft draws its own title bar exactly
+/// when `craft-window` says the app owns the frame **and** the user has not opted into the system
+/// title bar; the preference always forces the native frame back on.
+///
+/// macOS and Windows keep today's behavior and are decided by [`CUSTOM_TITLEBAR`] rather than the
+/// probe: `craft-window` returns `Frame::Desktop` for both (the OS always draws a frame), but
+/// VectorCraft insets its content under the macOS traffic lights and draws its own caption buttons
+/// on Windows — an overdraw on an OS-decorated window that is VectorCraft's choice, not
+/// `craft-window`'s. Only Linux and the BSDs take the decision from the probe.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn custom_titlebar_from(frame: &craft_window::Frame, opted_into_system: bool) -> bool {
+    matches!(frame, craft_window::Frame::App(_)) && !opted_into_system
+}
+
+/// macOS and Windows: today's behavior, independent of the `craft-window` probe (see
+/// [`custom_titlebar_from`]). macOS never draws its own frame (`CUSTOM_TITLEBAR` is `false`);
+/// Windows draws its own caption unless the user opted into the system title bar.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn custom_titlebar_from(_frame: &craft_window::Frame, opted_into_system: bool) -> bool {
+    CUSTOM_TITLEBAR && !opted_into_system
+}
+
+/// Whether this start draws its own title bar. Probes the shared `craft-window` crate once (its
+/// override variable is `VECTORCRAFT_TITLEBAR`) and combines its decision with the saved System
+/// Title Bar preference. Call once at startup, before [`native_options`].
+///
+/// On Linux, Preferences › Performance › Linux Display Server › X11 opens the window through
+/// XWayland (below). A GNOME/Wayland probe would say `Frame::App` there, but the window really runs
+/// on X11, whose window manager draws the frame — so when XWayland is being forced, keep the native
+/// frame, the same as a real X11 session. An explicit `VECTORCRAFT_TITLEBAR` override still wins.
 fn custom_titlebar(saved: Option<&vectorcraft_ui_egui::UiState>) -> bool {
-    CUSTOM_TITLEBAR && !saved.map(|ui| ui.engine_prefs.get("systemTitleBar").and_then(serde_json::Value::as_bool).unwrap_or(false)).unwrap_or(false)
+    let choice = craft_window::Choice::probe(craft_window::Prefix::new("VECTORCRAFT"));
+    let opted_into_system = opted_into_system_title_bar(saved);
+    #[cfg(target_os = "linux")]
+    {
+        let pref = saved.and_then(|ui| ui.engine_prefs.get("linuxDisplayServer")).and_then(serde_json::Value::as_str);
+        // `overridden() == None` means the probe decided (no VECTORCRAFT_TITLEBAR). When the window
+        // will actually open on X11 (XWayland) — the user asked for it *and* the X11 libraries are
+        // present, the same two conditions the launch path checks below — that run is effectively
+        // X11, so keep the native frame. If the libraries are missing, startup stays on Wayland, so
+        // the probe's own decision (app-drawn on GNOME) must stand.
+        let forced_to_x11 = xwayland::wanted(pref, |name| std::env::var_os(name), xwayland::pen_attached) && xwayland::x11_libraries_found();
+        if choice.overridden().is_none() && forced_to_x11 {
+            return custom_titlebar_from(&craft_window::Frame::Desktop, opted_into_system);
+        }
+    }
+    custom_titlebar_from(choice.frame(), opted_into_system)
 }
 
 fn native_options(custom_titlebar: bool) -> eframe::NativeOptions {
@@ -635,7 +775,9 @@ Options:
   --control <port>               Start the localhost JSON-lines control server on <port>
                                  (or VECTORCRAFT_CONTROL_PORT)
   --automation-read-root <dir>   Confine the files control requests read to <dir>
+                                 (may be given more than once)
   --automation-write-root <dir>  Confine the files control requests write to <dir>
+                                 (may be given more than once)
   --in-window-menus              Keep the menus inside the window on macOS
                                  (or VECTORCRAFT_IN_WINDOW_MENUS=1)
   --version                      Print the version and exit
@@ -646,6 +788,9 @@ Without a window (converting, scripting, the MCP server), use vectorcraft-cli:
 ";
 
 fn main() -> std::process::ExitCode {
+    // Before any thread starts: the pointer must find a cursor theme on Wayland (#2450).
+    #[cfg(target_os = "linux")]
+    cursor_theme::apply();
     // Validate roots before logging, font scans, preferences or the window: a missing value
     // must not clear an environment root and start the control channel without confinement.
     let mut control = automation_args::ControlArg::default();
@@ -681,7 +826,7 @@ fn main() -> std::process::ExitCode {
             _ => files.push(a),
         }
     }
-    let automation_args::AutomationArgs { read_root, write_root, .. } = roots_args;
+    let automation_args::AutomationArgs { read_roots, write_roots, .. } = roots_args;
     // After the arguments: `--control` and `--version` win over a bad environment value.
     let control_port = match control.port {
         Some(port) => Some(port),
@@ -720,12 +865,14 @@ fn main() -> std::process::ExitCode {
     // The roots confine the control channel: a bad one keeps the app from starting rather than
     // leaving agents unconfined. Without a control port there is nothing to confine.
     let roots = if control_port.is_none() {
-        if read_root.is_some() || write_root.is_some() {
+        if !read_roots.is_empty() || !write_roots.is_empty() {
             log::warn!("--automation-read-root and --automation-write-root confine the control channel: ignored without --control");
         }
         None
     } else {
-        match AutomationRoots::new(read_root.as_deref(), write_root.as_deref()) {
+        let read: Vec<&std::path::Path> = read_roots.iter().map(std::path::PathBuf::as_path).collect();
+        let write: Vec<&std::path::Path> = write_roots.iter().map(std::path::PathBuf::as_path).collect();
+        match AutomationRoots::new(&read, &write) {
             Ok(roots) => roots,
             Err(e) => {
                 log::error!("{e}");
@@ -774,14 +921,19 @@ fn main() -> std::process::ExitCode {
     let custom_titlebar = custom_titlebar(saved.as_ref());
     let options = native_options(custom_titlebar);
     // winit picks Wayland whenever `WAYLAND_DISPLAY` is set; Preferences › Performance › Linux
-    // Display Server › X11 opens the window through XWayland instead, where file drops work (#1151).
+    // Display Server › X11 opens the window through XWayland instead, where file drops work (#1151),
+    // and X11 (XWayland) When a Pen Is Attached does so when a pen is attached, where the pen draws (#2028).
     #[cfg(target_os = "linux")]
     let options = {
         let mut options = options;
         let pref = saved.as_ref().and_then(|ui| ui.engine_prefs.get("linuxDisplayServer")).and_then(serde_json::Value::as_str);
-        if xwayland::wanted(pref, |name| std::env::var_os(name)) {
+        if xwayland::wanted(pref, |name| std::env::var_os(name), xwayland::pen_attached) {
             if xwayland::x11_libraries_found() {
-                log::info!("opening the window through XWayland (Preferences › Performance › Linux Display Server)");
+                if pref == Some("x11WithPen") {
+                    log::info!("pen found: opening the window through XWayland (Preferences › Performance › Linux Display Server)");
+                } else {
+                    log::info!("opening the window through XWayland (Preferences › Performance › Linux Display Server)");
+                }
                 use winit::platform::x11::EventLoopBuilderExtX11 as _;
                 options.event_loop_builder = Some(Box::new(|builder| {
                     builder.with_x11();
@@ -790,6 +942,18 @@ fn main() -> std::process::ExitCode {
                 log::warn!("Linux Display Server is X11, but the X11 libraries aren't all installed: opening the window on Wayland");
             }
         }
+        options
+    };
+    // With Windows Ink, winit reports a pen as a touch and drops its barrel button; the message
+    // hook notes each pointer contact and whether it starts with the barrel button held
+    // (`windows_stylus`).
+    #[cfg(all(windows, not(target_vendor = "win7")))]
+    let options = {
+        use winit::platform::windows::EventLoopBuilderExtWindows as _;
+        let mut options = options;
+        options.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_msg_hook(windows_stylus::msg_hook);
+        }));
         options
     };
     #[cfg(feature = "wgpu")]
@@ -836,24 +1000,48 @@ fn main() -> std::process::ExitCode {
     #[cfg(feature = "wgpu")]
     let created = startup.clone();
     // A panic that ends the window (egui-wgpu's own, #502) is caught here: never a crash.
+    let run = |options: eframe::NativeOptions, app_creator: eframe::AppCreator<'_>| {
+        #[cfg(target_os = "linux")]
+        {
+            linux_stylus::run_native("VectorCraft", options, app_creator)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eframe::run_native("VectorCraft", options, app_creator)
+        }
+    };
     let outcome = vectorcraft_engine::guard::catch_panic(|| {
-        eframe::run_native(
-            "VectorCraft",
+        run(
             options,
             Box::new(move |cc| {
-                let mut app = VectorcraftApp::new(Session::new(), services(cc.winit_window().cloned(), cc.egui_ctx.clone()));
+                let mut session = Session::new();
+                // The profiles loaded before come back before the preferences name any of them.
+                prefs_dir::attach_profile_store(&mut session);
+                prefs_dir::attach_plugin_store(&mut session);
+                let mut app = VectorcraftApp::new(session, services(cc.winit_window().cloned(), cc.egui_ctx.clone()));
                 load_prefs(&mut app, saved);
+                // The saved PDF presets live in their own folder (also read by vectorcraft-cli),
+                // which takes over from the copy the preferences file used to hold.
+                prefs_dir::attach_pdf_preset_store(&mut app.session);
                 // Fit the window to its monitor, or put it back where it was (still hidden).
-                if let Some(w) = cc.winit_window() {
-                    app.ui.window = Some(window::restore(w, saved_window));
+                let winit_window = cc.winit_window().cloned();
+                if let Some(w) = &winit_window {
+                    let g = window::restore(w, saved_window);
+                    app.ui.window = Some(g);
                     #[cfg(windows)]
                     set_taskbar_icon(w);
                 }
-                // User Defined swatch and graphic style libraries live next to the preferences.
+                // Linux may not map the window before the first frames, so a saved maximize is retried then (#3635).
+                let pending_maximize = cfg!(target_os = "linux") && app.ui.window.as_ref().is_some_and(|g| g.maximized);
+                // User Defined swatch, graphic style and symbol libraries live next to the preferences.
                 let swatches = prefs_path().and_then(|p| Some(p.parent()?.join("Swatches").to_string_lossy().to_string()));
                 app.session.swatch_libraries.set_user_dir(swatches);
                 let styles = prefs_path().and_then(|p| Some(p.parent()?.join("Graphic Styles").to_string_lossy().to_string()));
                 app.session.style_libraries.set_user_dir(styles);
+                let symbols = prefs_path().and_then(|p| Some(p.parent()?.join("Symbols").to_string_lossy().to_string()));
+                app.session.symbol_libraries.set_user_dir(symbols);
+                // With the User Defined libraries listed, the persistent library panels reopen.
+                vectorcraft_ui_egui::panels::library_panel::restore(&mut app);
                 // So do the Libraries panel's libraries; runs without preferences (agents' test
                 // runs) keep theirs for the session only, never touching the user's.
                 if prefs_enabled() {
@@ -908,7 +1096,7 @@ fn main() -> std::process::ExitCode {
                         // Everywhere the app doesn't say whose work it is (worker threads), the
                         // roots hold: unconfined is only what the person at the keyboard does.
                         file_access::confine_process(roots.clone());
-                        log::info!("control channel confined to the automation roots: read {:?}, write {:?}", roots.read_root(), roots.write_root());
+                        log::info!("control channel confined to the automation roots: {}", roots.describe());
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -927,7 +1115,16 @@ fn main() -> std::process::ExitCode {
                 created.ready();
                 // The content and the pointer stay aligned on Windows (#1758).
                 let window_frame = window_frame::service(cc, custom_titlebar);
-                Ok(Box::new(App { app, graphics_loss, graphics_lost: false, frames: 0, window_frame }))
+                Ok(Box::new(App {
+                    app,
+                    graphics_loss,
+                    graphics_lost: false,
+                    frames: 0,
+                    window_frame,
+                    winit_window,
+                    pending_maximize,
+                    maximize_tries: 8,
+                }))
             }),
         )
     });
@@ -952,6 +1149,49 @@ mod tests {
         vectorcraft_ui_egui::UiState { engine_prefs, ..Default::default() }
     }
 
+    /// Shortcut overrides an earlier version saved still load: its spellings, `panel:` keys, an
+    /// override that can't fire (#487), an entry for a command this version lacks, and an old set
+    /// name.
+    #[test]
+    fn shortcut_overrides_from_an_earlier_version_load() {
+        use serde_json::json;
+        use vectorcraft_ui_egui::{keymap, shortcut_editor};
+        let mut raw = serde_json::to_value(vectorcraft_ui_egui::UiState::default()).unwrap();
+        raw["shortcut_overrides"] = json!({
+            "tool:pen": "Shift+9",
+            "edit.preferences": "",
+            "panel:layers": "Cmd+Alt+Shift+F7",
+            "tool:groupSelection": "Shift+ShiftLeft",
+            "test.unknown": "Cmd+Alt+Shift+F9",
+            "view.grid": "Cmd+Period",
+        });
+        raw["shortcut_set"] = json!(shortcut_editor::LEGACY_PRESETS[0].0);
+        let ui = decode_saved_prefs(&serde_json::to_vec(&raw).unwrap()).unwrap().sanitized();
+        assert_eq!(ui.shortcut_set, shortcut_editor::LEGACY_PRESETS[0].1);
+        let km = keymap::keymap_with(&ui.shortcut_overrides);
+        let text = |key: &str| keymap::effective_with(&km, key);
+        assert_eq!(text("tool:pen").as_deref(), Some("Shift+9"));
+        assert_eq!(text("edit.preferences"), None);
+        assert_eq!(text("panel:layers").as_deref(), Some("Cmd+Alt+Shift+F7"));
+        assert_eq!(text("tool:groupSelection").as_deref(), shortcut_editor::default_of("tool:groupSelection"), "back on its default");
+        assert_eq!(text("view.grid").as_deref(), Some("Cmd+Period"));
+        let period = keymap::vc_chord("Cmd+.").unwrap();
+        assert_eq!(keymap::lookup(&km, &period).map(|c| c.id), Some("view.grid".to_string()));
+        assert_eq!(text("test.unknown").as_deref(), Some("Cmd+Alt+Shift+F9"), "kept");
+        assert!(km.problems().iter().any(|p| format!("{p:?}") == r#"UnknownCommand { key: "test.unknown" }"#), "reported");
+    }
+
+    #[test]
+    fn opening_files_unminimizes_and_focuses_the_window() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| bring_window_forward(ui.ctx()));
+        // Nothing paints in the test: drop the font atlas upload egui expects to be applied.
+        out.textures_delta.clear();
+        let cmds = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(cmds.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(cmds.contains(&egui::ViewportCommand::Focus));
+    }
+
     #[test]
     fn unreadable_saved_docking_keeps_preferences_and_every_workspace() {
         use serde_json::json;
@@ -961,6 +1201,7 @@ mod tests {
         app.ui.engine_prefs = json!({"interfaceLanguage":"fr", "uiBrightness":"light"});
         app.ui.custom_workspaces =
             vec![vectorcraft_ui_egui::workspaces::capture(&app.ui, "Future"), vectorcraft_ui_egui::workspaces::capture(&app.ui, "Valid")];
+        app.ui.workspace_changes = vec![vectorcraft_ui_egui::workspaces::capture(&app.ui, "Future")];
         let original = serde_json::to_value(&app.ui).unwrap();
         let valid_location = original["docking_hidden"]["layers"].clone();
         assert!(valid_location.is_object());
@@ -971,6 +1212,8 @@ mod tests {
                 raw["docking_hidden"] = invalid_hidden.clone();
                 raw["custom_workspaces"][0]["docking"] = invalid_layout.clone();
                 raw["custom_workspaces"][0]["dockingHidden"] = invalid_hidden.clone();
+                raw["workspace_changes"][0]["docking"] = invalid_layout.clone();
+                raw["workspace_changes"][0]["dockingHidden"] = invalid_hidden.clone();
                 assert!(serde_json::from_value::<vectorcraft_ui_egui::UiState>(raw.clone()).is_err(), "runtime serde stays strict");
                 let loaded = decode_saved_prefs(&serde_json::to_vec(&raw).unwrap()).unwrap();
                 assert_eq!(loaded.engine_prefs, app.ui.engine_prefs);
@@ -987,6 +1230,8 @@ mod tests {
                 assert!(loaded.custom_workspaces[0].docking.is_none());
                 assert!(!loaded.custom_workspaces[0].docking_hidden.contains_key("layers"));
                 assert_eq!(serde_json::to_value(&loaded.custom_workspaces[1]).unwrap(), original["custom_workspaces"][1]);
+                assert_eq!(loaded.workspace_changes.len(), 1, "a remembered layout is recovered, not the whole file lost");
+                assert!(loaded.workspace_changes[0].docking.is_none());
             }
         }
         let roundtrip = decode_saved_prefs(&serde_json::to_vec(&original).unwrap()).unwrap();
@@ -998,18 +1243,53 @@ mod tests {
     }
 
     #[test]
-    fn the_system_title_bar_preference_keeps_the_window_decorations() {
-        // Preferences › User Interface › System Title Bar gives the window back its system
-        // decorations on Windows and Linux; macOS always has them.
-        assert_eq!(super::custom_titlebar(None), super::CUSTOM_TITLEBAR, "no preferences: the default");
-        let off = ui_state_with_prefs(serde_json::json!({"systemTitleBar": false}));
-        assert_eq!(super::custom_titlebar(Some(&off)), super::CUSTOM_TITLEBAR);
-        let on = ui_state_with_prefs(serde_json::json!({"systemTitleBar": true}));
-        assert!(!super::custom_titlebar(Some(&on)));
-        assert_eq!(super::native_options(false).viewport.decorations, Some(true));
-        if super::CUSTOM_TITLEBAR {
-            assert_eq!(super::native_options(true).viewport.decorations, Some(false));
+    fn the_image_trace_preview_setting_is_kept_across_a_restart() {
+        for preview in [false, true] {
+            let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+            app.ui.image_trace_preview = preview;
+            let saved = prefs_bytes(&app).unwrap();
+            let loaded = decode_saved_prefs(&saved).unwrap().sanitized();
+            assert_eq!(loaded.image_trace_preview, preview, "Preview {preview} after a restart");
         }
+    }
+
+    #[test]
+    fn the_system_title_bar_preference_keeps_the_window_decorations() {
+        use craft_window::{Frame, Layout};
+
+        // The System Title Bar preference (Preferences › User Interface) is read the same way on
+        // every platform; a missing or unreadable value is `false`.
+        assert!(!super::opted_into_system_title_bar(None), "no preferences: the default");
+        let off = ui_state_with_prefs(serde_json::json!({"systemTitleBar": false}));
+        assert!(!super::opted_into_system_title_bar(Some(&off)));
+        let on = ui_state_with_prefs(serde_json::json!({"systemTitleBar": true}));
+        assert!(super::opted_into_system_title_bar(Some(&on)));
+
+        // The suite-wide mapping (Frame + preference -> whether VectorCraft draws its own title
+        // bar). The desktop frame (macOS, Windows, X11, KDE/Wayland, …) always keeps native
+        // decorations; the app frame (GNOME/Wayland, or a `VECTORCRAFT_TITLEBAR` override) draws
+        // our own title bar — unless the user opted into the system title bar, which forces the
+        // native frame back on.
+        let app = Frame::App(Layout::default());
+        let desktop = Frame::Desktop;
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            assert!(super::custom_titlebar_from(&app, false), "GNOME/Wayland: VectorCraft draws its own");
+            assert!(!super::custom_titlebar_from(&app, true), "System Title Bar preference forces native");
+            assert!(!super::custom_titlebar_from(&desktop, false), "KDE/X11/…: keep the compositor's frame");
+            assert!(!super::custom_titlebar_from(&desktop, true));
+        }
+        // macOS and Windows keep today's behavior, independent of the probed frame: the pref still
+        // forces the native frame back on where a custom one would otherwise be drawn.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(super::custom_titlebar_from(&desktop, false), super::CUSTOM_TITLEBAR);
+            assert_eq!(super::custom_titlebar_from(&app, false), super::CUSTOM_TITLEBAR, "the probe does not change macOS/Windows");
+            assert!(!super::custom_titlebar_from(&desktop, true));
+        }
+
+        assert_eq!(super::native_options(false).viewport.decorations, Some(true));
+        assert_eq!(super::native_options(true).viewport.decorations, Some(false));
     }
 
     /// The file extensions the macOS bundle declares: its document types and its own exported type.
@@ -1023,9 +1303,9 @@ mod tests {
             .collect()
     }
 
-    /// Finder offers the app for every file File › Open reads (#295, #354) but Photoshop documents
-    /// (`UNASSOCIATED_EXTS`), takes over no other app's files, and hands them to the app rather than
-    /// to AppKit's document machinery.
+    /// Finder offers the app for every file File › Open reads (#295, #354) but those with an
+    /// extension in `UNASSOCIATED_EXTS`, takes over no other app's files, and hands them to the app
+    /// rather than to AppKit's document machinery.
     #[test]
     fn the_macos_bundle_opens_every_readable_format() {
         let plist = include_str!("../../../packaging/macos/Info.plist.in");
@@ -1040,5 +1320,117 @@ mod tests {
         let types = plist.matches("<key>CFBundleTypeName</key>").count();
         assert!(types > 1 && plist.matches("<key>LSHandlerRank</key>").count() == types, "every document type has a rank");
         assert_eq!(plist.matches("<string>Owner</string>").count(), 2, "only VectorCraft documents and templates are owned");
+    }
+
+    /// The MIME types a Linux desktop gives each extension in `OPEN_EXTS` but `UNASSOCIATED_EXTS`
+    /// (one row per type): shared-mime-info's, or one that `ai.storyteller.vectorcraft.mime.xml`
+    /// declares.
+    const LINUX_TYPES: &[(&str, &str)] = &[
+        ("vectorcraft", "application/x-vectorcraft"),
+        ("drawcraft", "application/x-vectorcraft"),
+        ("svg", "image/svg+xml"),
+        ("svgz", "image/svg+xml-compressed"),
+        ("pdf", "application/pdf"),
+        ("ai", "application/illustrator"), // brand-ok: shared-mime-info's type
+        ("ait", "application/x-ai-template"),
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("gif", "image/gif"),
+        ("webp", "image/webp"),
+        ("tif", "image/tiff"),
+        ("tiff", "image/tiff"),
+        ("bmp", "image/bmp"),
+        ("vctemplate", "application/x-vectorcraft-template"),
+        ("dxf", "image/vnd.dxf"),
+        ("emf", "image/emf"),
+        ("wmf", "image/wmf"),
+        ("eps", "image/x-eps"),
+        ("af", "application/x-affinity"),
+        ("afdesign", "application/x-affinity"),
+        ("afpub", "application/x-affinity"),
+    ];
+
+    /// The types in `LINUX_TYPES` that shared-mime-info defines. The MIME package declares every
+    /// other one.
+    const LINUX_SHARED_TYPES: &[&str] = &[
+        "image/svg+xml",
+        "image/svg+xml-compressed",
+        "application/pdf",
+        "application/illustrator", // brand-ok: shared-mime-info's type
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/tiff",
+        "image/bmp",
+        "image/vnd.dxf",
+        "image/emf",
+        "image/wmf",
+        "image/x-eps",
+    ];
+
+    /// Extensions in `LINUX_TYPES` whose type the MIME package matches by file content and not by a
+    /// glob, with the package's `<magic>` rule for that type (its lines joined, indentation removed).
+    const LINUX_BY_CONTENT: &[(&str, &str)] = &[(
+        "af",
+        // `MAGIC` at offset 0 and `DOCUMENT_KIND` at offset 8 (crates/affinity/src/container.rs).
+        r#"<magic><match type="string" offset="0" value="\x00\xff\x4b\x41"><match type="string" offset="8" value="nsrP"/></match></magic>"#,
+    )];
+
+    /// The desktop entry lists a MIME type for every extension in `OPEN_EXTS` but
+    /// `UNASSOCIATED_EXTS`, and the app's MIME package declares the types shared-mime-info doesn't
+    /// have.
+    #[test]
+    fn the_linux_desktop_entry_opens_every_readable_format() {
+        let desktop = include_str!("../../../packaging/linux/ai.storyteller.vectorcraft.desktop");
+        let mime = include_str!("../../../packaging/linux/ai.storyteller.vectorcraft.mime.xml");
+        let listed: Vec<&str> =
+            desktop.lines().find_map(|l| l.strip_prefix("MimeType=")).unwrap_or_default().split(';').filter(|t| !t.is_empty()).collect();
+        // Each type the MIME package declares, with the extensions of its globs and its `<magic>`
+        // rule (empty when it has none) in the form `LINUX_BY_CONTENT` gives.
+        let declared: Vec<(&str, Vec<&str>, String)> = mime
+            .split("<mime-type type=\"")
+            .skip(1)
+            .map(|block| {
+                let body = block.split("</mime-type>").next().unwrap_or_default();
+                let globs = body.split("<glob pattern=\"*.").skip(1).filter_map(|g| g.split('"').next()).collect();
+                let magic = match (body.find("<magic"), body.find("</magic>")) {
+                    (Some(start), Some(end)) => body[start..end + "</magic>".len()].lines().map(str::trim).collect(),
+                    _ => String::new(),
+                };
+                (block.split('"').next().unwrap_or_default(), globs, magic)
+            })
+            .collect();
+        let mut associated: Vec<&str> = fileio::OPEN_EXTS.iter().copied().filter(|e| !fileio::UNASSOCIATED_EXTS.contains(e)).collect();
+        let mut typed: Vec<&str> = LINUX_TYPES.iter().map(|(e, _)| *e).collect();
+        associated.sort_unstable();
+        typed.sort_unstable();
+        typed.dedup();
+        assert_eq!(typed, associated, "a MIME type for each extension the packaging associates with the app");
+        for (e, t) in LINUX_TYPES {
+            assert!(listed.contains(t), "the desktop entry doesn't list {t} (.{e})");
+            let package = declared.iter().find(|(name, ..)| name == t);
+            if LINUX_SHARED_TYPES.contains(t) {
+                assert!(package.is_none(), "{t} is shared-mime-info's, and the MIME package declares it again");
+                continue;
+            }
+            let Some((_, globs, magic)) = package else { panic!("the MIME package doesn't declare {t} (.{e})") };
+            if let Some((_, rule)) = LINUX_BY_CONTENT.iter().find(|(content, _)| content == e) {
+                assert!(!globs.contains(e), "{t} matches .{e} files by content only");
+                assert_eq!(magic, rule, "{t}'s magic rule for .{e} files");
+            } else {
+                assert!(globs.contains(e), "{t} has no *.{e} glob");
+            }
+        }
+        for t in &listed {
+            assert!(LINUX_TYPES.iter().any(|(_, known)| known == t), "the desktop entry lists {t}, which the app doesn't open");
+        }
+        for (t, globs, _) in &declared {
+            assert!(listed.contains(t), "the desktop entry doesn't list the declared {t}");
+            for g in globs {
+                assert!(LINUX_TYPES.contains(&(*g, *t)), "{t}'s *.{g} isn't a file the app opens as {t}");
+            }
+        }
     }
 }

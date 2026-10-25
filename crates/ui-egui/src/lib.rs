@@ -25,15 +25,18 @@ pub mod cursors;
 pub mod dialogs;
 pub mod dock;
 mod edit_toolbar;
+pub mod export_progress;
 pub mod find_font;
 pub mod floating;
 pub mod font_menu;
+mod frame_rate;
 mod free_transform;
 pub mod graphics;
 pub mod i18n;
 pub mod icon_data;
 pub mod icons;
 pub mod io;
+pub mod keymap;
 pub mod menus;
 pub mod native_menu;
 pub mod opening;
@@ -42,6 +45,8 @@ mod panel_docking;
 pub mod panels;
 pub mod picks;
 pub mod place;
+pub mod placing;
+pub mod plugin_runs;
 pub mod prefs_dialog;
 pub mod print;
 pub mod recovery;
@@ -51,6 +56,7 @@ mod scrub;
 pub mod shortcut_editor;
 pub mod shortcuts;
 pub mod state;
+pub mod stylus;
 pub mod sysclip;
 pub mod theme;
 pub mod thumb_worker;
@@ -62,6 +68,7 @@ pub mod unsaved;
 pub mod widgets;
 pub mod workspaces;
 
+mod document_drag;
 #[cfg(test)]
 mod tests_adjust;
 #[cfg(test)]
@@ -80,6 +87,8 @@ mod tests_cut;
 mod tests_distortkeys;
 #[cfg(test)]
 mod tests_docsetup;
+#[cfg(test)]
+mod tests_document_drag;
 #[cfg(test)]
 mod tests_font_menu;
 #[cfg(test)]
@@ -110,6 +119,8 @@ mod tests_pdfoutput;
 mod tests_picks;
 #[cfg(test)]
 mod tests_place;
+#[cfg(test)]
+mod tests_plugin_runs;
 #[cfg(test)]
 mod tests_plugins;
 #[cfg(test)]
@@ -155,6 +166,8 @@ mod tests_sysclip_emf;
 #[cfg(test)]
 mod tests_sysclip_probe;
 #[cfg(test)]
+mod tests_taskbar;
+#[cfg(test)]
 mod tests_transparencygrid;
 #[cfg(test)]
 mod tests_widthtool;
@@ -171,14 +184,18 @@ pub use control::{ControlRequest, ControlResponse, Ticket as ControlTicket};
 pub use state::{UiState, View};
 pub use sysclip::{ClipboardProbeFactory, SystemClipboard};
 
+/// A file type a dialog filters by: its label, which shows translated, and its extensions without
+/// the dot.
+pub type FileFilter = (String, Vec<String>);
+
 /// What a file dialog shows: a suggested file name (save dialogs), the folder to start in and the
 /// file-type filters.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FilePick {
     pub name: String,
     pub folder: Option<String>,
-    /// `(label, extensions without the dot)`, the default type first; empty = every file.
-    pub filters: Vec<(&'static str, &'static [&'static str])>,
+    /// The default type first; empty = every file.
+    pub filters: Vec<FileFilter>,
 }
 
 impl FilePick {
@@ -186,12 +203,23 @@ impl FilePick {
     pub fn named(name: &str) -> Self {
         Self { name: name.to_string(), ..Default::default() }
     }
+
+    /// The file type `label` with `extensions`.
+    pub fn filter(label: &str, extensions: &[&str]) -> FileFilter {
+        (label.to_owned(), extensions.iter().map(|e| (*e).to_owned()).collect())
+    }
+
+    /// The file types of `list`, as the engine lists them: `(label, extensions)`.
+    pub fn filters<'a>(list: impl IntoIterator<Item = (&'a str, &'a [&'a str])>) -> Vec<FileFilter> {
+        list.into_iter().map(|(label, extensions)| Self::filter(label, extensions)).collect()
+    }
 }
 
 pub type PickOpen = Box<dyn FnMut(&FilePick) -> Option<String>>;
 pub type PickSave = Box<dyn FnMut(&FilePick) -> Option<String>>;
 pub type ReadFn = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
 pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
+pub type ExistsFn = Box<dyn Fn(&str) -> bool>;
 pub type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 /// Starts a browser download of the bytes under a file name; an error when it couldn't be started
 /// (the save or export then fails as a refused write does: #1693).
@@ -199,6 +227,18 @@ pub type DownloadFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 
 /// Opens a URL in the system browser.
 pub type OpenUrlFn = Box<dyn FnMut(&str)>;
+
+/// Whether a URL from a document may open in the browser: an `http:`, `https:` or `mailto:` URL
+/// without control characters. The system hands other schemes (`file:`, application schemes) to
+/// other programs.
+pub(crate) fn browsable_url(url: &str) -> Result<(), String> {
+    let scheme = url.split_once(':').map_or("", |(s, _)| s);
+    if ["http", "https", "mailto"].iter().any(|k| scheme.eq_ignore_ascii_case(k)) && !url.chars().any(char::is_control) {
+        Ok(())
+    } else {
+        Err(format!("only http, https and mailto URLs open in the browser, not “{url}”"))
+    }
+}
 
 /// Shows a file in the system file manager, or opens it in its app.
 pub type RevealFn = Box<dyn FnMut(&str) -> Result<(), String>>;
@@ -212,6 +252,10 @@ pub struct Services {
     pub pick_save: Option<PickSave>,
     pub read: Option<ReadFn>,
     pub write: Option<WriteFn>,
+    /// Is there a file or folder at a path (desktop)? The app asks before replacing a file that a
+    /// save panel's name names once the app gives it an extension ([`picks::ask_to_replace`]).
+    /// Without it, no file counts as there.
+    pub exists: Option<ExistsFn>,
     /// Files that arrived asynchronously (web open / drops): (name, bytes).
     pub inbox: Option<Inbox>,
     /// Web: trigger a browser download instead of writing a path.
@@ -275,6 +319,15 @@ pub struct Services {
     /// The window is on Wayland: the tool cursors are painted into it instead of handed to the
     /// compositor as bitmaps ([`cursors::os_cursors`]).
     pub wayland: bool,
+    /// On Wayland, no cursor theme can be loaded, so winit sets no pointer and the compositor's
+    /// default one would never come back once the canvas hid it: the canvas keeps the system
+    /// pointer visible next to the tool glyph ([`cursors::hide_system_pointer`], #2450).
+    pub no_cursor_theme: bool,
+    /// The pen pressure and pen end the host reads from the system itself (desktop Linux under
+    /// X11 and XWayland). The canvas uses the pressure when a frame's events carry no touch force,
+    /// and the end to switch to the Eraser tool and back. Without it, pen pressure comes from
+    /// touch events only ([`stylus`]).
+    pub stylus: Option<stylus::StylusFeed>,
 }
 
 /// Cached canvas raster.
@@ -282,17 +335,33 @@ pub struct CanvasCache {
     pub renderer: vectorcraft_render::Renderer,
     pub texture: Option<egui::TextureHandle>,
     pub key: Option<CacheKey>,
+    /// The document the frame shown was rendered from, and the options it was rendered with, with
+    /// [`Self::key`]: when only the document changes, the canvas renders again only where it
+    /// changed ([`vectorcraft_render::changed`]).
+    pub shown: Option<(std::sync::Arc<vectorcraft_doc::Document>, vectorcraft_render::RenderOptions)>,
     pub last_ms: f64,
-    /// The frame shown drew raster effects from rasters made before their objects moved
-    /// ([`vectorcraft_render::FrameStats::moved`]): the next frame outside an interaction runs
-    /// them again, on the worker when there is one.
+    /// The frame shown drew raster effects from rasters made before their objects moved, or at a
+    /// drag's lower resolution ([`vectorcraft_render::FrameStats::moved`]): the next frame outside
+    /// an interaction runs them again, on the worker when there is one.
     pub moved: bool,
+    /// The frame shown was rendered on the worker: an interaction's frames stay there
+    /// ([`canvas::show`]).
+    pub from_worker: bool,
+    /// Set in the web build, which has no render worker: while the view changes on a document whose
+    /// last render took more than 8 ms, the canvas draws the frame shown reprojected and renders
+    /// once the view has been still for [`canvas::STILL_SECS`].
+    pub waits_for_still: bool,
+    /// The cache key the canvas last asked for and when it first asked for it (seconds, egui's
+    /// input time), kept while [`Self::waits_for_still`] is set.
+    pub still: Option<(CacheKey, f64)>,
     pub worker: Option<render_worker::Worker>,
     pub worker_started: bool,
     /// The slices as laid out for (document uid, revision): the canvas draws them every frame.
     pub slices: Option<SliceCache>,
     /// The print tiling's pages for (document uid, revision) (View → Show Print Tiling).
     pub print_tiling: Option<PrintTilingCache>,
+    /// The gap lines View → Show Live Paint Gaps draws for (document uid, revision).
+    pub live_paint_gaps: Option<LivePaintGapsCache>,
     /// The marks Type → Show Hidden Characters drew on each text object in the last frame. A frame
     /// that does not draw them drops them ([`canvas::show`]).
     pub hidden_chars: canvas::HiddenChars,
@@ -304,10 +373,20 @@ pub struct CanvasCache {
     pub content_bounds: Option<((u64, u64), Option<vectorcraft_geom::Rect>)>,
     /// The tools' cursors as OS cursor bitmaps.
     pub cursors: cursors::Images,
+    /// The view the canvas last drew and when it last changed (egui's input time): while it moves,
+    /// the canvas doesn't hit-test the art under the pointer ([`canvas::hover_wait`], #2452).
+    pub view_moved: Option<(canvas::ViewKey, f64)>,
+    /// The cursor the active tool last gave over the canvas, with the tool and the modifier keys
+    /// it was for: kept while the view moves.
+    pub hover_cursor: Option<(&'static str, vectorcraft_tools::Mods, vectorcraft_tools::Cursor)>,
 }
 
 /// [`CanvasCache::slices`]: the layout of the slices of (document uid, revision).
 pub type SliceCache = ((u64, u64), std::sync::Arc<Vec<vectorcraft_doc::SliceArea>>);
+
+/// [`CanvasCache::live_paint_gaps`]: the gap lines of the selected Live Paint groups of (document
+/// uid, revision).
+pub type LivePaintGapsCache = ((u64, u64), std::sync::Arc<Vec<vectorcraft_tools::Overlay>>);
 
 /// [`CanvasCache::print_tiling`]: the print tiling of (document uid, revision).
 pub type PrintTilingCache = ((u64, u64), std::sync::Arc<Vec<vectorcraft_pdf::TilingPage>>);
@@ -318,6 +397,8 @@ pub struct CacheKey {
     pub revision: u64,
     /// An interaction is in progress ([`vectorcraft_render::RenderOptions::interacting`]).
     pub interacting: bool,
+    /// A tool's drag on the canvas is in progress ([`vectorcraft_render::RenderOptions::dragging`]).
+    pub dragging: bool,
     pub zoom: f64,
     pub cx: f64,
     pub cy: f64,
@@ -325,13 +406,17 @@ pub struct CacheKey {
     pub h: u32,
     pub outline: bool,
     pub trim: bool,
-    /// View › Hide Template: template layers left out ([`vectorcraft_render::RenderOptions::skip_templates`]).
+    /// View › Hide Template: template layers left out ([`vectorcraft_render::RenderOptions::hide_templates`]).
     pub templates: bool,
+    /// View › Show/Hide Guides: whether guide paths are visible in the artwork raster.
+    pub guides: bool,
     pub ppp: f32,
     pub hidden: Vec<u64>,
     pub rot: f64,
     /// General › Anti-aliased Artwork.
     pub anti_alias: bool,
+    /// Type › Highlight Alternate Glyphs (#394).
+    pub highlight_alternate_glyphs: bool,
     /// [`vectorcraft_render::placed_document::generation`]: placed documents' bitmaps made since.
     pub placed: u64,
     /// View › Pixel Preview: the document pixels rendered (x0, y0, x1, y1), one per point, shown
@@ -346,6 +431,9 @@ pub struct CacheKey {
     pub rich_black: bool,
     /// Colour and style of guide paths ([`vectorcraft_render::RenderOptions::guide`]).
     pub guide: ([u8; 3], bool),
+    /// The Image Trace objects drawn with their source image
+    /// ([`vectorcraft_render::RenderOptions::trace_source`]).
+    pub trace_source: Option<std::sync::Arc<Vec<vectorcraft_doc::NodeId>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -367,6 +455,8 @@ pub struct VectorcraftApp {
     pub titlebar_inset: f32,
     /// Last applied effect (Effect → Apply Last Effect).
     pub last_effect: Option<(String, serde_json::Value)>,
+    /// Last confirmed Warp Options (bend, distortion, orientation) for the next new warp dialog.
+    pub last_warp: Option<serde_json::Value>,
     /// Commands run through [`Self::run`] so far: the native menu bar reads its rows again when it
     /// moves ([`native_menu::sync`]).
     run_count: u64,
@@ -385,7 +475,8 @@ pub struct VectorcraftApp {
     /// Installed fonts added to the UI's for characters its own fonts lack (CJK names…).
     ui_fonts: ui_fonts::UiFonts,
     frame: u64,
-    last_time: f64,
+    /// The status bar's frame rate ([`frame_rate`]).
+    frame_rate: frame_rate::FrameRate,
     /// Canvas rect of the last frame (screen points), for control-channel coordinate mapping.
     pub canvas_rect: Option<egui::Rect>,
     /// Hover position in document coordinates.
@@ -424,15 +515,25 @@ pub struct VectorcraftApp {
     pub(crate) picks: picks::Picks,
     /// The screen color sampler shown and not answered yet, and where its color goes.
     pub(crate) screen_sampler: Option<screen_color::Waiting>,
-    /// The look for fonts installed or removed while the app was in the background, running
-    /// ([`Self::refresh_installed_fonts`]): whether they were.
-    font_check: Option<std::sync::mpsc::Receiver<bool>>,
+    /// The look for fonts installed or removed meanwhile, running
+    /// ([`Self::refresh_installed_fonts`]): whether they were, and whether to wake the app for
+    /// the answer.
+    font_check: Option<(std::sync::mpsc::Receiver<bool>, bool)>,
+    /// When installed fonts were last checked in line (app time, s).
+    #[cfg(not(target_arch = "wasm32"))]
+    font_install_check_at: f64,
     /// Keyboard pastes of something other than text (see [`shortcuts::PasteChord`]).
     pub(crate) paste_chord: shortcuts::PasteChord,
+    /// Runs the frame's key presses against the keymap ([`shortcuts::handle`]).
+    pub(crate) dispatcher: craft_keymap::egui::Dispatcher,
     /// Saves and exports running in the background (Preferences → File Handling).
     pub background: background::Background,
     /// Documents being read off the UI thread ([`opening`]).
     pub opening: opening::Opening,
+    /// Heavy plug-in filters running off the UI thread ([`plugin_runs`]).
+    pub plugin_runs: plugin_runs::PluginRuns,
+    /// Files being read off the UI thread for Place ([`placing`]).
+    pub placing: placing::Placing,
     /// Data Recovery's timer and startup question ([`recovery`]).
     pub recovery: recovery::Timer,
     /// Modifiers the keyboard holds (from the host's input), given back after synthetic input.
@@ -446,9 +547,13 @@ pub struct VectorcraftApp {
     pub(crate) ime_discard: bool,
     /// Preferences were confirmed (see [`Self::take_prefs_changed`]).
     pub(crate) prefs_changed: bool,
+    /// Whether the last frame's input reported a touch screen (Preferences › Devices › Touch Workspace).
+    pub touch_screen: bool,
     /// A numeric field is being scrubbed: the document's edits meanwhile are one undo step
     /// ([`scrub::begin_frame`]).
     scrub_group: bool,
+    /// The undo step of the scrub in progress ([`vectorcraft_engine::Session::begin_undo_scope`]).
+    scrub_scope: Option<vectorcraft_engine::UndoScope>,
     /// The folders control requests, and the input they inject, may read and write
     /// (`--automation-read-root`, `--automation-write-root`); `None`: anywhere. See
     /// [`Self::with_automation_roots`].
@@ -456,6 +561,9 @@ pub struct VectorcraftApp {
     /// This frame carries input the control channel injected ([`Self::raw_input_hook`]): it runs
     /// confined to [`Self::automation_roots`].
     synthetic_frame: bool,
+    /// The pen end the canvas saw last and the tool its eraser end stands in for
+    /// ([`stylus::sync_eraser_tool`]).
+    pub(crate) pen_end: stylus::PenEnd,
 }
 
 /// A window capture asked for through the control channel (`ui.screenshot`), answered once a
@@ -472,14 +580,23 @@ struct PendingScreenshot {
 
 /// Seconds between two looks at the system clipboard for [`VectorcraftApp::system_paste`].
 const SYSTEM_CLIPBOARD_POLL: f64 = 0.25;
+/// Seconds between looks for fonts a font manager activated while the app stays in front (#2576).
+#[cfg(not(target_arch = "wasm32"))]
+const FONT_INSTALL_POLL: f64 = 2.0;
 
 impl VectorcraftApp {
+    /// The app around `session`, reaching the platform through `services` (file pickers, the
+    /// clipboard, files and the like). It starts cataloguing the installed fonts at once, gives
+    /// Data Recovery the host's store and makes a view for each open document.
     pub fn new(mut session: Session, services: Services) -> Self {
         // The font menus and the first file opened need the installed fonts: catalog them now.
         vectorcraft_text::FontDb::global().scan_in_background();
         if let Some(store) = &services.recovery_store {
             session.recovery.set_store(store.clone());
         }
+        // The place cursor's clicks and drags place their files through the app
+        // ([`place::place_from_cursor`]).
+        session.place_cursor_requests = true;
         let views = session.documents().iter().map(View::of).collect();
         Self {
             session,
@@ -490,21 +607,29 @@ impl VectorcraftApp {
                 renderer: vectorcraft_render::Renderer::new(),
                 texture: None,
                 key: None,
+                shown: None,
                 last_ms: 0.0,
                 moved: false,
+                from_worker: false,
+                waits_for_still: cfg!(target_arch = "wasm32"),
+                still: None,
                 worker: None,
                 worker_started: false,
                 slices: None,
                 print_tiling: None,
+                live_paint_gaps: None,
                 hidden_chars: Default::default(),
                 selection_box: None,
                 selection_bounds: None,
                 content_bounds: None,
                 cursors: Default::default(),
+                view_moved: None,
+                hover_cursor: None,
             },
             perf: Perf::default(),
             titlebar_inset: 0.0,
             last_effect: None,
+            last_warp: None,
             run_count: 0,
             clipboard_out: None,
             clipboard_published: None,
@@ -521,7 +646,7 @@ impl VectorcraftApp {
             context: 0,
             ui_fonts: Default::default(),
             frame: 0,
-            last_time: 0.0,
+            frame_rate: Default::default(),
             canvas_rect: None,
             hover_doc: None,
             custom_titlebar: false,
@@ -534,18 +659,27 @@ impl VectorcraftApp {
             picks: picks::Picks::default(),
             screen_sampler: None,
             font_check: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            font_install_check_at: f64::NEG_INFINITY,
             paste_chord: Default::default(),
+            // Held keys repeat their command (Cmd+= keeps zooming in).
+            dispatcher: craft_keymap::egui::Dispatcher::new().with_repeat(true),
             background: Default::default(),
             opening: Default::default(),
+            plugin_runs: Default::default(),
+            placing: Default::default(),
             recovery: Default::default(),
             host_modifiers: Default::default(),
             synthetic_modifiers: false,
             ime_marked: None,
             ime_discard: false,
             prefs_changed: false,
+            touch_screen: false,
             scrub_group: false,
+            scrub_scope: None,
             automation_roots: None,
             synthetic_frame: false,
+            pen_end: Default::default(),
         }
     }
 
@@ -615,13 +749,53 @@ impl VectorcraftApp {
         }
     }
 
+    /// The active document's uid, how many times the tool has started afresh
+    /// ([`vectorcraft_engine::Session::tool_resets`]) and the artboards the Artboard tool has
+    /// selected (null with another tool), which [`Self::follow_artboard_tool`] compares before and
+    /// after a command.
+    fn artboard_tool_state(&self) -> (Option<u64>, u64, Value) {
+        let selected = if self.session.tool_id() == "artboard" { self.session.tool_options()["selected"].clone() } else { Value::Null };
+        (self.session.active().map(|d| d.uid), self.session.tool_resets(), selected)
+    }
+
+    /// After a command run with the Artboard tool, given [`Self::artboard_tool_state`] from before
+    /// it: when the command chose another document, or started the tool afresh in the same one
+    /// (File › Revert, a `command.batch` or `action.batch` that reverts it or switches to another
+    /// document and back), the tool takes the document's active artboard, as choosing its tab
+    /// does. When the command changed the artboards the tool has selected (Paste and Cut with the
+    /// tool, `tool.setOption`), also after starting it afresh (a batch step after the revert or the
+    /// switch), the tool's active artboard becomes the active one (the view's), as a click with the
+    /// tool makes it.
+    fn follow_artboard_tool(&mut self, before: (Option<u64>, u64, Value)) {
+        self.sync_views();
+        if self.session.tool_id() != "artboard" {
+            return;
+        }
+        let Some(n) = self.session.active().map(|d| d.doc.artboards.len()).filter(|n| *n > 0) else { return };
+        let (doc, resets, selected) = self.artboard_tool_state();
+        // The tool started afresh during the command, and no later step (a Paste or Cut) set its options.
+        let reset = resets != before.1;
+        let fresh = reset && !self.session.tool_set_since_reset();
+        if fresh || (doc != before.0 && !reset) {
+            panels::artboards::select(self, panels::artboards::selected(self, n));
+        } else if (reset || selected != before.2)
+            && let Some(i) = self.session.tool_options()["active"].as_u64().and_then(|i| usize::try_from(i).ok())
+            && i < n
+            && let Some(v) = self.view_mut()
+        {
+            v.artboard = i;
+        }
+    }
+
     pub fn view(&self) -> Option<&View> {
         self.session.active_index().and_then(|i| self.views.get(i))
     }
 
-    /// The zero point shown by rulers and position fields; command coordinates stay absolute.
+    /// The zero point shown by rulers and position fields: the document's with global rulers, the
+    /// active artboard's with artboard rulers. Command coordinates stay absolute.
     pub(crate) fn ruler_origin(&self) -> vectorcraft_geom::Point {
-        self.session.active().map_or(vectorcraft_geom::Point::ZERO, |d| d.doc.ruler_origin_or_zero())
+        let artboard = self.view().map_or(0, |v| v.artboard);
+        self.session.active().map_or(vectorcraft_geom::Point::ZERO, |d| d.doc.ruler_origin_for(artboard))
     }
     pub fn view_mut(&mut self) -> Option<&mut View> {
         self.sync_views();
@@ -641,8 +815,10 @@ impl VectorcraftApp {
             // nor the Live Corners widgets, and the tools do not answer the pointer on them.
             show_bbox: self.ui.view.bounding_box && self.ui.view.edges,
             snap_to_point: self.ui.view.snap_to_point,
+            snap_to_glyph: self.ui.view.snap_to_glyph,
             corner_widgets: self.ui.view.corner_widgets && self.ui.view.edges,
             screen: self.screen_frame(),
+            artboard: self.view().map_or(0, |v| v.artboard),
         }
     }
 
@@ -671,13 +847,16 @@ impl VectorcraftApp {
 
     /// [`Self::run`] it, inside what asks for file dialogs.
     fn run_now(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        crate::state::sync_zoom_stops_display_print_size(self.session.prefs.display_print_size);
         self.run_count = self.run_count.wrapping_add(1);
         // In debug builds the app's own calls are held to the params descriptions too (#1442): a
         // panel passing a key its command doesn't read shows up in the tests.
         if cfg!(debug_assertions) {
             menus::check_params(&self.session, id, &params)?;
         }
+        let artboards = self.artboard_tool_state();
         if let Some(r) = menus::run_ui_command(self, id, &params) {
+            self.follow_artboard_tool(artboards);
             return r;
         }
         let mut params = params;
@@ -734,9 +913,17 @@ impl VectorcraftApp {
             self.publish_clipboard();
         }
         self.sync_views();
+        // File › Revert replaces the document in its tab, keeps the tab's view and starts the tool afresh.
+        self.follow_artboard_tool(artboards);
         match &r {
             Err(e) => self.ui.status = e.clone(),
             Ok(v) => {
+                // Image Trace's notes (a large image traces more slowly, or was scaled down).
+                if id.starts_with("imageTrace.make")
+                    && let Some(w) = v["warnings"].as_array().and_then(|w| w.first()).and_then(Value::as_str)
+                {
+                    self.ui.status = w.to_string();
+                }
                 if id == "file.new" {
                     self.ui.status.clear();
                     // New Document's Pixel preview mode (Overprint Preview is the engine's).
@@ -744,13 +931,23 @@ impl VectorcraftApp {
                         self.ui.view.pixel_preview = true;
                     }
                 }
-                if id == "text.setStyle"
+                // Choosing a data set, or stepping to one, clears the status bar. The reply's `warning`
+                // below then shows when no object is bound to a variable the data set has a value for.
+                if matches!(id, "dataset.select" | "dataset.next" | "dataset.prev") {
+                    self.ui.status.clear();
+                }
+                if matches!(id, "text.setStyle" | "text.setRangeStyle")
                     && let Some(font) = params.get("font").and_then(Value::as_str)
                 {
                     let r = &mut self.ui.recent_fonts;
-                    r.retain(|f| f != font);
+                    r.retain(|f| !f.eq_ignore_ascii_case(font));
                     r.insert(0, font.to_string());
                     r.truncate(MAX_RECENT_FONTS);
+                }
+                // A command's warning (Rasterize's when an image couldn't be decoded) shows in the
+                // status bar, as a tool preview's does.
+                if let Some(w) = v.get("warning").and_then(Value::as_str) {
+                    self.ui.status = w.to_string();
                 }
             }
         }
@@ -766,6 +963,24 @@ impl VectorcraftApp {
         self.ui.status = format!("Opened {url}");
     }
 
+    /// Open `url`, which came from a document (an object's URL attribute), in the browser:
+    /// [`browsable_url`]s only.
+    pub(crate) fn open_document_url(&mut self, url: &str) -> Result<(), String> {
+        browsable_url(url)?;
+        self.open_url(url);
+        Ok(())
+    }
+
+    /// Refuse UI command `id`, which hands something to another app, when automation sent it (a
+    /// control or MCP request, or a frame of synthetic input): the automation roots don't confine
+    /// what that app does.
+    pub(crate) fn refuse_automation(&self, id: &str) -> Result<(), String> {
+        if self.ui.answering_control || self.synthetic_frame {
+            return Err(format!("{id} opens another app: only the person at the keyboard can run it"));
+        }
+        Ok(())
+    }
+
     /// Run a Help link command and open the URL it returns.
     pub fn open_link(&mut self, id: &str) {
         if let Ok(v) = self.run(id, serde_json::json!({}))
@@ -778,9 +993,24 @@ impl VectorcraftApp {
 
     /// Select a tool (also used by the toolbar and shortcuts).
     pub fn select_tool(&mut self, id: &str) {
+        // The tip of a pen whose eraser end selected the Eraser doesn't undo this choice.
+        self.pen_end.forget_tool();
+        self.activate_tool(id, true);
+    }
+
+    /// Go back to tool `id` after a tool that stood in for it (the pen's eraser end, [`stylus`]):
+    /// a perspective grid hidden meanwhile stays hidden.
+    pub(crate) fn return_to_tool(&mut self, id: &str) {
+        self.activate_tool(id, false);
+    }
+
+    /// Make tool `id` active: chosen afresh (`fresh`, [`vectorcraft_engine::Session::select_tool`]),
+    /// or back from a tool that stood in for it ([`vectorcraft_engine::Session::switch_tool`]).
+    fn activate_tool(&mut self, id: &str, fresh: bool) {
         let v = self.view_info();
         let before = self.session.tool_id();
-        if let Err(e) = self.session.select_tool(id, v) {
+        let switched = if fresh { self.session.select_tool(id, v) } else { self.session.switch_tool(id, v) };
+        if let Err(e) = switched {
             self.ui.status = e.to_string();
         }
         // A newly chosen Artboard tool starts on the active artboard (the view's).
@@ -1037,7 +1267,7 @@ impl VectorcraftApp {
         {
             return b;
         }
-        let b = match st.selection.anchor_bounds(&st.doc, self.session.prefs.use_preview_bounds) {
+        let b = match vectorcraft_effects::preview::anchor_bounds(&st.selection, &st.doc, self.session.prefs.use_preview_bounds) {
             Some(r) => Some(vectorcraft_doc::OrientedBox::aligned(r)),
             None => self.session.transform_box(&st.selection.objects),
         };
@@ -1045,9 +1275,9 @@ impl VectorcraftApp {
         b
     }
 
-    /// The selection's visual bounds (stroke and effects included), square to the page: measured
-    /// once per revision, as the canvas reads it every frame (a traced photo selects a group of
-    /// hundreds of thousands of paths).
+    /// The selection's visual bounds (strokes included, effects left out), square to the page:
+    /// measured once per revision, as the canvas reads it every frame (a traced photo selects a
+    /// group of hundreds of thousands of paths).
     pub fn selection_bounds(&mut self) -> Option<vectorcraft_geom::Rect> {
         let st = self.session.active()?;
         let key = (st.uid, st.revision);
@@ -1099,6 +1329,9 @@ impl VectorcraftApp {
         }
     }
 
+    /// [`Self::logic`]'s work, inside its guard: the UI language and styling, the clipboard and
+    /// font polls, the results of work done in the background (saves, exports, files being opened,
+    /// heavy plug-in filters) and the window's close button.
     fn logic_frame(&mut self, ctx: &egui::Context) {
         let lang = self.ui_language();
         i18n::set_current(lang);
@@ -1117,11 +1350,7 @@ impl VectorcraftApp {
         }
         self.frame += 1;
         let now = ctx.input(|i| i.time);
-        let dt = now - self.last_time;
-        if dt > 0.0 {
-            self.perf.fps = self.perf.fps * 0.9 + (1.0 / dt).min(240.0) * 0.1;
-        }
-        self.last_time = now;
+        self.perf.fps = self.frame_rate.frame(now, self.perf.frame_ms / 1000.0);
         self.sync_views();
         // Read the system clipboard only when that alone decides whether Paste is enabled. A
         // background thread reads it where the host installs one (an unresponsive owner must never
@@ -1138,15 +1367,27 @@ impl VectorcraftApp {
             self.system_paste_at = now;
             self.system_paste = wanted && self.system_clipboard_pasteable();
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if !(0.0..FONT_INSTALL_POLL).contains(&(now - self.font_install_check_at)) {
+            self.font_install_check_at = now;
+            // Read on the next frame the app draws anyway: an idle app isn't woken for it.
+            self.refresh_installed_fonts(false);
+        }
         self.poll_font_check(ctx);
         picks::poll(self, ctx);
         self.write_formats_before_text_input(ctx);
         background::poll(self);
         screen_color::poll(self, ctx);
         opening::poll(self);
+        plugin_runs::poll(self);
+        placing::poll(self);
         #[cfg(not(target_arch = "wasm32"))]
         self.tick_link_updates(ctx, now);
-        if !self.background.jobs.is_empty() || !self.opening.pending.is_empty() {
+        if !self.background.jobs.is_empty()
+            || !self.opening.pending.is_empty()
+            || !self.plugin_runs.running.is_empty()
+            || !self.placing.pending.is_empty()
+        {
             // Keep the status bar's progress moving and pick the result up when it arrives.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -1172,6 +1413,7 @@ impl VectorcraftApp {
             // The timer and heartbeat run in an idle window too.
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
+        crate::keymap::note_os(ctx);
         shortcut_editor::sync(&self.ui);
         prefs_dialog::apply_runtime(self, ctx);
         // The OS title bar (and the taskbar / Alt-Tab entry) follows the active file; with the
@@ -1232,12 +1474,15 @@ impl VectorcraftApp {
         place::drop_files(self, files);
     }
 
-    /// Fonts installed or removed while the app was in the background are listed when it comes
-    /// back (Refresh Font List by itself): a look at the font folders, a scan only when they changed.
+    /// Fonts installed or removed while the app runs are listed without Refresh Font List: a look
+    /// at the font folders and the platform's font list on a timer and when the window comes back,
+    /// a scan only when they changed.
     /// The look runs on another thread (asking DirectWrite for the fonts font services loaded
-    /// meanwhile takes tens of milliseconds on Windows, #579), [`Self::poll_font_check`] scans.
-    fn refresh_installed_fonts(&mut self) {
-        if self.font_check.is_some() {
+    /// meanwhile takes tens of milliseconds on Windows, #579), [`Self::poll_font_check`] scans;
+    /// `wake` wakes the app for the answer.
+    fn refresh_installed_fonts(&mut self, wake: bool) {
+        if let Some((_, w)) = &mut self.font_check {
+            *w |= wake;
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1250,12 +1495,12 @@ impl VectorcraftApp {
         if spawned.is_none() {
             look();
         }
-        self.font_check = Some(rx);
+        self.font_check = Some((rx, wake));
     }
 
     /// Rescan the fonts once [`Self::refresh_installed_fonts`]'s look says they changed.
     fn poll_font_check(&mut self, ctx: &egui::Context) {
-        let Some(check) = &self.font_check else { return };
+        let Some((check, wake)) = &self.font_check else { return };
         match check.try_recv() {
             Ok(changed) => {
                 self.font_check = None;
@@ -1264,7 +1509,11 @@ impl VectorcraftApp {
                     let _ = self.run("text.rescanFonts", json!({}));
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if *wake {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+            }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.font_check = None,
         }
     }
@@ -1286,7 +1535,7 @@ impl VectorcraftApp {
             match e {
                 egui::Event::ModifiersChanged(m) => self.host_modifiers = *m,
                 egui::Event::WindowFocused(false) => self.host_modifiers = egui::Modifiers::NONE,
-                egui::Event::WindowFocused(true) => self.refresh_installed_fonts(),
+                egui::Event::WindowFocused(true) => self.refresh_installed_fonts(true),
                 _ => {}
             }
         }
@@ -1340,16 +1589,22 @@ impl VectorcraftApp {
         }
     }
 
+    /// [`Self::ui`]'s work, inside its guard: the bars, panels and canvas, then the dialogs and
+    /// progress windows over them.
     fn ui_frame(&mut self, ui: &mut egui::Ui) {
+        crate::state::sync_zoom_stops_display_print_size(self.session.prefs.display_print_size);
         let ctx = ui.ctx().clone();
         if !self.fonts_ready {
             ctx.request_repaint();
             return;
         }
         let t0 = now_ms();
+        widgets::set_dialog_open(&ctx, self.ui.dialog.is_some());
         scrub::begin_frame(self, &ctx);
         font_menu::end_stale_preview(self, &ctx);
         floating::track(self, &ctx);
+        // A selection move released over a panel ends before any panel sees the release (#2826).
+        canvas::release_over_panel(self, &ctx);
         let t = theme::Tokens::get(&ctx);
         if self.ui.screen_mode < 2 {
             chrome::app_bar(self, ui);
@@ -1367,6 +1622,7 @@ impl VectorcraftApp {
         if self.ui.toolbar && self.ui.screen_mode < 3 {
             toolbar::show(self, ui);
         }
+        panels::library_panel::tidy(self);
         if self.ui.dock && self.ui.screen_mode < 3 {
             dock::show(self, ui);
         }
@@ -1375,11 +1631,19 @@ impl VectorcraftApp {
                 chrome::doc_tabs(self, ui);
             }
             canvas::show(self, ui);
+            // Over the canvas inside the rulers, so the rulers and scroll bars stay uncovered.
+            if self.ui.screen_mode < 3
+                && !menus::home_showing(self)
+                && let Some(area) = self.canvas_rect
+            {
+                chrome::isolation_bar(self, ui, area);
+            }
         });
         dock::floating_panel(self, &ctx);
         floating::show(self, &ctx);
-        panels::library_panel::show_window(self, &ctx);
         dialogs::show(self, &ctx);
+        export_progress::show(self, &ctx);
+        plugin_runs::show(self, &ctx);
         palette::show(self, &ctx);
         if self.custom_titlebar {
             titlebar::resize_zones(ui);
@@ -1388,6 +1652,9 @@ impl VectorcraftApp {
         scrub::end_frame(self, &ctx);
         native_menu::sync(self, &ctx);
         self.drop_formats_after_egui_copy(&ctx);
+        if opening::long_operation_busy(self) {
+            ctx.set_cursor_icon(egui::CursorIcon::Progress);
+        }
         self.perf.frame_ms = now_ms() - t0;
         let _ = json!(null);
     }

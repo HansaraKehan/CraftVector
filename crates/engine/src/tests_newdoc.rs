@@ -174,6 +174,20 @@ fn categories_list_generated_presets_with_neutral_names() {
     assert!(s.execute("file.newPresets", &json!({"category": "Furniture"})).is_err());
 }
 
+/// Branding has the Japanese business card, 91 × 55 mm, after the 85 × 55 mm one (#3828).
+#[test]
+fn branding_has_the_japanese_business_card() {
+    let mut s = Session::new();
+    let branding = presets(&mut s, "Branding");
+    let names: Vec<&str> = branding.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    let at = names.iter().position(|n| *n == "Business Card 91 × 55 mm").unwrap_or_else(|| panic!("{names:?}"));
+    assert_eq!(names[at - 1], "Business Card 85 × 55 mm");
+    s.execute("file.new", &json!({"preset": "Business Card 91 × 55 mm"})).unwrap();
+    let b = boards(&s)[0];
+    let mm = 72.0 / 25.4;
+    assert!((b.width() - 91.0 * mm).abs() < 1e-6 && (b.height() - 55.0 * mm).abs() < 1e-6, "{b:?}");
+}
+
 #[test]
 fn recent_remembers_the_last_sizes() {
     let mut s = Session::new();
@@ -192,6 +206,48 @@ fn recent_remembers_the_last_sizes() {
         s.execute("file.new", &json!({"width": 100 + i, "height": 100})).unwrap();
     }
     assert_eq!(presets(&mut s, "Recent").len(), 12);
+}
+
+/// A saved preset or a Recent entry whose size, artboards, spacing or bleed the preferences hold
+/// outside the range `file.new` takes reads as the nearer end of that range (a size of 0 or less
+/// reads as 1 pt), so `file.new` makes a document from it.
+#[test]
+fn a_saved_preset_with_values_out_of_range_reads_in_range() {
+    let mut s = Session::new();
+    let prefs = json!({
+        "newDocPresets": [
+            {"name": "Low", "width": -5, "height": 0, "artboards": 0, "spacing": -50, "bleed": [-5, -1, 0, 9]},
+            {"name": "High", "width": f64::MAX, "height": 200000, "spacing": f64::MAX, "bleed": [100, f64::MAX, 72, 0]},
+            {"name": "Many", "width": 10, "height": 10, "artboards": 5000, "spacing": 0},
+        ],
+        "recentNewDocs": [{"name": "Custom", "width": 100, "height": 50, "artboards": 3, "spacing": -50}],
+    });
+    s.apply_prefs(serde_json::from_value(prefs).unwrap());
+    let read = |p: &Value| {
+        let n = |v: &Value| v.as_f64().unwrap();
+        let bleed: Vec<f64> = p["bleed"].as_array().unwrap().iter().map(n).collect();
+        (n(&p["width"]), n(&p["height"]), n(&p["artboards"]), n(&p["artboardLayout"]["spacing"]), bleed)
+    };
+    let saved: Vec<_> = presets(&mut s, "Saved").iter().map(read).collect();
+    assert_eq!(
+        saved,
+        [
+            (1.0, 1.0, 1.0, 0.0, vec![0.0, 0.0, 0.0, 9.0]),
+            (163830.0, 163830.0, 1.0, 1.0e5, vec![72.0, 72.0, 72.0, 0.0]),
+            (10.0, 10.0, 1000.0, 0.0, vec![0.0; 4]),
+        ]
+    );
+    assert_eq!(read(&presets(&mut s, "Recent")[0]), (100.0, 50.0, 3.0, 0.0, vec![0.0; 4]));
+    // file.new makes each one with those values.
+    s.execute("file.new", &json!({"preset": "Low"})).unwrap();
+    assert_eq!((boards(&s), s.doc().unwrap().doc.setup.bleed), (vec![Rect::new(0.0, 0.0, 1.0, 1.0)], [0.0, 0.0, 0.0, 9.0]));
+    s.execute("file.new", &json!({"preset": "High"})).unwrap();
+    assert_eq!((boards(&s), s.doc().unwrap().doc.setup.bleed), (vec![Rect::new(0.0, 0.0, 163830.0, 163830.0)], [72.0, 72.0, 72.0, 0.0]));
+    s.execute("file.new", &json!({"preset": "Many"})).unwrap();
+    assert_eq!(boards(&s).len(), 1000);
+    let custom = presets(&mut s, "Recent").into_iter().find(|p| p["name"] == "Custom").unwrap();
+    s.execute("file.new", &custom).unwrap();
+    assert_eq!(boards(&s).iter().map(|r| r.x0).collect::<Vec<_>>(), [0.0, 100.0, 200.0], "side by side, not overlapping");
 }
 
 #[test]
@@ -223,6 +279,17 @@ fn saved_presets_live_in_the_preferences() {
     assert_eq!(s.execute("file.newPresets.delete", &json!({"name": "MINE"})).unwrap(), json!({"deleted": "mine"}));
     assert!(presets(&mut s, "Saved").is_empty());
     assert!(s.execute("file.newPresets.save", &json!({"name": " "})).is_err());
+}
+
+#[test]
+fn a_saved_preset_with_the_resolution_out_of_range_reads_in_range() {
+    let mut s = Session::new();
+    let saved = json!({"newDocPresets": [{"name": "Zero", "rasterEffectsPpi": 0}, {"name": "Huge", "rasterEffectsPpi": 5000}]});
+    s.apply_prefs(serde_json::from_value(saved).unwrap());
+    let ppi: Vec<Option<f64>> = presets(&mut s, "Saved").iter().map(|p| p["rasterEffectsPpi"].as_f64()).collect();
+    assert_eq!(ppi, [Some(1.0), Some(2400.0)]);
+    s.execute("file.new", &json!({"preset": "Zero"})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.raster_effects_ppi, 1.0);
 }
 
 #[test]
@@ -275,6 +342,23 @@ fn rearrange_lays_out_by_layout_and_order() {
         s.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(boards(&s), before);
     }
+}
+
+/// Art centered on an artboard's right or bottom edge moves with that artboard, and art centered on
+/// the edge two artboards share, away from its ends, moves with the artboard to the right of it.
+#[test]
+fn rearrange_moves_art_centered_on_an_artboard_edge() {
+    let mut s = new_doc(json!({"width": 100, "height": 50, "artboards": 2, "artboardLayout": {"layout": "row", "spacing": 0}}));
+    assert_eq!(boards(&s), [Rect::new(0.0, 0.0, 100.0, 50.0), Rect::new(100.0, 0.0, 200.0, 50.0)]);
+    let mut line = |x1: f64, y1: f64, x2: f64, y2: f64| {
+        NodeId(s.execute("shape.line", &json!({"x1": x1, "y1": y1, "x2": x2, "y2": y2})).unwrap()["id"].as_u64().unwrap())
+    };
+    let (bottom, right, shared) = (line(10.0, 50.0, 40.0, 50.0), line(200.0, 10.0, 200.0, 40.0), line(100.0, 10.0, 100.0, 40.0));
+    // Right to left, artboard 0 moves 100 pt right and artboard 1 moves 100 pt left.
+    s.execute("artboard.rearrange", &json!({"layout": "row", "order": "rightToLeft", "spacing": 0})).unwrap();
+    assert_eq!(boards(&s), [Rect::new(100.0, 0.0, 200.0, 50.0), Rect::new(0.0, 0.0, 100.0, 50.0)]);
+    let x0 = |id: NodeId| s.doc().unwrap().doc.node(id).unwrap().geometric_bounds().unwrap().x0;
+    assert_eq!((x0(bottom), x0(right), x0(shared)), (110.0, 100.0, 0.0));
 }
 
 /// `byColumn: true` is Grid by Column; without `moveArtwork` the art stays; bad values are errors.

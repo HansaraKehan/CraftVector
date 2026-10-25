@@ -72,6 +72,99 @@ fn five_colours_reduce_to_two() {
     assert_eq!(run(&mut s, "recolor.colors", json!({}))["colors"].as_array().unwrap().len(), 5);
     // Without a count every colour is its own row.
     assert_eq!(run(&mut s, "recolor.reduce", json!({}))["map"].as_array().unwrap().len(), 5);
+    // A count larger than the number of colors also keeps every color in its own row. A 32-bit build read 2^32 + 2 as 2.
+    assert_eq!(run(&mut s, "recolor.reduce", json!({"colors": (1u64 << 32) + 2}))["map"].as_array().unwrap().len(), 5);
+}
+
+#[test]
+fn colors_with_nothing_selected_come_from_all_the_art() {
+    let mut s = session();
+    let red = rect(&mut s, json!("#ff0000"));
+    let blue = rect(&mut s, json!("#0000ff"));
+    run(&mut s, "select.set", json!({"ids": []}));
+    let hexes = |v: &Value| v["colors"].as_array().unwrap().iter().map(|c| c["hex"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    let mut all = hexes(&run(&mut s, "recolor.colors", json!({})));
+    all.sort();
+    assert_eq!(all, ["#0000ff", "#ff0000"]);
+    assert!(s.doc().unwrap().selection.objects.is_empty(), "the selection is left as it was");
+    assert_eq!(run(&mut s, "recolor.reduce", json!({}))["map"].as_array().unwrap().len(), 2);
+    // `ids` names the objects; otherwise the selection does.
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({"ids": [blue.0]}))), ["#0000ff"]);
+    // An id listed twice counts once.
+    let once = run(&mut s, "recolor.colors", json!({"ids": [red.0]}))["colors"].clone();
+    assert_eq!(run(&mut s, "recolor.colors", json!({"ids": [red.0, red.0]}))["colors"], once);
+    assert_eq!(run(&mut s, "recolor.reduce", json!({"ids": [red.0]}))["map"][0]["from"], json!(["rgb 255 0 0"]));
+    run(&mut s, "select.set", json!({"ids": [red.0]}));
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({}))), ["#ff0000"]);
+    let e = s.execute("recolor.colors", &json!({"ids": [9999]})).unwrap_err().to_string();
+    assert!(e.contains("no such object id 9999"), "{e}");
+    // Recolor Artwork still recolors only what is selected.
+    run(&mut s, "select.set", json!({"ids": []}));
+    assert!(s.execute("recolor.apply", &json!({"map": {"#ff0000": "#00ff00"}})).is_err());
+    assert_eq!(fill(&s, red).to_hex(), "#ff0000");
+}
+
+#[test]
+fn colors_with_nothing_selected_leave_out_what_select_all_leaves_out() {
+    let mut s = session();
+    rect(&mut s, json!("#ff0000"));
+    let hidden = rect(&mut s, json!("#0000ff"));
+    let locked = rect(&mut s, json!("#00ff00"));
+    run(&mut s, "object.hide", json!({"ids": [hidden.0]}));
+    run(&mut s, "object.lock", json!({"ids": [locked.0]}));
+    // A hidden layer and a locked layer, each holding a rectangle.
+    for (fill, props) in [("#ffff00", json!({"visible": false})), ("#ff00ff", json!({"locked": true}))] {
+        let layer = run(&mut s, "layer.new", json!({}))["id"].as_u64().unwrap();
+        let id = run(&mut s, "shape.rectangle", json!({"x": 300, "y": 10, "width": 15, "height": 15}))["id"].as_u64().unwrap();
+        run(&mut s, "paint.setFill", json!({"ids": [id], "color": fill}));
+        assert_eq!(s.doc().unwrap().doc.layer_containing(NodeId(id)), Some(NodeId(layer)));
+        let mut p = props;
+        p["id"] = json!(layer);
+        run(&mut s, "layer.setProps", p);
+    }
+    let hexes = |v: &Value| v["colors"].as_array().unwrap().iter().map(|c| c["hex"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    run(&mut s, "select.set", json!({"ids": []}));
+    let none = hexes(&run(&mut s, "recolor.colors", json!({})));
+    assert_eq!(none, ["#ff0000"]);
+    assert_eq!(run(&mut s, "recolor.reduce", json!({}))["map"], json!([{"from": ["rgb 255 0 0"], "to": "rgb 255 0 0"}]));
+    select_all(&mut s);
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({}))), none, "the same colors as after Select All");
+    // `ids` still reads hidden and locked objects.
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({"ids": [hidden.0]}))), ["#0000ff"]);
+}
+
+#[test]
+fn colors_with_nothing_selected_leave_out_hidden_and_locked_objects_in_groups() {
+    let mut s = session();
+    rect(&mut s, json!("#ff0000"));
+    let hidden = rect(&mut s, json!("#0000ff"));
+    let locked = rect(&mut s, json!("#00ff00"));
+    // A group inside the group, holding a hidden rectangle.
+    let inner_hidden = rect(&mut s, json!("#ffff00"));
+    run(&mut s, "select.set", json!({"ids": [inner_hidden.0]}));
+    run(&mut s, "object.group", json!({}));
+    select_all(&mut s);
+    let g = NodeId(run(&mut s, "object.group", json!({}))["id"].as_u64().unwrap());
+    assert_eq!(s.doc().unwrap().doc.layers[0].children().unwrap().len(), 1, "one group holds the art");
+    run(&mut s, "object.hide", json!({"ids": [hidden.0, inner_hidden.0]}));
+    run(&mut s, "object.lock", json!({"ids": [locked.0]}));
+    let hexes = |v: &Value| {
+        let mut h = v["colors"].as_array().unwrap().iter().map(|c| c["hex"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        h.sort();
+        h
+    };
+    run(&mut s, "select.set", json!({"ids": []}));
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({}))), ["#ff0000"]);
+    assert_eq!(run(&mut s, "recolor.reduce", json!({}))["map"], json!([{"from": ["rgb 255 0 0"], "to": "rgb 255 0 0"}]));
+    // Isolation mode reads the same objects of the group.
+    run(&mut s, "object.isolate", json!({"id": g.0}));
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({}))), ["#ff0000"]);
+    run(&mut s, "object.exitIsolation", json!({}));
+    // The group named in `ids`, or selected, is read with everything it holds.
+    let all = ["#0000ff", "#00ff00", "#ff0000", "#ffff00"];
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({"ids": [g.0]}))), all);
+    run(&mut s, "select.set", json!({"ids": [g.0]}));
+    assert_eq!(hexes(&run(&mut s, "recolor.colors", json!({}))), all);
 }
 
 #[test]
@@ -286,6 +379,82 @@ fn edit_group_relinks_art_and_apply_rewrites_the_group_with_the_art() {
     assert_eq!(g.swatches.iter().map(|w| w.paint.color().unwrap()).collect::<Vec<_>>(), [Color::rgb8(1, 2, 3), Color::cmyk(0.0, 0.0, 0.0, 0.2)]);
 }
 
+/// Art linked to a global swatch of the group that `recolor.apply` rewrites stays linked when the
+/// swatch takes its row's new color: it shows that color at its tint and follows later edits.
+#[test]
+fn apply_with_a_group_keeps_art_linked_to_its_global_swatches() {
+    let mut s = session();
+    run(&mut s, "swatch.newGroup", json!({"name": "Brand", "colors": ["#2878f0"]}));
+    let name = s.doc().unwrap().doc.swatch_groups.iter().find(|g| g.name == "Brand").unwrap().swatches[0].name.clone();
+    run(&mut s, "swatch.edit", json!({"name": name, "global": true}));
+    let full = rect(&mut s, json!("#000000"));
+    let tint = rect(&mut s, json!("#000000"));
+    run(&mut s, "paint.setFill", json!({"ids": [full.0], "swatch": name}));
+    run(&mut s, "paint.setFill", json!({"ids": [tint.0], "swatch": name, "tint": 50}));
+    let link = |s: &Session, id: NodeId| match s.doc().unwrap().doc.node(id).unwrap().appearance.fill_paint() {
+        vectorcraft_color::Paint::Solid { color, swatch, tint } => (color, swatch, tint),
+        p => panic!("{p:?}"),
+    };
+    let swatch_hex = |s: &Session| s.doc().unwrap().doc.swatch(&name).unwrap().paint.color().unwrap().to_hex();
+    let orange = Color::from_hex("#ff6a00").unwrap();
+    select_all(&mut s);
+    let undo = s.doc().unwrap().history.undo.len();
+    // The 50% tint is not in the row: it follows the swatch.
+    let r = run(&mut s, "recolor.apply", json!({"map": {"#2878f0": "#ff6a00"}, "group": "Brand"}));
+    assert_eq!(r["relinked"], 1, "{r}");
+    assert_eq!(link(&s, full), (orange, Some(name.clone()), 1.0), "the recolored art stays linked");
+    let (c, w, t) = link(&s, tint);
+    assert!(w.as_deref() == Some(name.as_str()) && t == 0.5 && close(c, orange.tinted(0.5)), "{c:?} {w:?} {t}");
+    assert_eq!(swatch_hex(&s), "#ff6a00");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+    // A later edit of the swatch reaches the art.
+    let r = run(&mut s, "swatch.edit", json!({"name": name, "color": "#00ff00"}));
+    assert_eq!(r["relinked"], 2, "{r}");
+    assert_eq!(fill(&s, full).to_hex(), "#00ff00");
+    assert!(close(fill(&s, tint), Color::from_hex("#00ff00").unwrap().tinted(0.5)));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(swatch_hex(&s), "#2878f0");
+    assert_eq!(link(&s, full), (Color::from_hex("#2878f0").unwrap(), Some(name.clone()), 1.0), "undo restores the art");
+    // A row holding the tint too (as recolor.reduce gives it): the tint keeps its tint and its link.
+    select_all(&mut s);
+    let tint_key = vectorcraft_color::recolor::ColorKey::of(&fill(&s, tint)).to_string();
+    let rows = json!([{"from": ["rgb 40 120 240", tint_key], "to": "#ff6a00"}]);
+    run(&mut s, "recolor.apply", json!({"map": rows, "method": "scaleTints", "group": "Brand"}));
+    let (c, w, t) = link(&s, tint);
+    assert!(w.as_deref() == Some(name.as_str()) && (t - 0.5).abs() < 0.01 && close(c, orange.tinted(t)), "{c:?} {w:?} {t}");
+    assert_eq!(link(&s, full), (orange, Some(name.clone()), 1.0));
+    // A swatch rewritten with another color than its art's row: that art takes the row's color, unlinked.
+    run(&mut s, "edit.undo", json!({}));
+    select_all(&mut s);
+    run(&mut s, "recolor.apply", json!({"map": {"#2878f0": "#ff6a00"}, "group": "Brand", "groupColors": ["#123456"]}));
+    assert_eq!(link(&s, full), (orange, None, 1.0));
+    assert_eq!(swatch_hex(&s), "#123456");
+    // A row that leaves the art's color as it is while the swatch is rewritten with another color:
+    // the art keeps its color, unlinked.
+    run(&mut s, "edit.undo", json!({}));
+    select_all(&mut s);
+    let blue = Color::from_hex("#2878f0").unwrap();
+    run(&mut s, "recolor.apply", json!({"map": {"#2878f0": "#2878f0"}, "group": "Brand", "groupColors": ["#123456"]}));
+    assert_eq!(link(&s, full), (blue, None, 1.0));
+    assert_eq!(swatch_hex(&s), "#123456");
+    // A CMYK new color for RGB art keeps the art's model (model: "keep"), so the art takes the
+    // color in RGB, unlinked, while the swatch takes it in CMYK.
+    run(&mut s, "edit.undo", json!({}));
+    select_all(&mut s);
+    let r = run(&mut s, "recolor.apply", json!({"map": {"#2878f0": {"c": 0, "m": 60, "y": 100, "k": 0}}, "group": "Brand"}));
+    assert!(r["note"].is_string(), "{r}");
+    let (c, w, _) = link(&s, full);
+    assert!(matches!(c, Color::Rgb { .. }) && w.is_none(), "{c:?} {w:?}");
+    assert!(matches!(s.doc().unwrap().doc.swatch(&name).unwrap().paint.color(), Some(Color::Cmyk { .. })));
+    // Without a group the swatch is unchanged, so the art takes the new color unlinked.
+    run(&mut s, "edit.undo", json!({}));
+    select_all(&mut s);
+    run(&mut s, "recolor.apply", json!({"map": {"#2878f0": "#ff6a00"}}));
+    assert_eq!(link(&s, full), (orange, None, 1.0));
+    assert_eq!(swatch_hex(&s), "#2878f0");
+}
+
 #[test]
 fn edit_group_refuses_to_change_built_in_swatches() {
     let mut s = session();
@@ -366,4 +535,55 @@ fn recolor_to_a_library_spot_colour_links_it_and_adds_the_swatch() {
     select_all(&mut s);
     let r = run(&mut s, "recolor.apply", json!({"map": map, "method": "scaleTints", "limitTo": lib}));
     assert_eq!(r["swatches"], json!(["Leaf"]));
+}
+
+#[test]
+fn model_param_chooses_the_model_of_the_new_colour() {
+    // RGB art in a CMYK document: by default a CMYK replacement comes out RGB (#2170).
+    let mut s = session();
+    run(&mut s, "file.new", json!({"width": 400, "height": 200, "colorMode": "cmyk"}));
+    let art = NodeId(run(&mut s, "shape.rectangle", json!({"x": 10, "y": 10, "width": 15, "height": 15}))["id"].as_u64().unwrap());
+    run(&mut s, "paint.setFill", json!({"ids": [art.0], "color": "#1a1a1a", "keepModel": true}));
+    assert_eq!(fill(&s, art).model(), vectorcraft_color::cms::Model::Rgb);
+    select_all(&mut s);
+    let map = json!({"#1a1a1a": {"c": 0, "m": 0, "y": 0, "k": 100}});
+    let r = run(&mut s, "recolor.apply", json!({"map": map}));
+    assert_eq!(fill(&s, art).model(), vectorcraft_color::cms::Model::Rgb, "kept RGB");
+    assert!(r["note"].as_str().is_some_and(|n| n.contains("model")), "warns the model was kept: {r}");
+    run(&mut s, "edit.undo", json!({}));
+    let r = run(&mut s, "recolor.apply", json!({"map": map, "model": "new"}));
+    assert_eq!(fill(&s, art), Color::cmyk(0.0, 0.0, 0.0, 1.0));
+    assert!(r.get("note").is_none(), "no note when the model follows the new colour: {r}");
+    run(&mut s, "edit.undo", json!({}));
+    // "document" converts a new RGB colour into the document's CMYK.
+    run(&mut s, "recolor.apply", json!({"map": {"#1a1a1a": "#ff0000"}, "model": "document"}));
+    assert_eq!(fill(&s, art).model(), vectorcraft_color::cms::Model::Cmyk);
+    assert!(s.execute("recolor.apply", &json!({"map": map, "model": "nope"})).is_err());
+}
+
+#[test]
+fn model_param_must_be_a_string_when_given() {
+    let mut s = session();
+    let art = rect(&mut s, json!("#1a1a1a"));
+    select_all(&mut s);
+    for bad in [json!(42), json!(null), json!(true)] {
+        assert!(s.execute("recolor.apply", &json!({"map": {"#1a1a1a": "#ff0000"}, "model": bad})).is_err(), "{bad}");
+    }
+    assert_eq!(fill(&s, art).to_hex(), "#1a1a1a", "nothing changed");
+}
+
+#[test]
+fn document_model_converts_the_colours_of_a_group_too() {
+    let mut s = session();
+    run(&mut s, "file.new", json!({"width": 400, "height": 200, "colorMode": "cmyk"}));
+    run(&mut s, "swatch.newGroup", json!({"name": "Theme", "colors": ["cmyk 0 0 0 50"]}));
+    let group = |s: &Session| -> Vec<Color> {
+        let g = s.doc().unwrap().doc.swatch_groups.iter().find(|g| g.name == "Theme").unwrap();
+        g.swatches.iter().filter_map(|w| w.paint.color()).collect()
+    };
+    // Group-only edit from the rows, and with explicit group colours.
+    run(&mut s, "recolor.apply", json!({"map": {"cmyk 0 0 0 50": "#ff0000"}, "group": "Theme", "model": "document"}));
+    assert!(group(&s).iter().all(|c| c.model() == vectorcraft_color::cms::Model::Cmyk), "{:?}", group(&s));
+    run(&mut s, "recolor.apply", json!({"map": [], "group": "Theme", "groupColors": ["#00ff00"], "model": "document"}));
+    assert!(group(&s).iter().all(|c| c.model() == vectorcraft_color::cms::Model::Cmyk), "{:?}", group(&s));
 }

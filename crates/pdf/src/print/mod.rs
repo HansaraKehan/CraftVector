@@ -30,13 +30,14 @@ mod settings;
 mod tiling;
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use kurbo::{Affine, Rect};
 use serde::Serialize;
 use vectorcraft_color::cms::{self, ProfileKind};
 use vectorcraft_doc::marks::PrinterMarks;
-use vectorcraft_doc::overprint::{clear_overprints, multiply_overprints};
+use vectorcraft_doc::overprint::{clear_overprints, darken_overprints};
 use vectorcraft_doc::{ColorMode, Document, Node, NodeKind};
 
 pub use layout::{MAX_TILES, TileGrid};
@@ -44,7 +45,7 @@ pub use plates::print_inks;
 pub use settings::*;
 pub use tiling::{TilingPage, tiling};
 
-use crate::export::{Exporter, Sheet, Writer};
+use crate::export::{Exporter, Sheet, Writer, leaving_out_undecodable};
 use crate::marks::PageBoxes;
 use crate::{AdvancedSettings, ColorConversion, CompressionSettings, OutputSettings, Overprint, PdfError, PdfSettings};
 use layout::Layout;
@@ -66,6 +67,11 @@ pub struct PrintOptions {
     /// The job is written as PostScript, which carries halftone screens and flatness: no
     /// warnings that they are left to the device.
     pub postscript: bool,
+    /// The job goes to a print queue, which puts each page on the paper as it is (macOS does
+    /// not turn a landscape page to the paper): a page whose paper the layout turned to landscape
+    /// is written upright, the art turned a quarter anticlockwise, as a printer driver turns a
+    /// landscape job. Paper that is wide in Portrait, and transverse pages, stay as they are.
+    pub for_printer: bool,
 }
 
 /// A printed job.
@@ -167,7 +173,7 @@ pub fn printed_document<'a>(doc: &'a Document, set: &PrintSettings) -> Cow<'a, D
 }
 
 /// Overprinting fills and strokes in composite output: discarded (they knock out) or simulated
-/// (drawn with Multiply, as Overprint Preview shows them), after which nothing overprints any
+/// (drawn with Darken, as Overprint Preview shows them), after which nothing overprints any
 /// more; or preserved. Separations always honour them.
 fn composite_overprints(doc: &mut Document, set: &PrintSettings) {
     let how = set.advanced.overprints;
@@ -179,7 +185,7 @@ fn composite_overprints(doc: &mut Document, set: &PrintSettings) {
     let nodes = doc.layers.iter_mut().chain(symbols).chain(doc.patterns.iter_mut().flat_map(|p| p.art.iter_mut()));
     for n in nodes {
         if how == PrintOverprints::Simulate {
-            multiply_overprints(n, discard_white);
+            darken_overprints(n, discard_white);
         }
         clear_overprints(n);
     }
@@ -219,6 +225,10 @@ impl<'a> Job<'a> {
         let printed: Vec<Option<usize>> = if separations { (0..plates.len()).map(Some).collect() } else { vec![None] };
         if printed.is_empty() {
             return Err(PdfError::BadSetting("output.inks: no ink is set to print".into()));
+        }
+        // Counted before the sheets are made: layouts times inks can be far more than the limit.
+        if layouts.len().saturating_mul(printed.len()).saturating_mul(set.copies as usize) > MAX_PAGES {
+            return Err(PdfError::BadSetting(format!("the job would print more than {MAX_PAGES} pages")));
         }
         let sheets: Vec<(usize, Option<usize>)> = (0..layouts.len()).flat_map(|l| printed.iter().map(move |i| (l, *i))).collect();
         if sheets.len().saturating_mul(set.copies as usize) > MAX_PAGES {
@@ -354,7 +364,7 @@ pub fn plan<'a>(doc: &'a Document, opts: &PrintOptions) -> Result<PrintPlan<'a>,
     let set = &opts.settings;
     let job = Job::new(doc, set, opts.postscript)?;
     let title = opts.title.clone().unwrap_or_else(|| job.doc.title.clone());
-    let created = opts.created.or_else(vectorcraft_doc::metadata::now_unix);
+    let created = opts.created.or_else(vectorcraft_doc::metadata::output_time);
     let sep = Separator::new(&job.doc, set);
     let plates: Vec<Document> = (0..job.plates.len()).filter_map(|p| job.ink(Some(p))).map(|i| sep.plate(&i.name)).collect();
     let marks = set.marks.printer_marks();
@@ -370,7 +380,7 @@ pub fn plan<'a>(doc: &'a Document, opts: &PrintOptions) -> Result<PrintPlan<'a>,
                 }
                 art
             });
-            Some(PlannedSheet {
+            let sheet = PlannedSheet {
                 size: l.size,
                 trim: l.page_trim,
                 bleed: l.page_bleed,
@@ -382,19 +392,38 @@ pub fn plan<'a>(doc: &'a Document, opts: &PrintOptions) -> Result<PrintPlan<'a>,
                 negative: set.output.image == PrintImage::Negative,
                 plate: *plate,
                 ink: ink.cloned(),
-            })
+            };
+            // Only the paper the layout turned: custom paper can be wide in Portrait.
+            let turned = l.orientation.landscape() && !set.transverse;
+            Some(if opts.for_printer && turned { upright(sheet) } else { sheet })
         })
         .collect();
     let order = job.order(set);
     Ok(PrintPlan { plates, sheets, order, title, created, warnings: job.warnings, doc: job.doc })
 }
 
-/// Print `doc` to a PDF as `opts` say.
-pub fn print(doc: &Document, opts: &PrintOptions) -> Result<PrintReport, PdfError> {
-    craft_pdf::write::guard(|| print_inner(doc, opts))
+/// Landscape sheet `s` upright on the paper ([`PrintOptions::for_printer`]): a page wider than
+/// tall turns a quarter anticlockwise, its top to the paper's left edge.
+fn upright(mut s: PlannedSheet) -> PlannedSheet {
+    let (w, h) = s.size;
+    if w <= h {
+        return s;
+    }
+    // y down: the top-right corner (w, 0) goes to the top-left, the top-left to the bottom-left.
+    let turn = Affine::new([0.0, -1.0, 1.0, 0.0, 0.0, w]);
+    s.size = (h, w);
+    s.view = turn * s.view;
+    s.trim = turn.transform_rect_bbox(s.trim);
+    s.bleed = turn.transform_rect_bbox(s.bleed);
+    s
 }
 
-fn print_inner(doc: &Document, opts: &PrintOptions) -> Result<PrintReport, PdfError> {
+/// Print `doc` to a PDF as `opts` say.
+pub fn print(doc: &Document, opts: &PrintOptions) -> Result<PrintReport, PdfError> {
+    craft_pdf::write::guard(|| leaving_out_undecodable(doc, |left_out| print_inner(doc, opts, left_out)))
+}
+
+fn print_inner(doc: &Document, opts: &PrintOptions, left_out: &mut HashSet<String>) -> Result<PrintReport, PdfError> {
     let plan = plan(doc, opts)?;
     let doc = &*plan.doc;
     let separations = opts.settings.output.mode == OutputMode::Separations;
@@ -411,8 +440,9 @@ fn print_inner(doc: &Document, opts: &PrintOptions) -> Result<PrintReport, PdfEr
         ex.intent = opts.settings.color.intent;
         // The writer's colour output: the printer profile's conversion.
         ex.out = w.out.clone();
-        // Composite output keeps overprints as the Advanced option says (plates multiply them).
+        // Composite output keeps overprints as the Advanced option says (plates darken them).
         ex.overprint = !separations && pdf.advanced.overprint == Overprint::Preserve;
+        ex.left_out = left_out.clone();
     }
     for &i in &plan.order {
         let Some(s) = plan.sheets.get(i) else { continue };
@@ -420,11 +450,12 @@ fn print_inner(doc: &Document, opts: &PrintOptions) -> Result<PrintReport, PdfEr
         w.page(ex, &s.sheet())?;
     }
     let overprinted = exporters.iter().any(|ex| ex.overprinted);
+    let invisible = exporters.iter().any(|ex| ex.invisible);
     for ex in exporters {
         w.absorb(ex);
     }
-    let (bytes, more) = w.finish()?;
-    let bytes = crate::forms::finish(bytes, doc, &pdf, false, overprinted)?;
+    let (bytes, more) = w.finish(left_out, false)?;
+    let bytes = crate::forms::finish(bytes, doc, &pdf, false, overprinted, invisible)?;
     let mut warnings = plan.warnings;
     for m in more {
         if !warnings.contains(&m) {

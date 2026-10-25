@@ -5,8 +5,11 @@
 //! variable, or a graph root to a `graph` variable (CSV data), put a row of values in
 //! each dataset, and `dataset.select` swaps the whole document to that row in one undo
 //! step. `dataset.import` / `dataset.export` move those rows as CSV (header: `name`
-//! then variable names). Agents reach every command through `run_command`, like all
-//! engine commands.
+//! then variable names); import also reads tab-separated files, files without the
+//! `name` column, and header cells that define new variables (`#` for visibility, `@` for
+//! image, no prefix for text). `variable.loadLibrary` replaces the variables and data sets with the
+//! text variables and data sets of a variable library, the XML file of the reference app's Save
+//! Variable Library. Agents reach every command through `run_command`, like all engine commands.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,6 +30,29 @@ const MAX_GRAPH_CSV: usize = 256 * 1024;
 const MAX_CSV_BYTES: usize = 1_048_576;
 const MAX_CSV_ROWS: usize = 1_000;
 const MAX_CSV_COLS: usize = 256;
+
+/// Caps on a variable library (paths and MCP payloads are untrusted): its size, its XML nodes, how
+/// deep its elements nest, and the entities, variables and data sets it declares.
+const MAX_LIBRARY_BYTES: usize = 8 << 20;
+const MAX_LIBRARY_ENTITIES: usize = 64;
+const MAX_LIBRARY_NODES: u32 = 2_000_000;
+const MAX_LIBRARY_NESTING: usize = 256;
+const MAX_LIBRARY_VARIABLES: usize = 256;
+const MAX_LIBRARY_DATASETS: usize = 1_000;
+
+/// Lock Variables refuses New Variable, Delete Variable, Rename Variable (Variable Options),
+/// Make … Dynamic, an import whose header would define a variable and a Load Variable Library
+/// that would delete or define one; binding, unbinding and the other dataset commands still run.
+fn variables_unlocked(s: &Session) -> std::result::Result<(), String> {
+    has_doc(s)?;
+    if s.active().is_some_and(|st| st.doc.variables.locked) { Err("variables are locked".into()) } else { Ok(()) }
+}
+
+/// Make … Dynamic needs a selection, and defines a variable, which Lock Variables refuses.
+fn selection_and_unlocked(s: &Session) -> std::result::Result<(), String> {
+    has_selection(s)?;
+    variables_unlocked(s)
+}
 
 fn var_name(p: &Value, cmd: &str) -> Result<String> {
     named(str_param(p, "name"), "name", cmd)
@@ -60,9 +86,8 @@ fn names_param(p: &Value, cmd: &str, fallback: Option<String>, nothing: &str) ->
     }
 }
 
-/// Refuse what a variable of `kind` can't drive: art that is locked or on a hidden or locked
-/// layer is not the document's to rewrite; a text variable only drives type; an image variable
-/// only drives an image object.
+/// Refuse what a variable of `kind` can't be bound to: art that is locked or on a hidden or locked
+/// layer; a text variable only drives type; an image variable only drives an image object.
 fn check_bindable(doc: &vectorcraft_doc::Document, ids: &[NodeId], kind: VariableKind, cmd: &str) -> Result<()> {
     for id in ids {
         match doc.node(*id) {
@@ -232,7 +257,21 @@ fn list(s: &mut Session, _p: &Value) -> Result<Value> {
             json!({"name": v.name, "kind": v.kind.label(), "bindings": bindings})
         })
         .collect();
-    Ok(json!({"variables": variables}))
+    Ok(json!({"variables": variables, "locked": st.doc.variables.locked}))
+}
+
+/// Lock Variables: without `locked` it toggles. Setting the state the document already has
+/// does not edit the document or add an undo step.
+fn lock(s: &mut Session, p: &Value) -> Result<Value> {
+    let was = s.doc()?.doc.variables.locked;
+    let locked = bool_or(p, "locked", !was);
+    if locked != was {
+        s.edit(if locked { "Lock Variables" } else { "Unlock Variables" }, |d, _| {
+            d.variables.locked = locked;
+            Ok(())
+        })?;
+    }
+    Ok(json!({"locked": locked}))
 }
 
 fn bind(s: &mut Session, p: &Value) -> Result<Value> {
@@ -368,8 +407,8 @@ fn dataset_capture(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Update Data Set: write what the bound objects hold now into the row that is active, for each
-/// variable the row holds. A variable whose objects report no value (locked, inside a hidden or
-/// locked layer or group, or gone) keeps the row's value. With `all`, every other variable the
+/// variable the row holds. A variable whose objects report no value (locked, inside a locked
+/// layer or group, or gone) keeps the row's value. With `all`, every other variable the
 /// objects report a value for is added to the row. Without an active row there is nothing to
 /// update, so say so rather than picking one.
 fn dataset_update(s: &mut Session, p: &Value) -> Result<Value> {
@@ -430,7 +469,8 @@ fn dataset_list(s: &mut Session, _p: &Value) -> Result<Value> {
 
 fn apply_dataset(s: &mut Session, name: &str) -> Result<Value> {
     const C: &str = "dataset.select";
-    let (applied, skipped, mut typed) = s.edit("Apply Data Set", |d, sel| {
+    let doc_path = s.doc()?.path.clone();
+    let (applied, skipped, mut typed, bound) = s.edit("Apply Data Set", |d, sel| {
         let ds = d.variables.dataset(name).cloned().ok_or_else(|| bad(C, format!("no dataset named `{name}`")))?;
         // One object may be driven by several variables; walk them in definition order, so two
         // text variables on the same object land the later one's value and both are counted.
@@ -438,28 +478,8 @@ fn apply_dataset(s: &mut Session, name: &str) -> Result<Value> {
         for v in &d.variables.variables {
             pairs.extend(d.variables.objects_of(&v.name).into_iter().map(|id| (id, v.name.clone())));
         }
-        // The row's values go in three passes: the visibility values that show an object,
-        // outermost object first; the other values, in definition order; the visibility values
-        // that hide an object, innermost object first. An object inside a group is then rewritten
-        // after the row shows the group and before the row hides it. An object with several
-        // visibility variables goes in the pass of the last one's value, and each pass keeps
-        // definition order otherwise.
-        let mut shows = std::collections::HashMap::new();
-        for (id, var) in &pairs {
-            let kind = d.variables.variable(var).map(|v| v.kind);
-            if let (Some(VariableKind::Visibility), Some(DataValue::Visible(show))) = (kind, ds.values.get(var)) {
-                shows.insert(*id, *show);
-            }
-        }
-        let depths = d.index_paths(shows.keys().copied());
-        pairs.sort_by_cached_key(|(id, var)| {
-            let depth = depths.get(id).map_or(0, Vec::len);
-            match (d.variables.variable(var).map(|v| v.kind), shows.get(id)) {
-                (Some(VariableKind::Visibility), Some(true)) => (0, depth),
-                (Some(VariableKind::Visibility), Some(false)) => (2, usize::MAX - depth),
-                _ => (1, 0),
-            }
-        });
+        // Whether an object is bound to a variable that this row has a value for (the reply's `warning`).
+        let bound = pairs.iter().any(|(_, var)| ds.values.contains_key(var));
         let mut applied = 0usize;
         let mut skipped = 0usize;
         // Collects the type objects whose text the row rewrote, for the reply's `overflow`.
@@ -475,10 +495,10 @@ fn apply_dataset(s: &mut Session, name: &str) -> Result<Value> {
                     continue;
                 }
             };
-            // Locked art, art on a locked or hidden layer, and text whose object is gone, can't
-            // be rewritten: skipped and counted, like the rest. A hidden object is rewritten: a
-            // row that hid it shows it again.
-            if !d.variable_target(id) {
+            // Locked art, art in a locked layer or group, and text whose object is gone, can't be
+            // rewritten: skipped and counted, like the rest. Hidden art is rewritten, in a hidden
+            // layer or group too, and stays hidden unless a visibility value shows it.
+            if !d.dataset_target(id) {
                 skipped += 1;
                 continue;
             }
@@ -494,7 +514,7 @@ fn apply_dataset(s: &mut Session, name: &str) -> Result<Value> {
                     true
                 }),
                 // Swap the linked file; keep the object's bounds. A missing path skips.
-                (VariableKind::Image, DataValue::Image(path)) => links::set_image_from_path(d, id, path).is_ok(),
+                (VariableKind::Image, DataValue::Image(path)) => links::set_image_from_path(d, id, path, doc_path.as_deref()).is_ok(),
                 (VariableKind::Graph, DataValue::Graph(csv)) => super::graph::apply_csv(d, id, csv).is_ok(),
                 _ => false,
             };
@@ -507,12 +527,18 @@ fn apply_dataset(s: &mut Session, name: &str) -> Result<Value> {
         d.variables.active_dataset = Some(name.to_string());
         // Every selected object left hidden or locked, such as one the row hid, is deselected.
         sel.deselect_uneditable(d);
-        Ok((applied, skipped, typed))
+        Ok((applied, skipped, typed, bound))
     })?;
     // Two text variables on one object rewrite it twice; it is named once.
     typed.sort_unstable();
     typed.dedup();
-    Ok(super::typecmd::with_overflow(s, &typed, json!({"name": name, "applied": applied, "skipped": skipped})))
+    let mut out = super::typecmd::with_overflow(s, &typed, json!({"name": name, "applied": applied, "skipped": skipped}));
+    // A row with no value for any bound variable applies nothing. The reply then carries a
+    // `warning`, which the app shows in its status bar.
+    if !bound {
+        out["warning"] = json!(format!("nothing in data set {name} was applied: no object is bound to a variable it has a value for"));
+    }
+    Ok(out)
 }
 
 fn dataset_select(s: &mut Session, p: &Value) -> Result<Value> {
@@ -535,16 +561,61 @@ fn datasets_csv_bytes(p: &Value, cmd: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Parse a datasets CSV into rows of cells (no header interpretation yet): commas between cells,
-/// `"` quotes a cell (doubled inside), which may then hold commas and line breaks, as
-/// [`csv_escape`] writes them. An unquoted cell is trimmed. A quoted cell keeps what its quotes
-/// hold as written, spaces included, and drops white space after the closing quote at the end
-/// of the cell. Blank lines are skipped.
-fn parse_datasets_csv(text: &str, cmd: &str) -> Result<Vec<Vec<String>>> {
+/// A row of a datasets CSV: the file line it starts on, and its cells.
+type CsvRow = (usize, Vec<String>);
+
+/// Whether a datasets CSV separates its cells with tabs: its header row (the first line that
+/// isn't blank), read with tabs between cells, has a tab outside quotes and no comma outside
+/// quotes.
+fn tab_separated(text: &str) -> bool {
+    // `start`: nothing but `\r` read yet in this cell. `blank`: no cell on this line holds
+    // anything but white space yet.
+    let (mut in_quotes, mut start, mut blank, mut tab) = (false, true, true, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quotes => {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    blank = false;
+                } else {
+                    in_quotes = false;
+                }
+            }
+            '"' if start => in_quotes = true,
+            c if in_quotes => blank &= c.is_whitespace(),
+            ',' => return false,
+            '\t' => {
+                tab = true;
+                start = true;
+                continue;
+            }
+            '\r' => continue,
+            '\n' if blank => {
+                tab = false;
+                start = true;
+                continue;
+            }
+            '\n' => return tab,
+            c => blank &= c.is_whitespace(),
+        }
+        start = false;
+    }
+    tab
+}
+
+/// Parse a datasets CSV into rows of cells (no header interpretation yet). Cells are separated
+/// by commas, or by tabs when [`tab_separated`] says so. `"` quotes a cell (doubled inside),
+/// which may then hold separators and line breaks, as [`csv_escape`] writes them. An unquoted
+/// cell is trimmed. A quoted cell keeps what its quotes hold as written, spaces included, and
+/// drops white space after the closing quote at the end of the cell. Blank lines are skipped.
+fn parse_datasets_csv(text: &str, cmd: &str) -> Result<Vec<CsvRow>> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let sep = if tab_separated(text) { '\t' } else { ',' };
     let (mut rows, mut row, mut cur) = (Vec::new(), Vec::<String>::new(), String::new());
-    // `closed`: where the closing quote of a quoted cell falls in `cur`.
-    let (mut in_quotes, mut closed, mut line) = (false, None, 1usize);
+    // `closed`: where the closing quote of a quoted cell falls in `cur`. `start`: the line the
+    // current row starts on.
+    let (mut in_quotes, mut closed, mut line, mut start) = (false, None, 1usize, 1usize);
     let mut chars = text.chars().peekable();
     loop {
         let c = chars.next();
@@ -559,12 +630,12 @@ fn parse_datasets_csv(text: &str, cmd: &str) -> Result<Vec<Vec<String>>> {
                 }
             }
             Some('"') if cur.is_empty() => in_quotes = true,
-            Some(',') if !in_quotes => row.push(end_csv_cell(&mut cur, &mut closed)),
+            Some(ch) if ch == sep && !in_quotes => row.push(end_csv_cell(&mut cur, &mut closed)),
             Some('\r') if !in_quotes => {}
             Some('\n') | None if !in_quotes => {
                 row.push(end_csv_cell(&mut cur, &mut closed));
                 if row.iter().any(|c| !c.trim().is_empty()) {
-                    rows.push(std::mem::take(&mut row));
+                    rows.push((start, std::mem::take(&mut row)));
                     // +1 for the header.
                     if rows.len() > MAX_CSV_ROWS + 1 {
                         return Err(bad(cmd, format!("more than {MAX_CSV_ROWS} data rows")));
@@ -575,6 +646,7 @@ fn parse_datasets_csv(text: &str, cmd: &str) -> Result<Vec<Vec<String>>> {
                     return Ok(rows);
                 }
                 line += 1;
+                start = line;
             }
             None => return Err(bad(cmd, format!("line {line}: unclosed quote"))),
             Some(c) => {
@@ -659,51 +731,104 @@ fn datasets_to_csv(vars: &Variables) -> String {
     out
 }
 
-/// Import datasets from CSV: first column `name`, remaining headers are variable names.
-/// Existing rows of the same name are replaced; new names are appended. One undo step.
+/// The variable that a datasets CSV header cell (trimmed, not empty) in 1-based `column` names,
+/// and its kind. A cell that is the name of a variable in `kinds` or in `defined` (the variables
+/// that earlier columns define) names that variable. Otherwise `#` before the name makes it a
+/// visibility variable, `@` makes it an image variable, and a cell without a prefix names a text
+/// variable. A prefixed name that is already a variable must be one of the prefix's kind; a new
+/// name is added to `defined`. A `%` cell that names no variable (graph data files) is refused.
+fn header_variable(
+    cell: &str,
+    column: usize,
+    kinds: &BTreeMap<String, VariableKind>,
+    defined: &mut Vec<Variable>,
+    cmd: &str,
+) -> Result<(String, VariableKind)> {
+    let known = |name: &str, defined: &[Variable]| kinds.get(name).copied().or_else(|| defined.iter().find(|v| v.name == name).map(|v| v.kind));
+    if let Some(kind) = known(cell, defined) {
+        return Ok((cell.to_string(), kind));
+    }
+    let (name, kind) = if let Some(rest) = cell.strip_prefix('#') {
+        (rest.trim(), VariableKind::Visibility)
+    } else if let Some(rest) = cell.strip_prefix('@') {
+        (rest.trim(), VariableKind::Image)
+    } else if cell.starts_with('%') {
+        return Err(bad(cmd, format!("column {column}: `{cell}` is a `%` column of graph data files, which are not read")));
+    } else {
+        (cell, VariableKind::Text)
+    };
+    if name.is_empty() {
+        return Err(bad(cmd, format!("column {column}: `{cell}` names no variable")));
+    }
+    match known(name, defined) {
+        Some(k) if k == kind => Ok((name.to_string(), kind)),
+        Some(k) => Err(bad(cmd, format!("column {column}: `{cell}` names `{name}`, which is a {} variable", k.label()))),
+        None if name.chars().count() > MAX_NAME => Err(bad(cmd, format!("column {column}: the variable name is longer than {MAX_NAME} characters"))),
+        None => {
+            defined.push(Variable { name: name.to_string(), kind });
+            Ok((name.to_string(), kind))
+        }
+    }
+}
+
+/// Import datasets from CSV. A first header cell `name` makes the first column the dataset
+/// names; the other headers name variables, as [`header_variable`] reads them, and the
+/// variables the document doesn't define yet are defined, unbound. Without the `name` column,
+/// every header names a variable and the rows take the first free names "Data Set 1", "Data
+/// Set 2" and so on. Existing rows of the same name are replaced; new names are appended. One
+/// undo step.
 fn dataset_import(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "dataset.import";
     let bytes = datasets_csv_bytes(p, C)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| bad(C, "CSV is not UTF-8"))?;
     let rows = parse_datasets_csv(text, C)?;
-    let Some(header) = rows.first() else {
+    let Some((_, header)) = rows.first() else {
         return Err(bad(C, "CSV is empty"));
     };
-    if header.first().map(|h| h.trim().eq_ignore_ascii_case("name")) != Some(true) {
-        return Err(bad(C, "first header cell must be `name`"));
-    }
+    let name_column = header.first().is_some_and(|h| h.trim().eq_ignore_ascii_case("name"));
     let (kinds, existing_names) = {
         let st = s.doc()?;
         let kinds: BTreeMap<String, VariableKind> = st.doc.variables.variables.iter().map(|v| (v.name.clone(), v.kind)).collect();
-        let existing: Vec<String> = st.doc.variables.datasets.iter().map(|d| d.name.clone()).collect();
+        let existing: BTreeSet<String> = st.doc.variables.datasets.iter().map(|d| d.name.clone()).collect();
         (kinds, existing)
     };
     let mut columns: Vec<(usize, String, VariableKind)> = Vec::new();
-    for (i, h) in header.iter().enumerate().skip(1) {
-        let name = h.trim();
-        if name.is_empty() {
+    let mut defined: Vec<Variable> = Vec::new();
+    for (i, h) in header.iter().enumerate().skip(usize::from(name_column)) {
+        let cell = h.trim();
+        if cell.is_empty() {
             return Err(bad(C, format!("empty header in column {}", i + 1)));
         }
-        let kind = kinds.get(name).copied().ok_or_else(|| bad(C, format!("no variable named `{name}`")))?;
-        columns.push((i, name.to_string(), kind));
+        let (name, kind) = header_variable(cell, i + 1, &kinds, &mut defined, C)?;
+        columns.push((i, name, kind));
+    }
+    // Lock Variables refuses New Variable, so the import is refused when a header would define one.
+    if !defined.is_empty() {
+        variables_unlocked(s).map_err(|why| EngineError::Disabled(C.into(), why))?;
     }
     if rows.len() == 1 {
         return Err(bad(C, "CSV has a header but no data rows"));
     }
     let mut parsed: Vec<DataSet> = Vec::new();
-    for (r_i, row) in rows.iter().enumerate().skip(1) {
-        let line = r_i + 1;
-        let raw_name = row.first().map(|c| c.trim()).unwrap_or("");
+    // The names of the rows read so far, and the last number given to a row without a name.
+    let (mut seen, mut number) = (BTreeSet::new(), 0usize);
+    for &(line, ref row) in rows.iter().skip(1) {
+        let raw_name = if name_column { row.first().map_or("", |c| c.trim()) } else { "" };
         let name = if raw_name.is_empty() {
-            // Same numbering as Capture Data Set when a row leaves the name blank.
-            (1..)
-                .map(|n| format!("Data Set {n}"))
-                .find(|n| parsed.iter().all(|d| d.name != *n) && !existing_names.iter().any(|e| e == n))
-                .unwrap_or_else(|| format!("Data Set {line}"))
+            // Same numbering as Capture Data Set when a row leaves the name blank or the file has
+            // no name column. The search starts after the last number given.
+            let (n, name) = (number + 1..)
+                .map(|n| (n, format!("Data Set {n}")))
+                .find(|(_, n)| !seen.contains(n) && !existing_names.contains(n))
+                .unwrap_or_else(|| (line, format!("Data Set {line}")));
+            number = n;
+            name
+        } else if raw_name.chars().count() > MAX_NAME {
+            return Err(bad(C, format!("line {line}: `name` is longer than {MAX_NAME} characters")));
         } else {
-            named(Some(raw_name), "name", C)?
+            raw_name.to_string()
         };
-        if parsed.iter().any(|d| d.name == name) {
+        if !seen.insert(name.clone()) {
             return Err(bad(C, format!("line {line}: dataset `{name}` appears twice")));
         }
         let mut values = BTreeMap::new();
@@ -720,7 +845,9 @@ fn dataset_import(s: &mut Session, p: &Value) -> Result<Value> {
         parsed.push(DataSet { name, values });
     }
     let names: Vec<String> = parsed.iter().map(|d| d.name.clone()).collect();
+    let new_variables: Vec<String> = defined.iter().map(|v| v.name.clone()).collect();
     let (imported, updated) = s.edit("Import Data Sets", |d, _| {
+        d.variables.variables.extend(defined);
         let mut imported = 0usize;
         let mut updated = 0usize;
         for row in parsed {
@@ -734,7 +861,7 @@ fn dataset_import(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Ok((imported, updated))
     })?;
-    Ok(json!({"imported": imported, "updated": updated, "names": names}))
+    Ok(json!({"imported": imported, "updated": updated, "names": names, "defined": new_variables}))
 }
 
 /// Export every dataset as CSV (`name` then variables). With `path`, write the file; else return `{csv}`.
@@ -775,6 +902,289 @@ fn dataset_step(s: &mut Session, cmd: &str, forward: bool) -> Result<Value> {
     apply_dataset(s, &name)
 }
 
+/// Bytes of a variable library from `path`, `xml` or `dataBase64`.
+fn library_bytes(p: &Value, cmd: &str) -> Result<Vec<u8>> {
+    let bytes = match (str_param(p, "path"), str_param(p, "xml"), str_param(p, "dataBase64")) {
+        // One byte past the cap is enough to refuse the file below.
+        (Some(path), ..) => read_file_head(&absolute_path(path), MAX_LIBRARY_BYTES + 1)?,
+        (None, Some(xml), _) => xml.as_bytes().to_vec(),
+        (None, None, Some(b64)) => vectorcraft_format::base64_decode(b64).ok_or_else(|| bad(cmd, "bad dataBase64"))?,
+        _ => return Err(bad(cmd, "give `path`, `xml` or `dataBase64`")),
+    };
+    if bytes.len() > MAX_LIBRARY_BYTES {
+        return Err(bad(cmd, format!("the variable library is larger than {MAX_LIBRARY_BYTES} bytes")));
+    }
+    Ok(bytes)
+}
+
+/// `xml` without the document type declaration of its prolog, with each reference to a general
+/// entity that the declaration defines replaced by the entity's value, its quotes and `>` escaped,
+/// outside CDATA sections, comments and processing instructions. The declaration may hold an
+/// external identifier and an internal subset of white space, comments, processing instructions and
+/// up to [`MAX_LIBRARY_ENTITIES`] entity declarations, each with a name of at most [`MAX_NAME`]
+/// bytes and a quoted value that holds no `<`, `&` or `%`. Anything else in it is refused, and so is
+/// a text that the replacements make longer than [`MAX_LIBRARY_BYTES`]. The XML parser then refuses
+/// any other document type declaration, so [`nesting`](super::place::docx::nesting) counts the
+/// elements the parser reads.
+fn without_doctype(xml: &str, cmd: &str) -> Result<String> {
+    let b = xml.as_bytes();
+    let past = |from: usize, end: &str| xml.get(from..).and_then(|rest| rest.find(end)).map(|at| from + at + end.len());
+    let spaces = |from: usize| from + b.get(from..).map_or(0, |rest| rest.iter().take_while(|c| c.is_ascii_whitespace()).count());
+    let at = |i: usize, s: &str| xml.get(i..).is_some_and(|rest| rest.starts_with(s));
+    let refused = || bad(cmd, "the variable library's document type declaration holds something other than entities of plain text");
+    // The prolog: an XML declaration, white space, comments and processing instructions.
+    let mut i = 0;
+    loop {
+        i = spaces(i);
+        if at(i, "<?") {
+            i = past(i + 2, "?>").ok_or_else(refused)?;
+        } else if at(i, "<!--") {
+            i = past(i + 4, "-->").ok_or_else(refused)?;
+        } else {
+            break;
+        }
+    }
+    if !at(i, "<!DOCTYPE") {
+        return Ok(xml.to_string());
+    }
+    let start = i;
+    // A quoted literal starting at `i` → the index past it and its text.
+    let literal = |i: usize| -> Option<(usize, &str)> {
+        let quote = *b.get(i).filter(|c| matches!(c, b'"' | b'\''))?;
+        let len = b.get(i + 1..)?.iter().position(|c| *c == quote)?;
+        Some((i + len + 2, xml.get(i + 1..i + 1 + len)?))
+    };
+    // `<!DOCTYPE` S Name (S ExternalID)? S? ('[' intSubset ']' S?)? '>'
+    i = spaces(i + "<!DOCTYPE".len());
+    i += b.get(i..).map_or(0, |rest| rest.iter().take_while(|c| !c.is_ascii_whitespace() && !matches!(c, b'[' | b'>')).count());
+    i = spaces(i);
+    for (id, literals) in [("SYSTEM", 1), ("PUBLIC", 2)] {
+        if at(i, id) {
+            i += id.len();
+            for _ in 0..literals {
+                i = literal(spaces(i)).ok_or_else(refused)?.0;
+            }
+            i = spaces(i);
+        }
+    }
+    let mut entities: Vec<(&str, String)> = Vec::new();
+    if at(i, "[") {
+        i += 1;
+        loop {
+            i = spaces(i);
+            if at(i, "]") {
+                i = spaces(i + 1);
+                break;
+            } else if at(i, "<!--") {
+                i = past(i + 4, "-->").ok_or_else(refused)?;
+            } else if at(i, "<?") {
+                i = past(i + 2, "?>").ok_or_else(refused)?;
+            } else if at(i, "<!ENTITY") {
+                i = spaces(i + "<!ENTITY".len());
+                let len =
+                    b.get(i..).map_or(0, |rest| rest.iter().take_while(|c| !c.is_ascii_whitespace() && !matches!(c, b'"' | b'\'' | b'>')).count());
+                let name = xml.get(i..i + len).filter(|n| !n.is_empty() && n.len() <= MAX_NAME && !n.starts_with('%')).ok_or_else(refused)?;
+                let (end, value) = literal(spaces(i + len)).ok_or_else(refused)?;
+                if value.contains(['<', '&', '%']) {
+                    return Err(refused());
+                }
+                i = spaces(end);
+                if !at(i, ">") {
+                    return Err(refused());
+                }
+                i += 1;
+                if entities.len() == MAX_LIBRARY_ENTITIES {
+                    return Err(bad(cmd, format!("the variable library declares more than {MAX_LIBRARY_ENTITIES} entities")));
+                }
+                entities.push((name, value.replace('"', "&quot;").replace('\'', "&apos;").replace('>', "&gt;")));
+            } else {
+                return Err(refused());
+            }
+        }
+    }
+    if !at(i, ">") {
+        return Err(refused());
+    }
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(xml.get(..start).unwrap_or_default());
+    // The rest, copied with the references replaced outside CDATA sections, comments and
+    // processing instructions, where the parser reads none.
+    let mut i = i + 1;
+    while let Some(c) = xml.get(i..).and_then(|rest| rest.chars().next()) {
+        let verbatim = [("<![CDATA[", "]]>"), ("<!--", "-->"), ("<?", "?>")].into_iter().find(|(open, _)| at(i, open));
+        if let Some((open, close)) = verbatim {
+            let end = past(i + open.len(), close).unwrap_or(xml.len());
+            out.push_str(xml.get(i..end).unwrap_or_default());
+            i = end;
+            continue;
+        }
+        // Entity names are at most `MAX_NAME` bytes long, so the `;` is looked for that far.
+        let entity = if c == '&' {
+            let name = xml.get(i + 1..).and_then(|rest| rest.get(..rest.bytes().take(MAX_NAME + 1).position(|b| b == b';')?));
+            name.and_then(|name| entities.iter().find(|(n, _)| *n == name))
+        } else {
+            None
+        };
+        match entity {
+            Some((name, value)) => {
+                out.push_str(value);
+                i += name.len() + 2;
+                if out.len() > MAX_LIBRARY_BYTES {
+                    return Err(bad(cmd, format!("the variable library's entities expand to more than {MAX_LIBRARY_BYTES} bytes")));
+                }
+            }
+            None => {
+                out.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    if out.len() > MAX_LIBRARY_BYTES {
+        return Err(bad(cmd, format!("the variable library's entities expand to more than {MAX_LIBRARY_BYTES} bytes")));
+    }
+    Ok(out)
+}
+
+/// A variable library as Load Variable Library reads it: the names of its text variables in the
+/// order it declares them, the name and `trait` of each variable of another kind, and its data
+/// sets with their text values.
+struct Library {
+    text: Vec<String>,
+    other: Vec<(String, String)>,
+    datasets: Vec<DataSet>,
+}
+
+/// Read a variable library: XML whose `variableSets` element holds `variableSet` elements, each
+/// with a `variables` element of `variable` elements (`varName`, `trait`) and a `sampleDataSets`
+/// element of `sampleDataSet` elements (`dataSetName`). Elements are matched by their local names.
+/// A variable whose `trait` is `textcontent` is a text variable. In a data set, an element named
+/// after a text variable gives its value: the text of its `p` elements, one paragraph each, and
+/// none when it has no `p` element. Values for variables of other kinds are left out. A variable
+/// or data set declared twice, a value for a variable the library doesn't declare, and a library
+/// past the caps are refused. Entities that its document type declaration defines are read as
+/// [`without_doctype`] says.
+fn parse_library(xml: &str, cmd: &str) -> Result<Library> {
+    let xml = without_doctype(xml, cmd)?;
+    // roxmltree parses nested elements recursively.
+    if super::place::docx::nesting(&xml) > MAX_LIBRARY_NESTING {
+        return Err(bad(cmd, format!("the variable library nests elements more than {MAX_LIBRARY_NESTING} deep")));
+    }
+    let opts = roxmltree::ParsingOptions { nodes_limit: MAX_LIBRARY_NODES, ..roxmltree::ParsingOptions::default() };
+    let doc =
+        roxmltree::Document::parse_with_options(&xml, opts).map_err(|e| bad(cmd, format!("the variable library is not well-formed XML: {e}")))?;
+    let is = |n: &roxmltree::Node, name: &str| n.is_element() && n.tag_name().name() == name;
+    let Some(root) = doc.descendants().find(|n| is(n, "variableSets")) else {
+        return Err(bad(cmd, "the file holds no `variableSets` element"));
+    };
+    let sets: Vec<roxmltree::Node> = root.children().filter(|n| is(n, "variableSet")).collect();
+    let (mut text, mut other, mut declared) = (Vec::new(), Vec::new(), BTreeSet::new());
+    for var in sets.iter().flat_map(|s| s.children()).filter(|n| is(n, "variables")).flat_map(|v| v.children()).filter(|n| is(n, "variable")) {
+        let name = named(var.attribute("varName"), "varName", cmd)?;
+        if !declared.insert(name.clone()) {
+            return Err(bad(cmd, format!("variable `{name}` is declared twice")));
+        }
+        if declared.len() > MAX_LIBRARY_VARIABLES {
+            return Err(bad(cmd, format!("the variable library declares more than {MAX_LIBRARY_VARIABLES} variables")));
+        }
+        match var.attribute("trait") {
+            Some("textcontent") => text.push(name),
+            Some(t) => other.push((name, t.chars().take(MAX_NAME).collect())),
+            None => return Err(bad(cmd, format!("variable `{name}` has no `trait`"))),
+        }
+    }
+    if declared.is_empty() {
+        return Err(bad(cmd, "the variable library declares no variables"));
+    }
+    let text_names: BTreeSet<&str> = text.iter().map(String::as_str).collect();
+    let (mut datasets, mut seen) = (Vec::new(), BTreeSet::new());
+    for row in
+        sets.iter().flat_map(|s| s.children()).filter(|n| is(n, "sampleDataSets")).flat_map(|d| d.children()).filter(|n| is(n, "sampleDataSet"))
+    {
+        let name = named(row.attribute("dataSetName"), "dataSetName", cmd)?;
+        if !seen.insert(name.clone()) {
+            return Err(bad(cmd, format!("data set `{name}` is declared twice")));
+        }
+        if seen.len() > MAX_LIBRARY_DATASETS {
+            return Err(bad(cmd, format!("the variable library declares more than {MAX_LIBRARY_DATASETS} data sets")));
+        }
+        let (mut values, mut held) = (BTreeMap::new(), BTreeSet::new());
+        for el in row.children().filter(roxmltree::Node::is_element) {
+            let var = el.tag_name().name();
+            if !declared.contains(var) {
+                return Err(bad(cmd, format!("data set `{name}` holds a value for `{var}`, which the library doesn't declare")));
+            }
+            if !held.insert(var) {
+                return Err(bad(cmd, format!("data set `{name}` holds two values for `{var}`")));
+            }
+            if !text_names.contains(var) {
+                continue;
+            }
+            let paras: Vec<String> = el
+                .children()
+                .filter(|n| is(n, "p"))
+                .map(|p| p.descendants().filter(roxmltree::Node::is_text).filter_map(|t| t.text()).collect())
+                .collect();
+            if !paras.is_empty() {
+                values.insert(var.to_string(), DataValue::Text(paras.join("\n")));
+            }
+        }
+        datasets.push(DataSet { name, values });
+    }
+    Ok(Library { text, other, datasets })
+}
+
+/// Load Variable Library: replace the document's variables and data sets with a variable library's
+/// ([`parse_library`]) in one undo step. Every variable of the document is deleted with its bindings
+/// and values, and every data set is deleted. The library's text variables are then defined,
+/// unbound, and its data sets are added. The library's variables of other kinds are left out, named
+/// in `skipped` and in a warning.
+fn load_library(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "variable.loadLibrary";
+    let bytes = library_bytes(p, C)?;
+    let xml = std::str::from_utf8(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes)).map_err(|_| bad(C, "the variable library is not UTF-8"))?;
+    let lib = parse_library(xml, C)?;
+    let vars = &s.doc()?.doc.variables;
+    let deleted: Vec<String> = vars.variables.iter().map(|v| v.name.clone()).collect();
+    let deleted_sets: Vec<String> = vars.datasets.iter().map(|d| d.name.clone()).collect();
+    // Lock Variables refuses New Variable and Delete Variable, so the load is refused when it would
+    // delete or define a variable.
+    if !deleted.is_empty() || !lib.text.is_empty() {
+        variables_unlocked(s).map_err(|why| EngineError::Disabled(C.into(), why))?;
+    }
+    let added: Vec<Variable> = lib.text.iter().map(|n| Variable { name: n.clone(), kind: VariableKind::Text }).collect();
+    let names: Vec<String> = lib.datasets.iter().map(|d| d.name.clone()).collect();
+    s.edit("Load Variable Library", |d, _| {
+        d.variables.prune(&deleted);
+        d.variables.variables.extend(added);
+        d.variables.datasets = lib.datasets;
+        d.variables.active_dataset = None;
+        Ok(())
+    })?;
+    // A highlight of a variable that is gone highlights nothing.
+    let st = s.doc_mut()?;
+    if st.variables_highlight.as_ref().is_some_and(|h| st.doc.variables.variable(h).is_none()) {
+        st.variables_highlight = None;
+    }
+    st.revision += 1;
+    let skipped: Vec<Value> = lib.other.iter().map(|(name, t)| json!({"name": name, "trait": t})).collect();
+    let mut out = json!({
+        "variables": lib.text, "deleted": deleted, "deletedDataSets": deleted_sets, "names": names, "skipped": skipped,
+    });
+    // Each `trait` once, in the order the library first uses it, with how many variables have it.
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for (_, t) in &lib.other {
+        match kinds.iter_mut().find(|(k, _)| k == t) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((t, 1)),
+        }
+    }
+    if !kinds.is_empty() {
+        let kinds = kinds.iter().map(|(k, n)| format!("{k} ({n})")).collect::<Vec<_>>().join(", ");
+        out["warning"] = json!(format!("variables that aren't text were left out: {kinds}"));
+    }
+    Ok(out)
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
@@ -782,8 +1192,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Variable…",
             ["Window", "Variables"],
             None,
-            "{name, kind: text|visibility|image|graph} define a variable (graph: CSV data on a graph root)",
-            has_doc,
+            "{name, kind: text|visibility|image|graph} define a variable (graph: CSV data on a graph root); refused while the variables are locked",
+            variables_unlocked,
             define
         ),
         cmd!(
@@ -791,8 +1201,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete Variable",
             ["Window", "Variables"],
             None,
-            "{names?} delete variables with their bindings and values (default: the highlighted one)",
-            has_doc,
+            "{names?} delete variables with their bindings and values (default: the highlighted one); refused while the variables are locked",
+            variables_unlocked,
             delete
         ),
         cmd!(
@@ -800,18 +1210,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Rename Variable",
             ["Window", "Variables"],
             None,
-            "{name, newName} rename a variable, with its bindings and its values in every dataset",
-            has_doc,
+            "{name, newName} rename a variable, with its bindings and its values in every dataset; refused while the variables are locked",
+            variables_unlocked,
             rename
         ),
-        cmd!(query "variable.list", "List Variables", [], None, "{} → variables with kinds and binding counts", has_doc, list),
+        cmd!(query "variable.list", "List Variables", [], None, "{} → variables with kinds and binding counts, and whether they are locked → {variables, locked}", has_doc, list),
         cmd!(
             "variable.makeTextDynamic",
             "Make Text Dynamic",
             ["Window", "Variables"],
             None,
-            "{} define a text variable over the selection, named after it and bound to it",
-            has_selection,
+            "{} define a text variable over the selection, named after it and bound to it; refused while the variables are locked",
+            selection_and_unlocked,
             |s, _| make_dynamic(s, VariableKind::Text, "Text")
         ),
         cmd!(
@@ -819,8 +1229,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make Visibility Dynamic",
             ["Window", "Variables"],
             None,
-            "{} define a visibility variable over the selection, named after it and bound to it",
-            has_selection,
+            "{} define a visibility variable over the selection, named after it and bound to it; refused while the variables are locked",
+            selection_and_unlocked,
             |s, _| make_dynamic(s, VariableKind::Visibility, "Visibility")
         ),
         cmd!(
@@ -828,8 +1238,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make Image Dynamic",
             ["Window", "Variables"],
             None,
-            "{} define an image variable over the selection, named after it and bound to it",
-            has_selection,
+            "{} define an image variable over the selection, named after it and bound to it; refused while the variables are locked",
+            selection_and_unlocked,
             |s, _| make_dynamic(s, VariableKind::Image, "Image")
         ),
         cmd!(
@@ -837,8 +1247,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make Graph Dynamic",
             ["Window", "Variables"],
             None,
-            "{} define a graph variable over the selected graph root(s), named after it and bound to it; each dataset row supplies CSV as graph.setData",
-            has_selection,
+            "{} define a graph variable over the selected graph root(s), named after it and bound to it; each dataset row supplies CSV as graph.setData; refused while the variables are locked",
+            selection_and_unlocked,
             |s, _| make_dynamic(s, VariableKind::Graph, "Graph")
         ),
         cmd!(
@@ -858,6 +1268,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{ids?, variable?} drop bindings (default: the selection): `variable` drops that one, else every variable the object has",
             has_doc,
             unbind
+        ),
+        cmd!(
+            "variable.lock",
+            "Lock Variables",
+            ["Window", "Variables"],
+            None,
+            "{locked?: bool} lock or unlock the variables (default: toggle); saved with the document; a change is one undo step. While locked, variable.define, variable.delete, variable.rename, variable.make…Dynamic and a variable.loadLibrary that would delete or define a variable are refused; binding, unbinding and the dataset commands still run → {locked}",
+            has_doc,
+            lock
         ),
         cmd!(
             "variable.highlight",
@@ -893,7 +1312,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Update Data Set",
             ["Window", "Variables"],
             None,
-            "{all?: bool} write what the bound objects hold now into the active dataset, for each variable the dataset holds; a variable whose objects report no value (locked, inside a hidden or locked layer or group, or gone) keeps the dataset's value. `all: true` also adds every other variable the objects report a value for; `left` names the variables it didn't write → {values, left}",
+            "{all?: bool} write what the bound objects hold now into the active dataset, for each variable the dataset holds; a variable whose objects report no value (locked, inside a locked layer or group, or gone) keeps the dataset's value. `all: true` also adds every other variable the objects report a value for; `left` names the variables it didn't write → {values, left}",
             has_doc,
             dataset_update
         ),
@@ -920,7 +1339,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Data Set",
             ["Window", "Variables"],
             None,
-            "{name} apply a dataset in one undo step, deselecting every selected object left hidden or locked (the key object too) → {applied, skipped, overflow?: [id…] (area type and type on a path whose text it rewrote and that no longer fits; left out when all fits)}",
+            "{name} apply a dataset in one undo step, deselecting every selected object left hidden or locked (the key object too) → {applied, skipped, overflow?: [id…] (area type and type on a path whose text it rewrote and that no longer fits; left out when all fits), warning? (when no object is bound to a variable that the dataset has a value for, so nothing was applied)}",
             has_doc,
             dataset_select
         ),
@@ -937,7 +1356,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Import Data Sets…",
             ["Window", "Variables"],
             None,
-            "{path? | data? | dataBase64? | csv?} load datasets from CSV (header: name, then variable names; one row per dataset). Rows whose name already exists are replaced → {imported, updated, names}",
+            "{path? | data? | dataBase64? | csv?} load datasets from CSV, comma- or tab-separated (header: name, then variable names; one row per dataset; without the name column every header is a variable and the rows take the first free names Data Set 1, 2…). A header that names no variable defines one, unbound: `#Name` defines a visibility variable, `@Name` defines an image variable, and a header without a prefix defines a text variable. A prefixed header whose name is a variable of another kind, and a `%` header that isn't a variable's exact name (graph data files), are refused, and so is a header that would define a variable while the variables are locked. Rows whose name already exists are replaced → {imported, updated, names, defined}",
             has_doc,
             dataset_import
         ),
@@ -949,6 +1368,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{path?} write every dataset as CSV (header: name, then variables); without path → {csv, datasets}",
             has_doc,
             dataset_export
+        ),
+        cmd!(
+            "variable.loadLibrary",
+            "Load Variable Library…",
+            ["Window", "Variables"],
+            None,
+            "{path? | xml? | dataBase64?} replace the document's variables and data sets with a variable library's (XML: `variableSets` › `variableSet` › `variables` of `variable` elements with `varName` and `trait`, and `sampleDataSets` of `sampleDataSet` elements with `dataSetName`) in one undo step. Every variable of the document is deleted with its bindings and values, and every data set is deleted; then variables whose `trait` is `textcontent` are defined as text variables, unbound, and each data set takes a value for a variable from the `p` elements of the element named after it, one paragraph each. Variables of other kinds are left out and named in `skipped` and `warning`. Refused while the variables are locked when it would delete or define a variable → {variables, deleted, deletedDataSets, names, skipped, warning?}",
+            has_doc,
+            load_library
         ),
     ]
 }

@@ -31,6 +31,8 @@ vello_cpu = { workspace = true, features = ["multithreading"] }
 
 [dev-dependencies]
 vectorcraft-testkit = { workspace = true }
+# A variable font built in code (no font file is committed).
+vectorcraft-text = { workspace = true, features = ["test-fonts"] }
 # Live-effect plug-ins the cache tests install, written in WebAssembly text.
 vectorcraft-plugins = { workspace = true }
 wat = { workspace = true }

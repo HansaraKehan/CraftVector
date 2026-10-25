@@ -86,6 +86,18 @@ fn replace_range_takes_replaced_style_and_normalizes() {
     assert_eq!(runs[0].style.size, 12.0);
 }
 
+/// #2119: deleting all of the text with no runs to insert (Backspace over a full selection, an IME
+/// clearing its marked text) keeps the first replaced character's style, not the default one.
+#[test]
+fn replace_range_styled_with_nothing_keeps_the_style_of_emptied_text() {
+    let mut runs = vec![run("Chair", 36.0), run(" 123", 48.0)];
+    let caret = edit::replace_range_styled(&mut runs, 0, 9, &[]);
+    assert_eq!(caret, 0);
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].text.is_empty());
+    assert_eq!(runs[0].style.size, 36.0);
+}
+
 #[test]
 fn replace_respects_char_boundaries_and_slices() {
     let mut runs = vec![run("héllo", 12.0)];
@@ -660,7 +672,9 @@ fn hyphenation_zone_breaks_before_the_word_with_the_single_line_composer() {
 
 /// The default Hyphenation options keep the line breaks of hyphenated text: the copy twice over
 /// at three widths, ragged and justified, with either composer. The constant is an FNV-1a hash of
-/// each line's end and whether it ends with a hyphen.
+/// each line's end and whether it ends with a hyphen. It changed once since: justified lines
+/// follow the default Justification options (word spacing up to 133%, where the composer used
+/// to stretch spaces to 150%), and the every-line composer no longer gives up on loose lines.
 #[test]
 fn default_hyphenation_options_keep_the_line_breaks() {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -683,7 +697,7 @@ fn default_hyphenation_options_keep_the_line_breaks() {
             }
         }
     }
-    assert_eq!(hash, 8_558_443_895_699_068_077);
+    assert_eq!(hash, 4_188_642_633_634_327_633);
 }
 
 /// The longest run of consecutive lines of `l` that end with a hyphen.
@@ -1070,6 +1084,160 @@ fn uncovered_characters_do_not_break_layout() {
     let l = layout(db(), &TextObject::point(Point::ZERO, "a\u{F8FF}\u{E000}b", style(12.0)));
     assert_eq!(l.lines.len(), 1);
     assert!(l.glyphs.len() >= 3);
+}
+
+// ---------- kerning across style runs ----------
+
+/// 40 pt "AVAV" in Source Sans 3, which kerns A and V, with the character at `byte` restyled by
+/// `restyle`.
+fn avav(byte: usize, restyle: impl FnMut(&mut CharStyle)) -> TextObject {
+    let mut t = TextObject::point(Point::ZERO, "AVAV", style(40.0));
+    edit::style_range(&mut t.runs, byte, byte + 1, restyle);
+    t
+}
+
+/// Each glyph's source byte, pen position along the line and advance.
+fn pens(t: &TextObject) -> Vec<(usize, f64, f64)> {
+    layout(db(), t).glyphs.iter().map(|g| (g.byte, g.origin.x, g.advance)).collect()
+}
+
+#[test]
+fn restyling_one_character_keeps_its_kerning_with_its_neighbors() {
+    let plain = pens(&TextObject::point(Point::ZERO, "AVAV", style(40.0)));
+    let unkerned = pens(&TextObject::point(Point::ZERO, "AVAV", CharStyle { kerning: Some(0.0), ..style(40.0) }));
+    assert!((plain[0].2 - unkerned[0].2).abs() > 0.1, "the font kerns A and V: {plain:?} {unkerned:?}");
+    type Restyle = fn(&mut CharStyle);
+    let restyles: [(&str, Restyle); 10] = [
+        ("fill", |s| s.fill = Default::default()),
+        ("stroke", |s| {
+            s.stroke = s.fill.clone();
+            s.stroke_width = 2.0;
+        }),
+        ("underline", |s| s.underline = true),
+        ("strikethrough", |s| s.strikethrough = true),
+        ("overprint", |s| s.overprint_fill = true),
+        ("character style", |s| s.style_name = Some("Accent".into())),
+        ("leading", |s| s.leading = Some(60.0)),
+        ("baseline shift", |s| s.baseline_shift = 5.0),
+        ("rotation", |s| s.rotation = 15.0),
+        ("character alignment", |s| s.char_align = vectorcraft_doc::CharAlign::EmBoxCenter),
+    ];
+    for byte in 0..4 {
+        for (what, restyle) in restyles {
+            let t = avav(byte, restyle);
+            assert_eq!(t.runs.len(), if byte == 0 || byte == 3 { 2 } else { 3 }, "{what} on byte {byte}");
+            assert_eq!(pens(&t), plain, "{what} on byte {byte} moves no glyph");
+            let l = layout(db(), &t);
+            for g in &l.glyphs {
+                assert_eq!(g.run, usize::from(byte > 0 && g.byte >= byte) + usize::from(g.byte > byte), "{what} on byte {byte}: glyph {g:?}");
+                let x = g.origin.x + g.advance * 0.25;
+                assert_eq!(hit_byte(&l, Point::new(x, l.lines[0].baseline)), g.byte, "{what} on byte {byte}: a click before glyph {}", g.byte);
+            }
+        }
+    }
+    // The V keeps its own baseline shift and rotation.
+    let l = layout(db(), &avav(1, |s| s.baseline_shift = 5.0));
+    let y: Vec<f64> = l.glyphs.iter().map(|g| g.xf.as_coeffs()[5]).collect();
+    assert!((y[0] - y[1] - 5.0).abs() < 1e-9 && y[0] == y[2] && y[0] == y[3], "{y:?}");
+    let l = layout(db(), &avav(1, |s| s.rotation = 90.0));
+    assert!(l.glyphs[1].xf.as_coeffs()[1].abs() > l.glyphs[1].xf.as_coeffs()[0].abs(), "the V stands rotated: {:?}", l.glyphs[1].xf);
+    assert_eq!(l.glyphs[0].xf.as_coeffs()[1], 0.0, "the A does not");
+    // A V with 60 pt leading on the second line sets that line 60 pt below the first.
+    let mut t = TextObject::point(Point::ZERO, "AVAV\nAVAV", style(40.0));
+    edit::style_range(&mut t.runs, 6, 7, |s| s.leading = Some(60.0));
+    let l = layout(db(), &t);
+    assert!((l.lines[1].baseline - l.lines[0].baseline - 60.0).abs() < 1e-9, "{:?}", l.lines);
+}
+
+#[test]
+fn tracking_or_kerning_on_one_character_keeps_the_kerning_before_it() {
+    let plain = pens(&TextObject::point(Point::ZERO, "AVAV", style(40.0)));
+    let unkerned = pens(&TextObject::point(Point::ZERO, "AVAV", CharStyle { kerning: Some(0.0), ..style(40.0) }));
+    // Tracking of 50/1000 em on the V adds 2 pt after it and leaves the font's kerning on both sides.
+    let tracked = pens(&avav(1, |s| s.tracking = 50.0));
+    assert_eq!(tracked[0], plain[0], "the A keeps its kerning with the V");
+    assert!((tracked[1].2 - (plain[1].2 + 2.0)).abs() < 1e-9, "{tracked:?} {plain:?}");
+    // Manual kerning of 100/1000 em on the V sets the space between the V and the A after it, in
+    // place of the font's; the A before the V keeps the font's kerning with it.
+    let kerned = pens(&avav(1, |s| s.kerning = Some(100.0)));
+    assert_eq!(kerned[0], plain[0], "the A keeps its kerning with the V");
+    assert!((kerned[1].2 - (unkerned[1].2 + 4.0)).abs() < 1e-9, "{kerned:?} {unkerned:?}");
+    assert!((kerned[2].1 - (plain[1].1 + unkerned[1].2 + 4.0)).abs() < 1e-9, "{kerned:?}");
+    assert_eq!((kerned[2].2, kerned[3].2), (plain[2].2, plain[3].2), "the A and V after it keep their kerning");
+}
+
+#[test]
+fn manual_kerning_after_a_small_caps_break_replaces_the_fonts_kerning() {
+    // Small Caps shapes the lowercase a apart from "AVA", which has manual kerning while the a has
+    // the font's: "AVA" is set as it is when all of the text has manual kerning.
+    let caps = CharStyle { small_caps: Some(70.0), ..style(40.0) };
+    let mut mixed = TextObject::point(Point::ZERO, "aAVA", caps.clone());
+    edit::style_range(&mut mixed.runs, 1, 4, |s| s.kerning = Some(0.0));
+    let manual = TextObject::point(Point::ZERO, "aAVA", CharStyle { kerning: Some(0.0), ..caps });
+    let advances = |t: &TextObject| pens(t).into_iter().filter(|g| g.0 > 0).map(|g| g.2).collect::<Vec<_>>();
+    assert_eq!(advances(&mixed), advances(&manual));
+}
+
+#[test]
+fn manual_kerning_replaces_both_halves_of_the_fonts_pair_after_it() {
+    use crate::test_fonts::{PAIR_KERNING_FAMILY, pair_kerning_font};
+    let db = FontDb::with_font_dirs(vec![]);
+    db.add_font(pair_kerning_font().unwrap());
+    // 100 pt in a 1000-unit font: the pair takes 6 pt off the A's advance and moves the V 10 pt left.
+    let st = CharStyle { font_family: PAIR_KERNING_FAMILY.into(), ..style(100.0) };
+    // Each A's advance and how far the V after it is drawn from its pen position, in `text` with
+    // manual kerning on the bytes `manual`.
+    let set = |text: &str, manual: std::ops::Range<usize>| {
+        let mut t = TextObject::point(Point::ZERO, text, st.clone());
+        edit::style_range(&mut t.runs, manual.start, manual.end, |s| s.kerning = Some(0.0));
+        let l = layout(&db, &t);
+        let g = |c: char| l.glyphs.iter().filter(move |g| text[g.byte..].starts_with(c));
+        g('A').zip(g('V')).map(|(a, v)| (a.advance, v.xf.as_coeffs()[4] - v.origin.x)).collect::<Vec<_>>()
+    };
+    let (kerned, unkerned) = (set("AV", 0..0)[0], set("AV", 0..2)[0]);
+    assert!((unkerned.0 - kerned.0 - 6.0).abs() < 1e-9 && (unkerned.1 - kerned.1 - 10.0).abs() < 1e-9, "{kerned:?} {unkerned:?}");
+    assert_eq!(set("AV", 0..1), [unkerned], "manual kerning on the A turns off the whole A-V pair");
+    assert_eq!(set("AV", 1..2), [kerned], "manual kerning on the V keeps the A-V pair");
+    assert_eq!(set("HAV", 0..1), [kerned], "manual kerning on the H before them keeps the A-V pair");
+    assert_eq!(set("AVAV", 1..4), [kerned, unkerned], "manual kerning from the first V on: the second pair is off");
+    assert_eq!(set("AV\u{301}", 1..4), [kerned], "manual kerning on a V with a combining accent keeps the A-V pair");
+    // An ß in All Caps is set as SS: with manual kerning on it, the font's S-S pair is off.
+    let caps = |manual: std::ops::Range<usize>| {
+        let mut t = TextObject::point(Point::ZERO, "Aß", CharStyle { all_caps: true, ..st.clone() });
+        edit::style_range(&mut t.runs, manual.start, manual.end, |s| s.kerning = Some(0.0));
+        let l = layout(&db, &t);
+        l.glyphs.iter().filter(|g| g.byte == 1).map(|g| (g.advance, g.xf.as_coeffs()[4] - g.origin.x)).collect::<Vec<_>>()
+    };
+    let (auto, manual) = (caps(0..0), caps(0..3));
+    assert_eq!(auto.len(), 2);
+    assert_ne!(auto, manual, "the font kerns S-S");
+    assert_eq!(caps(1..3), manual, "manual kerning on the ß turns off the S-S pair");
+}
+
+#[test]
+fn a_size_change_still_shapes_the_character_apart() {
+    let plain = pens(&TextObject::point(Point::ZERO, "AVAV", style(40.0)));
+    let unkerned = pens(&TextObject::point(Point::ZERO, "AVAV", CharStyle { kerning: Some(0.0), ..style(40.0) }));
+    let larger = pens(&avav(1, |s| s.size = 41.0));
+    assert_eq!(larger[0], unkerned[0], "a V of another size is shaped on its own: {larger:?}");
+    assert_ne!(larger[0], plain[0]);
+}
+
+#[test]
+fn a_ligature_does_not_span_a_change_of_paint() {
+    let serif = CharStyle { font_family: "Source Serif 4".into(), ..style(20.0) };
+    let glyphs = |byte: Option<usize>| {
+        let mut t = TextObject::point(Point::ZERO, "ofit", serif.clone());
+        if let Some(byte) = byte {
+            edit::style_range(&mut t.runs, byte, byte + 1, |s| s.fill = Default::default());
+        }
+        layout(db(), &t).glyphs.iter().map(|g| (g.byte, g.len)).collect::<Vec<_>>()
+    };
+    let fi = vec![(0, 1), (1, 2), (3, 1)];
+    assert_eq!(glyphs(None), fi, "fi ligature in unstyled text");
+    assert_eq!(glyphs(Some(0)), fi, "a restyled o leaves the fi ligature");
+    assert_eq!(glyphs(Some(3)), fi, "a restyled t leaves the fi ligature");
+    assert_eq!(glyphs(Some(2)), vec![(0, 1), (1, 1), (2, 1), (3, 1)], "an i in another paint is a glyph of its own");
 }
 
 // ---------- performance ----------

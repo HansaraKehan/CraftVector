@@ -56,6 +56,17 @@ fn move_between_groups_is_one_undo_step() {
     assert_eq!(names(&s, None).last().map(String::as_str), Some("White"));
 }
 
+/// A swatch or color group moved to place 2^32 goes last. A 32-bit build read the place as 0 and
+/// moved it to the front.
+#[test]
+fn move_past_u32_goes_last() {
+    let mut s = session();
+    run(&mut s, "swatch.move", json!({"name": "White", "to": 1u64 << 32}));
+    assert_eq!(names(&s, None).last().map(String::as_str), Some("White"));
+    run(&mut s, "swatch.move", json!({"name": "Grays", "to": 1u64 << 32}));
+    assert_eq!(doc(&s).swatch_groups.last().map(|g| g.name.as_str()), Some("Grays"));
+}
+
 #[test]
 fn move_reorders_groups_and_refuses_bad_moves() {
     let mut s = session();
@@ -203,8 +214,11 @@ fn a_cmyk_document_starts_with_cmyk_swatches_and_stores_new_colours_as_cmyk() {
     assert_eq!(doc(&s).color_mode, vectorcraft_doc::ColorMode::Cmyk);
     assert!(doc(&s).swatches_iter().filter_map(|w| w.paint.color()).all(|c| !matches!(c, Color::Rgb { .. })));
     assert_eq!(doc(&s).swatch("Black").and_then(|w| w.paint.color()), Some(Color::cmyk(0.0, 0.0, 0.0, 1.0)));
+    // RGB colors separate through the color settings (Generic CMYK: red is C0 M97 Y100 K0).
+    let cms = vectorcraft_color::cms::active();
+    let managed = |c: Color| cms.convert(&c, vectorcraft_color::cms::Model::Cmyk, cms.settings().intent);
     let a = rect_filled(&mut s, json!({"color": "#ff0000"}));
-    assert_eq!(fill(&s, a), Paint::solid(Color::cmyk(0.0, 1.0, 1.0, 0.0)));
+    assert_eq!(fill(&s, a), Paint::solid(managed(Color::rgb(1.0, 0.0, 0.0))));
     // Gray stays Gray; keepModel keeps RGB; gradient stops follow the document too.
     run(&mut s, "paint.setFill", json!({"ids": [a.0], "color": {"gray": 0.4}}));
     assert_eq!(fill(&s, a), Paint::solid(Color::gray(0.4)));
@@ -218,10 +232,115 @@ fn a_cmyk_document_starts_with_cmyk_swatches_and_stores_new_colours_as_cmyk() {
     let Paint::Gradient(g) = fill(&s, a) else { panic!("a gradient") };
     assert!(g.gradient.stops.iter().all(|st| matches!(st.color, Color::Cmyk { .. })));
     // A swatch made from a hex colour is CMYK as well; the document round-trips natively.
-    let name = run(&mut s, "swatch.new", json!({"color": "#00ff00"}))["name"].clone();
-    assert_eq!(name, "C=100 M=0 Y=100 K=0");
+    let name = run(&mut s, "swatch.new", json!({"color": "#00ff00"}))["name"].as_str().unwrap().to_string();
+    assert_eq!(doc(&s).swatch(&name).and_then(|w| w.paint.color()), Some(managed(Color::rgb(0.0, 1.0, 0.0))));
+    assert_eq!(name, "C=62 M=0 Y=100 K=0");
     let json = serde_json::to_string(doc(&s)).unwrap();
     assert_eq!(serde_json::from_str::<vectorcraft_doc::Document>(&json).unwrap(), *doc(&s));
+}
+
+/// The other swatch commands store RGB colors in a CMYK document as `swatch.new {color}` does:
+/// `swatch.new {colors}`, `swatch.newGroup {colors}`, `swatch.editGroup {colors}` and
+/// `swatch.edit {color}`. A color a swatch already has, and a color given with `mode`, keep their
+/// model.
+#[test]
+fn a_cmyk_document_stores_rgb_colors_given_to_the_swatch_commands_as_cmyk() {
+    use vectorcraft_color::Color;
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 100, "height": 100, "colorMode": "cmyk"}));
+    let cms = vectorcraft_color::cms::active();
+    let managed = |c: Color| cms.convert(&c, vectorcraft_color::cms::Model::Cmyk, cms.settings().intent);
+    let (red, green) = (Color::rgb(1.0, 0.0, 0.0), Color::rgb(0.0, 1.0, 0.0));
+    let color = |s: &Session, n: &Value| doc(s).swatch(n.as_str().unwrap()).and_then(|w| w.paint.color());
+    let r = run(&mut s, "swatch.new", json!({"colors": ["#ff0000", {"c": 0, "m": 0, "y": 100, "k": 0}]}));
+    assert_eq!((color(&s, &r["names"][0]), color(&s, &r["names"][1])), (Some(managed(red)), Some(Color::cmyk(0.0, 0.0, 1.0, 0.0))));
+    let r = run(&mut s, "swatch.newGroup", json!({"name": "G", "colors": ["#00ff00"]}));
+    assert_eq!(color(&s, &r["swatches"][0]), Some(managed(green)));
+    let kept = run(&mut s, "swatch.newGroup", json!({"name": "K", "colors": ["#00ff00"], "keepModel": true}));
+    assert_eq!(color(&s, &kept["swatches"][0]), Some(green), "keepModel keeps RGB");
+    let r = run(&mut s, "swatch.editGroup", json!({"group": "G", "colors": ["#ff0000", "#00ff00"]}));
+    assert_eq!((color(&s, &r["swatches"][0]), color(&s, &r["swatches"][1])), (Some(managed(red)), Some(managed(green))));
+    let name = run(&mut s, "swatch.new", json!({"color": "#000000", "keepModel": true}))["name"].clone();
+    assert_eq!(color(&s, &name), Some(Color::BLACK));
+    run(&mut s, "swatch.edit", json!({"name": name, "color": "#ff0000"}));
+    assert_eq!(color(&s, &name), Some(managed(red)));
+    // An RGB swatch sent back unchanged stays RGB.
+    let rgb = run(&mut s, "swatch.new", json!({"color": "#00ff00", "keepModel": true}))["name"].clone();
+    run(&mut s, "swatch.edit", json!({"name": rgb, "color": "#00ff00", "global": true}));
+    assert_eq!(color(&s, &rgb), Some(green));
+    run(&mut s, "swatch.newGroup", json!({"name": "H", "swatches": [rgb]}));
+    let r = run(&mut s, "swatch.editGroup", json!({"group": "H", "colors": ["#00ff00", "#ff0000"]}));
+    assert_eq!((color(&s, &r["swatches"][0]), color(&s, &r["swatches"][1])), (Some(green), Some(managed(red))));
+    // With `mode`, the color is converted once, into that mode.
+    let r = run(&mut s, "swatch.new", json!({"color": "#00ff00", "mode": "rgb"}));
+    assert_eq!(color(&s, &r["name"]), Some(green));
+    let r = run(&mut s, "swatch.new", json!({"colors": ["#00ff00"], "mode": "rgb"}));
+    assert_eq!(color(&s, &r["names"][0]), Some(green));
+}
+
+/// In a CMYK document `swatch.new` (with `color`, `colors` or `mode`), `swatch.newGroup`,
+/// `swatch.edit` (its `keepModel` and its `paint`'s) and `swatch.editGroup` refuse a `keepModel` given
+/// as text or as another value that is not true or false, and the swatches and the undo history stay
+/// as they were. Null is read as `keepModel` left out.
+#[test]
+fn the_swatch_commands_refuse_a_keep_model_given_as_text() {
+    use vectorcraft_color::Color;
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 100, "height": 100, "colorMode": "cmyk"}));
+    let cms = vectorcraft_color::cms::active();
+    let managed = |c: Color| cms.convert(&c, vectorcraft_color::cms::Model::Cmyk, cms.settings().intent);
+    let name = run(&mut s, "swatch.new", json!({"color": "#000000", "keepModel": true}))["name"].clone();
+    run(&mut s, "swatch.newGroup", json!({"name": "G", "colors": ["#00ff00"]}));
+    let before = (doc(&s).clone(), undo_len(&s));
+    let calls = [
+        ("swatch.new", json!({"color": "#ff0000", "keepModel": "true"})),
+        ("swatch.new", json!({"colors": ["#ff0000"], "keepModel": 1})),
+        ("swatch.new", json!({"color": "#ff0000", "mode": "rgb", "keepModel": "false"})),
+        ("swatch.newGroup", json!({"name": "K", "colors": ["#00ff00"], "keepModel": "true"})),
+        ("swatch.edit", json!({"name": name, "color": "#ff0000", "keepModel": [true]})),
+        ("swatch.edit", json!({"name": name, "paint": {"color": "#ff0000", "keepModel": "true"}, "mode": "cmyk"})),
+        ("swatch.editGroup", json!({"group": "G", "colors": ["#ff0000"], "keepModel": "true"})),
+    ];
+    for (cmd, p) in &calls {
+        let r = s.execute(cmd, p);
+        assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if msg == "`keepModel` must be true or false"), "{cmd} {p}: {r:?}");
+        assert_eq!((doc(&s).clone(), undo_len(&s)), before, "{cmd} {p}");
+    }
+    let r = run(&mut s, "swatch.new", json!({"color": "#ff0000", "keepModel": null}));
+    assert_eq!(doc(&s).swatch(r["name"].as_str().unwrap()).and_then(|w| w.paint.color()), Some(managed(Color::rgb(1.0, 0.0, 0.0))));
+}
+
+/// The swatch commands refuse an on/off option given as text or as another value that is not true
+/// or false, and `swatch.move` a `to` that is not a number, naming the key; the swatches and the
+/// undo history stay as they were. True, false, numbers and null still work.
+#[test]
+fn the_swatch_commands_refuse_a_boolean_or_number_given_as_text() {
+    use super::tests::{not_a_number, not_a_switch, not_refused};
+    let mut s = session();
+    run(&mut s, "shape.rectangle", json!({"x": 10, "y": 10, "width": 20, "height": 20}));
+    run(&mut s, "paint.setFill", json!({"color": "#3366cc"}));
+    let name = run(&mut s, "swatch.new", json!({"color": "#000000"}))["name"].clone();
+    let mut calls: Vec<_> = [
+        ("swatch.new", json!({"color": "#ff0000", "spot": "true"}), "spot"),
+        ("swatch.new", json!({"color": "#ff0000", "global": 1}), "global"),
+        ("swatch.delete", json!({"name": name, "unlink": "false"}), "unlink"),
+        ("swatch.newGroup", json!({"name": "K", "colors": ["#00ff00"], "includeTints": "true"}), "includeTints"),
+        ("swatch.newGroup", json!({"name": "K", "fromArtwork": "true"}), "fromArtwork"),
+        ("swatch.newGroup", json!({"name": "K", "fromArtwork": true, "toGlobal": "false"}), "toGlobal"),
+        ("swatch.edit", json!({"name": name, "spot": "true"}), "spot"),
+        ("swatch.edit", json!({"name": name, "global": [true]}), "global"),
+        ("swatch.addUsedColors", json!({"global": "true"}), "global"),
+        ("swatch.addUsedColors", json!({"selection": 1}), "selection"),
+    ]
+    .into_iter()
+    .map(|(cmd, p, key)| not_a_switch(cmd, p, key))
+    .collect();
+    calls.push(not_a_number("swatch.move", json!({"name": name, "to": "0"}), "to"));
+    let wrong = not_refused(&mut s, &calls);
+    assert!(wrong.is_empty(), "not refused: {wrong:#?}");
+    run(&mut s, "swatch.edit", json!({"name": name, "global": true, "spot": null}));
+    run(&mut s, "swatch.move", json!({"name": name, "to": 0}));
+    assert!(doc(&s).swatch(name.as_str().unwrap()).is_some_and(|w| w.global && !w.spot));
 }
 
 #[test]

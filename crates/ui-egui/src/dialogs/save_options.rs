@@ -75,7 +75,8 @@ fn separates(f: &Format) -> bool {
 }
 
 /// The options the dialog shows: arrays and objects are for agents, and a page range replaces the
-/// single artboard choice; none for a format with its own dialog.
+/// single artboard choice; none for a format with its own dialog. A `.ait` template has no
+/// Version: Save as Template writes it PDF-compatible only.
 fn shown(f: &Format) -> impl Iterator<Item = &'static FormatOption> {
     let range = f.options.iter().any(|o| o.name == "range");
     let separate = separates(f);
@@ -84,7 +85,8 @@ fn shown(f: &Format) -> impl Iterator<Item = &'static FormatOption> {
         !(matches!(o.ty, "array" | "object")
             || (range && o.name == "artboard")
             || (separate && o.name == "range")
-            || (matches!(f.id, "ai" | "ait") && o.name == "useArtboards"))
+            || (matches!(f.id, "ai" | "ait") && o.name == "useArtboards")
+            || (f.id == "ait" && o.name == "aiVersion"))
     })
 }
 
@@ -541,7 +543,7 @@ mod tests {
         assert_eq!((r["pending"].as_str(), r["path"].as_str()), (Some("svgOptions"), Some("art.svg")));
         // The save panel offers every save format, the document's own first.
         let pick = &picks.borrow()[0];
-        let labels: Vec<&str> = pick.filters.iter().map(|f| f.0).collect();
+        let labels: Vec<&str> = pick.filters.iter().map(|f| f.0.as_str()).collect();
         assert_eq!(labels, ["VectorCraft", "VectorCraft Template", "PDF", "SVG", "SVG Compressed", "PDF-compatible .ai"]);
         assert_eq!(pick.name, "Untitled-1.vectorcraft");
         let d = dialog(&app);
@@ -696,8 +698,11 @@ mod tests {
         let pick = &picks.borrow()[1];
         assert_eq!(pick.name, "Untitled-1 template.vctemplate");
         assert_eq!(pick.folder.as_deref().map(std::path::Path::new), Some(folder.as_path()));
-        assert_eq!(pick.filters, [("VectorCraft Template", &["vctemplate"][..]), ("PDF-compatible .ait template", &["ait"][..])]);
-        assert_eq!(written.borrow()[1].0, "copy.vectorcraft", "the picked name is kept");
+        assert_eq!(
+            pick.filters,
+            crate::FilePick::filters([("VectorCraft Template", &["vctemplate"][..]), ("PDF-compatible .ait template", &["ait"][..])])
+        );
+        assert_eq!(written.borrow()[1].0, "copy.vctemplate", "the picked name, its extension replaced with the template's");
     }
 
     #[test]
@@ -724,6 +729,29 @@ mod tests {
         let (name, bytes) = written.borrow()[0].clone();
         assert_eq!(name, "Untitled-1 template.ait");
         assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    /// The `.ait` template's options have no Version row: Save as Template writes it
+    /// PDF-compatible only. A `.ai` file's options keep it.
+    #[test]
+    fn the_ait_template_options_have_no_version_row() {
+        let names = |id: &str| shown(fileio::format(id).unwrap()).map(|o| o.name).collect::<Vec<_>>();
+        assert!(names("ai").contains(&"aiVersion"), "{:?}", names("ai"));
+        assert!(!names("ait").contains(&"aiVersion"), "{:?}", names("ait"));
+    }
+
+    /// A name typed in the Save as Template panel with a Save As format's extension has it
+    /// replaced with the template's, as Save As replaces the extension of a format it doesn't write.
+    #[test]
+    fn save_as_template_replaces_a_save_formats_extension() {
+        for (picked, saved) in [("card.pdf", "card.vctemplate"), ("card.vectorcraft", "card.vctemplate"), ("card.svg", "card.vctemplate")] {
+            let (mut app, written, _) = desktop(picked);
+            app.session.prefs.templates_folder = vectorcraft_testkit::temp_dir("save-template-ext").to_string_lossy().into_owned();
+            app.run("file.saveAsTemplate", json!({})).unwrap();
+            let (path, bytes) = written.borrow()[0].clone();
+            assert_eq!(path, saved, "typed {picked}");
+            assert!(vectorcraft_format::load(&bytes).is_ok_and(|d| d.template), "typed {picked}: a native template");
+        }
     }
 
     #[test]

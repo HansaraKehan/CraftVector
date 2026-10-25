@@ -1,7 +1,9 @@
-//! Photoshop-style raster effects (Effect › Artistic › Film Grain, Blur › Radial Blur and Smart Blur, Brush Strokes ›
-//! Accented Edges, Angled Strokes, Crosshatch, Dark Strokes, Ink Outlines, Spatter, Sprayed Strokes
-//! and Sumi-e, Distort › Diffuse Glow, Glass and Ocean Ripple, Pixelate › Color Halftone,
-//! Crystallize, Mezzotint and Pointillize, Sharpen › Unsharp Mask, Sketch › Halftone Pattern, Stylize ›
+//! Photoshop-style raster effects (Effect › Artistic › Colored Pencil, Cutout, Dry Brush, Film Grain, Fresco, Neon Glow, Paint Daubs, Plastic Wrap and
+//! Poster Edges, Rough Pastels, Smudge Stick, Sponge and Watercolor, Blur › Radial Blur and Smart Blur, Brush Strokes › Accented Edges, Angled Strokes,
+//! Crosshatch, Dark Strokes, Ink Outlines, Spatter, Sprayed Strokes and Sumi-e, Distort › Diffuse
+//! Glow, Glass and Ocean Ripple, Pixelate › Color Halftone, Crystallize, Mezzotint and Pointillize,
+//! Sharpen › Unsharp Mask, Sketch › Bas Relief, Chalk & Charcoal, Charcoal, Chrome, Conté Crayon, Graphic Pen, Halftone Pattern,
+//! Note Paper, Photocopy, Plaster, Reticulation, Stamp, Torn Edges and Water Paper, Stylize ›
 //! Glowing Edges, Texture
 //! › Craquelure, Grain, Mosaic Tiles, Patchwork, Stained Glass and Texturizer, and Video ›
 //! De-Interlace and NTSC Colors): filters over premultiplied RGBA8 pixels.
@@ -19,9 +21,11 @@ mod brushstrokes;
 mod distort;
 mod edges;
 mod loaded;
+mod paint;
 mod pixelate;
 mod sharpen;
 mod sketch;
+mod sketch_ink;
 mod texture;
 mod video;
 
@@ -30,17 +34,32 @@ use vectorcraft_geom::{Affine, Point, Rect};
 
 use crate::util::{flag, num, text};
 
+pub use artistic::{PAINT_DAUB_BRUSH_TYPES, PaintDaubBrush};
 pub use blur::{SMART_BLUR_MODES, SmartBlurMode};
 pub use brushstrokes::{STROKE_DIRECTIONS, StrokeDirection};
 pub use distort::{GLASS_TEXTURES, GLASS_TEXTURES_LOADED, GlassTexture};
 pub use loaded::{LOADED, LoadedTexture, TEXTURE_IMAGE, texture};
 pub use pixelate::{MEZZOTINT_TYPES, Mezzotint};
 pub use sketch::{HALFTONE_TYPES, HalftonePattern};
-pub use texture::{GRAIN_TYPES, Grain, LIGHT_DIRECTIONS, Light, TEXTURES, Texture};
+pub use texture::{GRAIN_TYPES, Grain, LIGHT_DIRECTIONS, Light, TEXTURES, TEXTURES_LOADED, Texture};
 
 /// The Photoshop-style effect ids (all raster effects, see [`crate::is_raster`]).
-pub const PIXEL_EFFECTS: [&str; 29] = [
+pub const PIXEL_EFFECTS: [&str; 56] = [
+    "artistic.coloredPencil",
+    "artistic.cutout",
+    "artistic.dryBrush",
     "artistic.filmGrain",
+    "artistic.fresco",
+    "artistic.neonGlow",
+    "artistic.paintDaubs",
+    "artistic.paletteKnife",
+    "artistic.plasticWrap",
+    "artistic.posterEdges",
+    "artistic.roughPastels",
+    "artistic.smudgeStick",
+    "artistic.sponge",
+    "artistic.underpainting",
+    "artistic.watercolor",
     "blur.radial",
     "blur.smart",
     "brushStrokes.accentedEdges",
@@ -59,7 +78,20 @@ pub const PIXEL_EFFECTS: [&str; 29] = [
     "pixelate.mezzotint",
     "pixelate.pointillize",
     "sharpen.unsharpMask",
+    "sketch.basRelief",
+    "sketch.chalkCharcoal",
+    "sketch.charcoal",
+    "sketch.chrome",
+    "sketch.conteCrayon",
+    "sketch.graphicPen",
     "sketch.halftonePattern",
+    "sketch.notePaper",
+    "sketch.photocopy",
+    "sketch.plaster",
+    "sketch.reticulation",
+    "sketch.stamp",
+    "sketch.tornEdges",
+    "sketch.waterPaper",
     "stylize.glowingEdges",
     "texture.craquelure",
     "texture.grain",
@@ -75,18 +107,65 @@ pub const PIXEL_EFFECTS: [&str; 29] = [
 /// are in document units.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PixelFx {
+    /// Artistic › Colored Pencil: coloured strokes `width` (1..24) apart, as heavy as `pressure`
+    /// (0..15), on paper lifted by `paper` (0..50).
+    ColoredPencil { width: f64, pressure: f64, paper: f64 },
+    /// Artistic › Cutout: flat pieces of colour in `levels` (2..8) steps per channel, their
+    /// edges as simple as `simplicity` (0..10) and as faithful as `fidelity` (1..3) say.
+    Cutout { levels: f64, simplicity: f64, fidelity: f64 },
+    /// Artistic › Dry Brush: short strokes along the form with darkened edges; `size` (1..10) is the
+    /// brush length, `detail` (0..10) how much detail is kept, `texture` (1..3) the edge and bristle
+    /// contrast.
+    DryBrush { size: f64, detail: f64, texture: f64 },
     /// Artistic › Film Grain: monochrome grain in shadows and midtones, a wider bright
     /// highlight area (0..20), and tonal intensity (0..10), preserving coverage.
     FilmGrain { grain: f64, highlight: f64, intensity: f64 },
+    /// Artistic › Fresco: coarse brush dabs on plaster; `brush_size` (1..10), `brush_detail`
+    /// (0..10) and `texture` (1..3).
+    Fresco { brush_size: f64, brush_detail: f64, texture: f64 },
+    /// Artistic › Smudge Stick: the dark areas smudged along short diagonal strokes `stroke`
+    /// (0..10) long, the light areas (widened by `highlight`, 0..20) smudged longer and lightened
+    /// by up to `intensity` (0..10).
+    SmudgeStick { stroke: f64, highlight: f64, intensity: f64 },
+    /// Artistic › Sponge: soft blobs of lighter and darker colour about `brush` (0..10) large,
+    /// contrasting as `definition` (0..25) says, their edges as soft as `smoothness` (1..15).
+    Sponge { brush: f64, definition: f64, smoothness: f64 },
+    /// Artistic › Watercolor: detail simplified by a brush of `detail` (1..14), edges saturated,
+    /// shadows deepened by `shadow` (0..10), `texture` (1..3) grains of paper showing.
+    Watercolor { detail: f64, shadow: f64, texture: u32 },
+    /// Artistic › Neon Glow: dimmed greys lit by `colour` (straight RGB, 0..1) glowing from the
+    /// light areas (`size` above 0) or the dark ones (below 0), spread by |`size`| (-24..24), as
+    /// strong as `brightness` (0..50).
+    NeonGlow { size: f64, brightness: f64, colour: [f32; 3] },
+    /// Artistic › Paint Daubs: dabs `size` (1..50) points apart, as sharp as `sharpness` (0..40),
+    /// with brush `kind`.
+    PaintDaubs { size: f64, sharpness: f64, kind: PaintDaubBrush },
+    /// Artistic › Palette Knife: knife strokes `stroke_size` (1..50) long smear the colours;
+    /// `stroke_detail` (1..3) keeps more original detail when higher; `softness` (0..10) softens
+    /// the strokes.
+    PaletteKnife { stroke_size: f64, stroke_detail: f64, softness: f64 },
+    /// Artistic › Plastic Wrap: specular highlights as strong as `highlight` (0..20) on a relief
+    /// wrinkled by `detail` (0..15) and softened by `smoothness` (1..15).
+    PlasticWrap { highlight: f64, detail: f64, smoothness: f64 },
+    /// Artistic › Poster Edges: colours posterized to `posterization` + 2 levels (0..6) with black
+    /// lines on the edges, as thick as `thickness` (0..10) and as dark as `intensity` (0..10).
+    PosterEdges { thickness: f64, intensity: f64, posterization: f64 },
+    /// Artistic › Underpainting: colours softened as widely as `brush_size` (0..40), then a
+    /// `texture` surface (`scaling`, `relief`, `light`, `invert`) blended in as strongly as
+    /// `texture_coverage` (0..40) says.
+    Underpainting { brush_size: f64, texture_coverage: f64, texture: Texture, scaling: f64, relief: f64, light: Light, invert: bool },
+    /// Artistic › Rough Pastels: diagonal pastel strokes `length` (0..40) long, bristle detail
+    /// (1..20), then a [`Texture`] surface scaled by `scaling` (0.5..2), in relief as strong as
+    /// `relief` (0..50) and lit from `light`; `invert` turns the surface's heights over.
+    RoughPastels { length: f64, detail: f64, texture: Texture, scaling: f64, relief: f64, light: Light, invert: bool },
     /// Blur › Radial Blur around the object's centre: along arcs (spin, an arc of `amount`°) or
     /// along rays (zoom, the content scaled by up to about ±`amount`/2 %), averaging 2^`passes` samples.
     RadialBlur { amount: f64, zoom: bool, passes: u32 },
     /// Blur › Smart Blur (Normal mode): each pixel averaged with the neighbours within `radius`
     /// whose colour differs from its own by no more than `threshold` levels, over a grid of
     /// `samples` × `samples` neighbours at most.
-    /// The Edge Only `mode` draws the edges where neighboring pixels differ by more than
-    /// `threshold` levels in white on black, and Overlay Edge draws them in white over the Normal
-    /// result.
+    /// The Edge Only `mode` draws the edges that `threshold` and `radius` find (`blur::smart_edges`)
+    /// in white on black, and Overlay Edge draws them in white over the Normal result.
     SmartBlur { radius: f64, threshold: f64, samples: u32, mode: SmartBlurMode },
     /// Brush Strokes › Accented Edges: the edges, about `width` (1..14) wide, accented towards
     /// white chalk or black ink as `brightness` (0..50) says; `smoothness` (1..15) softens them.
@@ -127,9 +206,51 @@ pub enum PixelFx {
     /// Sharpen › Unsharp Mask: colours pushed away from a Gaussian blur of σ = `radius` by `amount`
     /// (1 = 100 %), where they differ from it by at least `threshold` levels.
     UnsharpMask { amount: f64, radius: f64, threshold: f64 },
+    /// Sketch › Chalk & Charcoal: chalk highlights in light areas and charcoal in dark ones;
+    /// `chalk` and `charcoal` (0..20) set how much, `pressure` (0..5) the stroke weight.
+    ChalkCharcoal { chalk: f64, charcoal: f64, pressure: f64 },
+    /// Sketch › Chrome: polished chrome relief with `detail` (0..10) and `smoothness` (0..10).
+    Chrome { detail: f64, smoothness: f64 },
+    /// Sketch › Conté Crayon: dark areas in a black crayon, light areas in a white one, on mid-grey
+    /// paper; `foreground` and `background` (0..20) set how far each crayon reaches into the
+    /// midtones, and the paper is a `texture` surface scaled by `scaling` (0.5..2), in relief as
+    /// strong as `relief` (0..50), lit from `light`, its heights turned over when `invert`.
+    ConteCrayon { foreground: f64, background: f64, texture: Texture, scaling: f64, relief: f64, light: Light, invert: bool },
+    /// Sketch › Graphic Pen: fine linear ink strokes along `dir`, each `length` (1..15) points long
+    /// on white paper; `balance` (0..100) sets how much of the tone range becomes black ink.
+    GraphicPen { length: f64, balance: f64, direction: StrokeDirection },
     /// Sketch › Halftone Pattern: black ink on white paper through a `kind` screen of cells `size`
     /// (1..12) apart, its edges as hard as `contrast` (0..50) says.
     HalftonePattern { size: f64, contrast: f64, kind: HalftonePattern },
+    /// Sketch › Note Paper: embossed tones on fibrous paper (`balance`, `graininess`, `relief`).
+    NotePaper { balance: f64, graininess: f64, relief: f64 },
+    /// Sketch › Bas Relief: low relief lit from `light`, keeping the finer features as `detail`
+    /// (1..15) says and rounded by `smoothness` (1..15).
+    BasRelief { detail: f64, smoothness: f64, light: Light },
+    /// Sketch › Charcoal: bold edges `thickness` (1..7) wide, as fine as `detail` (0..5) says, and
+    /// diagonal strokes over the midtones; `balance` (0..100) sets how far into the lights it reaches.
+    Charcoal { thickness: f64, detail: f64, balance: f64 },
+    /// Sketch › Photocopy: black only where a pixel is darker than its surroundings, as fine as
+    /// `detail` (1..24) says, and as readily as `darkness` (1..50) says.
+    Photocopy { detail: f64, darkness: f64 },
+    /// Sketch › Stamp: solid black and white, printing black as much as `balance` (0..50) says,
+    /// its shapes rounded by `smoothness` (1..50).
+    Stamp { balance: f64, smoothness: f64 },
+    /// Sketch › Plaster: relief plaster lit from `light`; dark areas raised, light recessed;
+    /// `imageBalance` (1..50) shifts more of the image lower at higher values; `smoothness` (1..15)
+    /// softens the relief.
+    Plaster { image_balance: f64, smoothness: f64, light: Light },
+    /// Sketch › Reticulation: black ink on white paper through a high-contrast film-grain screen;
+    /// `density` (0..50), `foreground` and `background` (0..50) pull tones before the grain.
+    Reticulation { density: f64, foreground: f64, background: f64 },
+    /// Sketch › Torn Edges: high-contrast black and white with ragged edges; `image_balance`
+    /// (0..50) shifts ink versus paper, `smoothness` (0..15) softens tones and fraying, `contrast`
+    /// (0..20) hardens the split.
+    TornEdges { image_balance: f64, smoothness: f64, contrast: f64 },
+    /// Sketch › Water Paper: colours flow on damp fibrous paper; `fiber_length` (3..50) sets the
+    /// fibers and daubs, `brightness` and `contrast` (0..100) adjust the wash. Ranges and defaults
+    /// are unverified VectorCraft choices (helpx documents the controls only).
+    WaterPaper { fiber_length: f64, brightness: f64, contrast: f64 },
     /// Stylize › Glowing Edges: bright coloured Sobel outlines on black.
     GlowingEdges { width: f64, brightness: f64, smoothness: f64 },
     /// Pixelate › Color Halftone: each colour channel screened at its angle (`angles`° of channels
@@ -210,10 +331,88 @@ pub(crate) fn parse(id: &str, p: &Value) -> Option<PixelFx> {
         levels.iter().find(|(name, _)| name.eq_ignore_ascii_case(q)).map_or(default, |(_, v)| *v)
     };
     Some(match id {
+        "artistic.coloredPencil" => PixelFx::ColoredPencil {
+            width: num(p, "pencilWidth", 5.0).clamp(1.0, 24.0),
+            pressure: num(p, "strokePressure", 5.0).clamp(0.0, 15.0),
+            paper: num(p, "paperBrightness", 25.0).clamp(0.0, 50.0),
+        },
+        "artistic.cutout" => PixelFx::Cutout {
+            levels: num(p, "levels", 4.0).round().clamp(2.0, 8.0),
+            simplicity: num(p, "edgeSimplicity", 4.0).clamp(0.0, 10.0),
+            fidelity: num(p, "edgeFidelity", 2.0).round().clamp(1.0, 3.0),
+        },
+        "artistic.dryBrush" => PixelFx::DryBrush {
+            size: num(p, "brushSize", 2.0).clamp(1.0, 10.0),
+            detail: num(p, "brushDetail", 10.0).clamp(0.0, 10.0),
+            texture: num(p, "texture", 1.0).round().clamp(1.0, 3.0),
+        },
+        "artistic.neonGlow" => PixelFx::NeonGlow {
+            size: num(p, "glowSize", 5.0).clamp(-24.0, 24.0),
+            brightness: num(p, "glowBrightness", 15.0).clamp(0.0, 50.0),
+            colour: crate::raster::color_param(p, vectorcraft_doc::color::Color::rgb(0.3, 0.65, 1.0)).to_rgb(),
+        },
+        "artistic.paletteKnife" => PixelFx::PaletteKnife {
+            stroke_size: num(p, "strokeSize", 10.0).clamp(1.0, 50.0),
+            stroke_detail: num(p, "strokeDetail", 2.0).clamp(1.0, 3.0),
+            softness: num(p, "softness", 3.0).clamp(0.0, 10.0),
+        },
+        "artistic.posterEdges" => PixelFx::PosterEdges {
+            thickness: num(p, "edgeThickness", 2.0).clamp(0.0, 10.0),
+            intensity: num(p, "edgeIntensity", 1.0).clamp(0.0, 10.0),
+            posterization: num(p, "posterization", 2.0).round().clamp(0.0, 6.0),
+        },
         "artistic.filmGrain" => PixelFx::FilmGrain {
             grain: num(p, "grain", 4.0).clamp(0.0, 20.0),
             highlight: num(p, "highlightArea", 0.0).clamp(0.0, 20.0),
             intensity: num(p, "intensity", 10.0).clamp(0.0, 10.0),
+        },
+        "artistic.underpainting" => PixelFx::Underpainting {
+            brush_size: num(p, "brushSize", 6.0).clamp(0.0, 40.0),
+            texture_coverage: num(p, "textureCoverage", 16.0).clamp(0.0, 40.0),
+            texture: Texture::parse(text(p, "texture", "canvas")),
+            scaling: num(p, "scaling", 100.0).clamp(50.0, 200.0) / 100.0,
+            relief: num(p, "relief", 4.0).clamp(0.0, 50.0),
+            light: Light::parse(text(p, "lightDirection", "top")),
+            invert: flag(p, "invert", false),
+        },
+        "artistic.roughPastels" => PixelFx::RoughPastels {
+            length: num(p, "strokeLength", 6.0).clamp(0.0, 40.0),
+            detail: num(p, "strokeDetail", 10.0).clamp(1.0, 20.0),
+            texture: Texture::parse(text(p, "texture", "canvas")),
+            scaling: num(p, "scaling", 100.0).clamp(50.0, 200.0) / 100.0,
+            relief: num(p, "relief", 4.0).clamp(0.0, 50.0),
+            light: Light::parse(text(p, "lightDirection", "top")),
+            invert: flag(p, "invert", false),
+        },
+        "artistic.fresco" => PixelFx::Fresco {
+            brush_size: num(p, "brushSize", 2.0).clamp(1.0, 10.0),
+            brush_detail: num(p, "brushDetail", 10.0).clamp(0.0, 10.0),
+            texture: num(p, "texture", 1.0).round().clamp(1.0, 3.0),
+        },
+        "artistic.smudgeStick" => PixelFx::SmudgeStick {
+            stroke: num(p, "strokeLength", 2.0).clamp(0.0, 10.0),
+            highlight: num(p, "highlightArea", 12.0).clamp(0.0, 20.0),
+            intensity: num(p, "intensity", 10.0).clamp(0.0, 10.0),
+        },
+        "artistic.sponge" => PixelFx::Sponge {
+            brush: num(p, "brushSize", 2.0).clamp(0.0, 10.0),
+            definition: num(p, "definition", 12.0).clamp(0.0, 25.0),
+            smoothness: num(p, "smoothness", 5.0).clamp(1.0, 15.0),
+        },
+        "artistic.watercolor" => PixelFx::Watercolor {
+            detail: num(p, "brushDetail", 9.0).clamp(1.0, 14.0),
+            shadow: num(p, "shadowIntensity", 1.0).clamp(0.0, 10.0),
+            texture: num(p, "texture", 1.0).clamp(1.0, 3.0).round() as u32,
+        },
+        "artistic.paintDaubs" => PixelFx::PaintDaubs {
+            size: num(p, "brushSize", 10.0).clamp(1.0, 50.0),
+            sharpness: num(p, "sharpness", 25.0).clamp(0.0, 40.0),
+            kind: PaintDaubBrush::parse(text(p, "brushType", "simple")),
+        },
+        "artistic.plasticWrap" => PixelFx::PlasticWrap {
+            highlight: num(p, "highlightStrength", 20.0).clamp(0.0, 20.0),
+            detail: num(p, "detail", 12.0).clamp(0.0, 15.0),
+            smoothness: num(p, "smoothness", 15.0).clamp(1.0, 15.0),
         },
         "blur.radial" => PixelFx::RadialBlur {
             amount: num(p, "amount", 10.0).clamp(1.0, 100.0),
@@ -284,10 +483,71 @@ pub(crate) fn parse(id: &str, p: &Value) -> Option<PixelFx> {
             radius: num(p, "radius", 1.0).clamp(0.1, 250.0),
             threshold: num(p, "threshold", 0.0).clamp(0.0, 255.0),
         },
+        "sketch.chalkCharcoal" => PixelFx::ChalkCharcoal {
+            chalk: num(p, "chalkArea", 6.0).clamp(0.0, 20.0),
+            charcoal: num(p, "charcoalArea", 6.0).clamp(0.0, 20.0),
+            pressure: num(p, "strokePressure", 2.0).clamp(0.0, 5.0),
+        },
+        "sketch.chrome" => PixelFx::Chrome { detail: num(p, "detail", 4.0).clamp(0.0, 10.0), smoothness: num(p, "smoothness", 4.0).clamp(0.0, 10.0) },
+        "sketch.conteCrayon" => PixelFx::ConteCrayon {
+            foreground: num(p, "foregroundLevel", 12.0).clamp(0.0, 20.0),
+            background: num(p, "backgroundLevel", 10.0).clamp(0.0, 20.0),
+            texture: Texture::parse(text(p, "texture", "canvas")),
+            scaling: num(p, "scaling", 100.0).clamp(50.0, 200.0) / 100.0,
+            relief: num(p, "relief", 4.0).clamp(0.0, 50.0),
+            light: Light::parse(text(p, "lightDirection", "top")),
+            invert: flag(p, "invert", false),
+        },
+        "sketch.graphicPen" => PixelFx::GraphicPen {
+            length: num(p, "strokeLength", 5.0).clamp(1.0, 15.0),
+            balance: num(p, "lightDarkBalance", 50.0).clamp(0.0, 100.0),
+            direction: StrokeDirection::parse(text(p, "strokeDirection", "rightDiagonal")),
+        },
         "sketch.halftonePattern" => PixelFx::HalftonePattern {
             size: num(p, "size", 1.0).clamp(1.0, 12.0),
             contrast: num(p, "contrast", 5.0).clamp(0.0, 50.0),
             kind: HalftonePattern::parse(text(p, "patternType", "dot")),
+        },
+        "sketch.notePaper" => PixelFx::NotePaper {
+            balance: num(p, "imageBalance", 25.0).clamp(0.0, 50.0),
+            graininess: num(p, "graininess", 0.0).clamp(0.0, 10.0),
+            relief: num(p, "relief", 4.0).clamp(0.0, 50.0),
+        },
+        "sketch.basRelief" => PixelFx::BasRelief {
+            detail: num(p, "detail", 13.0).clamp(1.0, 15.0),
+            smoothness: num(p, "smoothness", 3.0).clamp(1.0, 15.0),
+            light: Light::parse(text(p, "lightDirection", "bottom")),
+        },
+        "sketch.charcoal" => PixelFx::Charcoal {
+            thickness: num(p, "thickness", 1.0).clamp(1.0, 7.0),
+            detail: num(p, "detail", 1.0).clamp(0.0, 5.0),
+            balance: num(p, "lightDarkBalance", 50.0).clamp(0.0, 100.0),
+        },
+        "sketch.photocopy" => {
+            PixelFx::Photocopy { detail: num(p, "detail", 7.0).clamp(1.0, 24.0), darkness: num(p, "darkness", 25.0).clamp(1.0, 50.0) }
+        }
+        "sketch.stamp" => {
+            PixelFx::Stamp { balance: num(p, "lightDarkBalance", 25.0).clamp(0.0, 50.0), smoothness: num(p, "smoothness", 5.0).clamp(1.0, 50.0) }
+        }
+        "sketch.plaster" => PixelFx::Plaster {
+            image_balance: num(p, "imageBalance", 20.0).clamp(1.0, 50.0),
+            smoothness: num(p, "smoothness", 8.0).clamp(1.0, 15.0),
+            light: Light::parse(text(p, "lightDirection", "top")),
+        },
+        "sketch.reticulation" => PixelFx::Reticulation {
+            density: num(p, "density", 12.0).clamp(0.0, 50.0),
+            foreground: num(p, "foregroundLevel", 6.0).clamp(0.0, 50.0),
+            background: num(p, "backgroundLevel", 6.0).clamp(0.0, 50.0),
+        },
+        "sketch.tornEdges" => PixelFx::TornEdges {
+            image_balance: num(p, "imageBalance", 25.0).clamp(0.0, 50.0),
+            smoothness: num(p, "smoothness", 11.0).clamp(0.0, 15.0),
+            contrast: num(p, "contrast", 17.0).clamp(0.0, 20.0),
+        },
+        "sketch.waterPaper" => PixelFx::WaterPaper {
+            fiber_length: num(p, "fiberLength", 15.0).clamp(3.0, 50.0),
+            brightness: num(p, "brightness", 50.0).clamp(0.0, 100.0),
+            contrast: num(p, "contrast", 50.0).clamp(0.0, 100.0),
         },
         "stylize.glowingEdges" => PixelFx::GlowingEdges {
             width: num(p, "edgeWidth", 2.0).clamp(1.0, 14.0),
@@ -326,7 +586,7 @@ pub(crate) fn parse(id: &str, p: &Value) -> Option<PixelFx> {
             light: num(p, "lightIntensity", 3.0).clamp(0.0, 10.0),
         },
         "texture.texturizer" => PixelFx::Texturizer {
-            texture: Texture::parse(text(p, "texture", "canvas")),
+            texture: Texture::parse_with(text(p, "texture", "canvas"), p.get(TEXTURE_IMAGE).and_then(Value::as_str)),
             scaling: num(p, "scaling", 100.0).clamp(50.0, 200.0) / 100.0,
             relief: num(p, "relief", 4.0).clamp(0.0, 50.0),
             light: Light::parse(text(p, "lightDirection", "top")),
@@ -354,7 +614,11 @@ impl PixelFx {
             PixelFx::SmartBlur { radius, .. } => radius,
             PixelFx::AccentedEdges { .. } => 0.0,
             // Strokes reach out of the object as far as they reach into it.
-            PixelFx::AngledStrokes { length, .. } | PixelFx::InkOutlines { length, .. } => brushstrokes::stroke_reach(length),
+            PixelFx::PaletteKnife { stroke_size, softness, .. } => artistic::palette_knife_reach(stroke_size, softness),
+            PixelFx::AngledStrokes { length, .. }
+            | PixelFx::GraphicPen { length, .. }
+            | PixelFx::InkOutlines { length, .. }
+            | PixelFx::RoughPastels { length, .. } => brushstrokes::stroke_reach(length),
             PixelFx::Crosshatch { length, .. } => brushstrokes::stroke_reach(length) + brushstrokes::rough(length),
             PixelFx::DarkStrokes { .. } => brushstrokes::stroke_reach(brushstrokes::LIGHT_LENGTH),
             PixelFx::Spatter { radius, .. } => brushstrokes::spatter_shift(radius),
@@ -365,9 +629,30 @@ impl PixelFx {
             // Content shifted outwards reaches past the bounds by as much as the shift.
             PixelFx::Glass { distortion, .. } => distort::glass_shift(distortion),
             PixelFx::OceanRipple { size, magnitude } => distort::ripple_shift(size, magnitude),
-            PixelFx::UnsharpMask { .. } | PixelFx::HalftonePattern { .. } => 0.0,
+            PixelFx::UnsharpMask { .. }
+            | PixelFx::ChalkCharcoal { .. }
+            | PixelFx::Chrome { .. }
+            | PixelFx::ConteCrayon { .. }
+            | PixelFx::HalftonePattern { .. }
+            | PixelFx::NotePaper { .. }
+            | PixelFx::Plaster { .. }
+            | PixelFx::Reticulation { .. }
+            | PixelFx::TornEdges { .. } => 0.0,
+            PixelFx::BasRelief { .. } | PixelFx::Charcoal { .. } | PixelFx::Photocopy { .. } | PixelFx::Stamp { .. } => 0.0,
+            PixelFx::WaterPaper { fiber_length, .. } => sketch::water_paper_shift(fiber_length),
             PixelFx::GlowingEdges { width, smoothness, .. } => width.max(smoothness * 3.0),
+            PixelFx::PaintDaubs { size, .. } => artistic::paint_daub_radius(size),
+            // These three keep the object's coverage.
+            PixelFx::SmudgeStick { .. } | PixelFx::Sponge { .. } | PixelFx::Watercolor { .. } => 0.0,
             PixelFx::FilmGrain { .. }
+            | PixelFx::ColoredPencil { .. }
+            | PixelFx::Fresco { .. }
+            | PixelFx::Cutout { .. }
+            | PixelFx::DryBrush { .. }
+            | PixelFx::NeonGlow { .. }
+            | PixelFx::PlasticWrap { .. }
+            | PixelFx::PosterEdges { .. }
+            | PixelFx::Underpainting { .. }
             | PixelFx::ColorHalftone { .. }
             | PixelFx::Mezzotint { .. }
             | PixelFx::Craquelure { .. }
@@ -388,10 +673,18 @@ impl PixelFx {
     pub fn reach(&self) -> Option<f64> {
         match *self {
             PixelFx::RadialBlur { .. } => None,
-            PixelFx::SmartBlur { radius, .. } => Some(radius),
+            PixelFx::SmartBlur { radius, mode: SmartBlurMode::Normal, .. } => Some(radius),
+            PixelFx::SmartBlur { radius, samples, .. } => Some(blur::edge_reach(radius, samples)),
+            PixelFx::SmudgeStick { stroke, .. } => Some(paint::smudge_reach(stroke)),
+            PixelFx::Sponge { brush, smoothness, .. } => Some(paint::sponge_reach(brush, smoothness)),
+            PixelFx::Watercolor { detail, .. } => Some(paint::watercolor_reach(detail)),
             PixelFx::AccentedEdges { width, smoothness, .. } => Some(brushstrokes::accent_reach(width, smoothness)),
             // The strokes, and the softened tones that choose them.
-            PixelFx::AngledStrokes { length, .. } => Some(brushstrokes::stroke_reach(length).max(brushstrokes::TONE_REACH)),
+            PixelFx::PaletteKnife { stroke_size, softness, .. } => Some(artistic::palette_knife_reach(stroke_size, softness)),
+            PixelFx::AngledStrokes { length, .. } | PixelFx::GraphicPen { length, .. } => {
+                Some(brushstrokes::stroke_reach(length).max(brushstrokes::TONE_REACH))
+            }
+            PixelFx::RoughPastels { length, .. } => Some(artistic::rough_pastels_reach(length)),
             PixelFx::Crosshatch { length, .. } => {
                 Some((brushstrokes::stroke_reach(length) + brushstrokes::rough(length)).max(brushstrokes::TONE_REACH))
             }
@@ -404,11 +697,38 @@ impl PixelFx {
             PixelFx::Glass { distortion, .. } => Some(distort::glass_shift(distortion)),
             PixelFx::OceanRipple { size, magnitude } => Some(distort::ripple_shift(size, magnitude)),
             PixelFx::UnsharpMask { radius, .. } => Some(3.0 * radius),
+            PixelFx::BasRelief { detail, smoothness, .. } => Some(sketch_ink::relief_reach(detail, smoothness)),
+            PixelFx::Charcoal { thickness, detail, .. } => Some(sketch_ink::charcoal_reach(thickness, detail)),
+            PixelFx::Photocopy { detail, .. } => Some(sketch_ink::copy_reach(detail)),
+            PixelFx::Stamp { smoothness, .. } => Some(sketch_ink::stamp_reach(smoothness)),
             PixelFx::GlowingEdges { width, smoothness, .. } => Some(width.max(smoothness * 3.0)),
             // The cells around the pixel's, and the cells around theirs.
             PixelFx::ColorHalftone { max_radius, .. } => Some(3.0 * std::f64::consts::SQRT_2 * max_radius),
             PixelFx::Crystallize { cell } => Some(1.5 * cell),
-            PixelFx::FilmGrain { .. } | PixelFx::Mezzotint { .. } | PixelFx::HalftonePattern { .. } => Some(0.0),
+            PixelFx::ColoredPencil { width, .. } => Some(artistic::colored_pencil_reach(width)),
+            PixelFx::ChalkCharcoal { .. } => Some(sketch::CHALK_CHARCOAL_REACH),
+            PixelFx::Chrome { smoothness, .. } => Some(sketch::chrome_reach(smoothness)),
+            PixelFx::ConteCrayon { .. } => Some(sketch::CONTE_REACH),
+            PixelFx::FilmGrain { .. }
+            | PixelFx::Mezzotint { .. }
+            | PixelFx::HalftonePattern { .. }
+            | PixelFx::NotePaper { .. }
+            | PixelFx::Reticulation { .. } => Some(0.0),
+            PixelFx::Fresco { brush_size, brush_detail, .. } => Some(artistic::fresco_reach(brush_size, brush_detail)),
+            PixelFx::DryBrush { size, detail, .. } => Some(artistic::dry_brush_reach(size, detail)),
+            PixelFx::Plaster { smoothness, .. } => Some(sketch::plaster_reach(smoothness)),
+            PixelFx::PaintDaubs { size, .. } => Some(artistic::paint_daub_radius(size) + size * 0.15),
+            PixelFx::WaterPaper { fiber_length, .. } => {
+                Some(sketch::water_paper_shift(fiber_length) + 3.0 * (0.06 * fiber_length.clamp(3.0, 50.0)).max(0.35))
+            }
+            // Cutout's palette and Torn Edges' peak-normalised edges come from the whole object.
+            PixelFx::Cutout { .. } | PixelFx::TornEdges { .. } => None,
+            // The softened tones around the pixel.
+            PixelFx::NeonGlow { size, .. } => Some(3.0 * artistic::glow_spread(size)),
+            PixelFx::PlasticWrap { smoothness, .. } => Some(artistic::plastic_reach(smoothness)),
+            // The edges' lines, spread round them.
+            PixelFx::PosterEdges { thickness, .. } => Some(3.0 * (0.3 + 0.25 * thickness) + 1.0),
+            PixelFx::Underpainting { brush_size, .. } => Some(3.0 * (0.1 * brush_size.max(0.25)) + 1.0),
             // The dots' points, and the softened colour around them.
             PixelFx::Pointillize { cell } => Some(2.5 * cell),
             // The softened tones around the pixel.
@@ -429,7 +749,29 @@ impl PixelFx {
         let Some(px) = pixels(data, w, h) else { return };
         let to_px = |len: f64| len / space.px.max(1e-9);
         match *self {
+            PixelFx::ColoredPencil { width, pressure, paper } => artistic::colored_pencil(px, w, h, space, width, pressure, paper),
+            PixelFx::Cutout { levels, simplicity, fidelity } => artistic::cutout(px, w, h, space, levels, simplicity, fidelity),
+            PixelFx::DryBrush { size, detail, texture } => artistic::dry_brush(px, w, h, space, size, detail, texture),
             PixelFx::FilmGrain { grain, highlight, intensity } => artistic::film_grain(px, w, h, space, grain, highlight, intensity),
+            PixelFx::Fresco { brush_size, brush_detail, texture } => artistic::fresco(px, w, h, space, brush_size, brush_detail, texture),
+            PixelFx::SmudgeStick { stroke, highlight, intensity } => paint::smudge_stick(px, w, h, space, stroke, highlight, intensity),
+            PixelFx::Sponge { brush, definition, smoothness } => paint::sponge(px, w, h, space, brush, definition, smoothness),
+            PixelFx::Watercolor { detail, shadow, texture } => paint::watercolor(px, w, h, space, detail, shadow, texture),
+            PixelFx::PaintDaubs { size, sharpness, kind } => artistic::paint_daubs(px, w, h, space, size, sharpness, kind),
+            PixelFx::PlasticWrap { highlight, detail, smoothness } => artistic::plastic_wrap(px, w, h, space, highlight, detail, smoothness),
+            PixelFx::NeonGlow { size, brightness, colour } => artistic::neon_glow(px, w, h, space, size, brightness, colour),
+            PixelFx::PaletteKnife { stroke_size, stroke_detail, softness } => {
+                artistic::palette_knife(px, w, h, space, stroke_size, stroke_detail, softness)
+            }
+            PixelFx::PosterEdges { thickness, intensity, posterization } => {
+                artistic::poster_edges(px, w, h, space, thickness, intensity, posterization)
+            }
+            PixelFx::Underpainting { brush_size, texture_coverage, ref texture, scaling, relief, light, invert } => {
+                artistic::underpainting(px, w, h, space, brush_size, texture_coverage, texture, scaling, relief, light, invert)
+            }
+            PixelFx::RoughPastels { length, detail, ref texture, scaling, relief, light, invert } => {
+                artistic::rough_pastels(px, w, h, space, length, detail, texture, scaling, relief, light, invert)
+            }
             PixelFx::RadialBlur { amount, zoom, passes } => blur::radial(px, w, h, space, amount, zoom, passes),
             PixelFx::SmartBlur { radius, threshold, samples, mode: SmartBlurMode::Normal } => {
                 blur::smart(px, w, h, to_px(radius), threshold, samples)
@@ -451,7 +793,22 @@ impl PixelFx {
             }
             PixelFx::OceanRipple { size, magnitude } => distort::ocean_ripple(px, w, h, space, size, magnitude),
             PixelFx::UnsharpMask { amount, radius, threshold } => sharpen::unsharp(px, w, h, amount, to_px(radius), threshold),
+            PixelFx::ChalkCharcoal { chalk, charcoal, pressure } => sketch::chalk_charcoal(px, w, h, space, chalk, charcoal, pressure),
+            PixelFx::Chrome { detail, smoothness } => sketch::chrome(px, w, h, space, detail, smoothness),
+            PixelFx::ConteCrayon { foreground, background, ref texture, scaling, relief, light, invert } => {
+                sketch::conte_crayon(px, w, h, space, foreground, background, texture, scaling, relief, light, invert)
+            }
+            PixelFx::GraphicPen { length, balance, direction } => brushstrokes::graphic_pen(px, w, h, space, length, balance, direction),
             PixelFx::HalftonePattern { size, contrast, kind } => sketch::halftone_pattern(px, w, h, space, size, contrast, kind),
+            PixelFx::NotePaper { balance, graininess, relief } => sketch::note_paper(px, w, h, space, balance, graininess, relief),
+            PixelFx::BasRelief { detail, smoothness, light } => sketch_ink::bas_relief(px, w, h, space, detail, smoothness, light),
+            PixelFx::Charcoal { thickness, detail, balance } => sketch_ink::charcoal(px, w, h, space, thickness, detail, balance),
+            PixelFx::Photocopy { detail, darkness } => sketch_ink::photocopy(px, w, h, space, detail, darkness),
+            PixelFx::Stamp { balance, smoothness } => sketch_ink::stamp(px, w, h, space, balance, smoothness),
+            PixelFx::Plaster { image_balance, smoothness, light } => sketch::plaster(px, w, h, space, image_balance, smoothness, light),
+            PixelFx::Reticulation { density, foreground, background } => sketch::reticulation(px, w, h, space, density, foreground, background),
+            PixelFx::TornEdges { image_balance, smoothness, contrast } => sketch::torn_edges(px, w, h, space, image_balance, smoothness, contrast),
+            PixelFx::WaterPaper { fiber_length, brightness, contrast } => sketch::water_paper(px, w, h, space, fiber_length, brightness, contrast),
             PixelFx::GlowingEdges { width, brightness, smoothness } => edges::glow(px, w, h, to_px(width), brightness, to_px(smoothness)),
             PixelFx::ColorHalftone { max_radius, angles } => pixelate::color_halftone(px, w, h, space, max_radius, angles),
             PixelFx::Crystallize { cell } => pixelate::crystallize(px, w, h, space, cell),
@@ -462,7 +819,7 @@ impl PixelFx {
             PixelFx::MosaicTiles { tile, grout, lighten } => texture::mosaic_tiles(px, w, h, space, tile, grout, lighten),
             PixelFx::Patchwork { square, relief } => texture::patchwork(px, w, h, space, square, relief),
             PixelFx::StainedGlass { cell, border, light } => texture::stained_glass(px, w, h, space, cell, border, light),
-            PixelFx::Texturizer { texture, scaling, relief, light, invert } => {
+            PixelFx::Texturizer { ref texture, scaling, relief, light, invert } => {
                 texture::texturizer(px, w, h, space, texture, scaling, relief, light, invert)
             }
             PixelFx::DeInterlace { even, interpolate } => video::deinterlace(px, w, h, space, even, interpolate),
@@ -549,6 +906,64 @@ pub fn blur_plane(a: &mut Vec<f32>, w: usize, h: usize, sigma: f64) {
         }
         transpose(a, &mut tmp, len, other);
         std::mem::swap(a, &mut tmp);
+    }
+}
+
+/// Grow a `w` × `h` plane by `radius` pixels each way, the box of SVG's feMorphology: each value
+/// becomes the largest within the radius. A fractional radius blends the two whole radii around
+/// it, so a silhouette grows smoothly as the raster scales. Does nothing for a radius of zero or
+/// less, or when the sizes don't match.
+pub fn dilate_plane(a: &mut Vec<f32>, w: usize, h: usize, radius: f64) {
+    if radius.is_nan() || radius <= 0.0 || w == 0 || h == 0 || w.checked_mul(h) != Some(a.len()) {
+        return;
+    }
+    let radius = radius.min(MAX_BOX as f64);
+    let whole = radius.floor() as usize;
+    let frac = (radius - whole as f64) as f32;
+    let mut tmp = vec![0.0; a.len()];
+    for (len, other) in [(w, h), (h, w)] {
+        max_plane(a, &mut tmp, len, whole, frac);
+        std::mem::swap(a, &mut tmp);
+        transpose(a, &mut tmp, len, other);
+        std::mem::swap(a, &mut tmp);
+    }
+}
+
+/// One horizontal pass of [`dilate_plane`] over the rows of `w` values of a plane: the largest
+/// value within `whole`, blended by `frac` towards the largest within `whole + 1`.
+fn max_plane(src: &[f32], dst: &mut [f32], w: usize, whole: usize, frac: f32) {
+    let (mut inner, mut ring) = (vec![0.0f32; w], vec![0.0f32; w]);
+    for (row, out) in src.chunks_exact(w).zip(dst.chunks_exact_mut(w)) {
+        window_max(row, whole, &mut inner);
+        window_max(row, whole + 1, &mut ring);
+        for ((o, i), r) in out.iter_mut().zip(&inner).zip(&ring) {
+            *o = i + (r - i) * frac;
+        }
+    }
+}
+
+/// For each `x`, the largest of `row[x - radius..=x + radius]` (cut at the row's ends) into `out`,
+/// in time linear in the row (a sliding window, not a scan of the window for each `x`).
+fn window_max(row: &[f32], radius: usize, out: &mut [f32]) {
+    use std::collections::VecDeque;
+    // Indices of the window's values that can still be its largest, falling in value.
+    let mut keep: VecDeque<usize> = VecDeque::new();
+    let mut next = 0;
+    for (x, o) in out.iter_mut().enumerate().take(row.len()) {
+        let hi = x.saturating_add(radius).min(row.len().saturating_sub(1));
+        while next <= hi {
+            let v = row[next];
+            while keep.back().is_some_and(|&b| row[b] <= v) {
+                keep.pop_back();
+            }
+            keep.push_back(next);
+            next += 1;
+        }
+        let lo = x.saturating_sub(radius);
+        while keep.front().is_some_and(|&f| f < lo) {
+            keep.pop_front();
+        }
+        *o = keep.front().map_or(row[x], |&f| row[f]);
     }
 }
 
@@ -661,3 +1076,26 @@ pub fn gaussian_rgba(data: &mut [u8], w: usize, h: usize, sigma: f64) {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_paint;
+#[cfg(test)]
+mod tests_sketch;
+
+#[cfg(test)]
+mod window_max_tests {
+    use super::window_max;
+
+    #[test]
+    fn the_sliding_maximum_matches_a_scan_of_each_window() {
+        let row: Vec<f32> = (0..40u32).map(|i| ((i * 7919) % 31) as f32).collect();
+        for radius in [0, 1, 2, 5, 39, 100] {
+            let mut out = vec![0.0; row.len()];
+            window_max(&row, radius, &mut out);
+            for (x, got) in out.iter().enumerate() {
+                let (lo, hi) = (x.saturating_sub(radius), (x + radius).min(row.len() - 1));
+                let want = row[lo..=hi].iter().copied().fold(f32::MIN, f32::max);
+                assert_eq!(*got, want, "radius {radius} at {x}");
+            }
+        }
+    }
+}

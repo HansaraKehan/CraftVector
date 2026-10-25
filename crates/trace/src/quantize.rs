@@ -21,6 +21,12 @@ pub(crate) fn luma(p: [u8; 4]) -> u8 {
 
 /// Reduce `img` to a palette according to `params.mode`.
 pub fn quantize(img: &Raster, params: &TraceParams) -> Quantized {
+    quantize_keeping(img, params).0
+}
+
+/// [`quantize`], and the palette colours that are rare but kept on purpose (see [`rare_colours`]):
+/// noise removal must not erase their regions.
+pub(crate) fn quantize_keeping(img: &Raster, params: &TraceParams) -> (Quantized, Vec<[u8; 3]>) {
     let px = img.rgba.as_chunks::<4>().0.iter().map(|c| [c[0], c[1], c[2], c[3]]);
     match params.mode {
         Mode::BlackAndWhite => {
@@ -36,7 +42,7 @@ pub fn quantize(img: &Raster, params: &TraceParams) -> Quantized {
                     }
                 })
                 .collect();
-            Quantized { labels, palette: vec![[255, 255, 255], [0, 0, 0]] }
+            (Quantized { labels, palette: vec![[255, 255, 255], [0, 0, 0]] }, vec![])
         }
         Mode::Grayscale => {
             let own = own_colours(img);
@@ -61,7 +67,7 @@ pub fn quantize(img: &Raster, params: &TraceParams) -> Quantized {
                 let g = l.round().clamp(0.0, 255.0) as u8;
                 [g, g, g]
             });
-            settled(merge_mixed(compact(labels, palette.collect()), img.width as usize, img.height as usize), img, &own)
+            (settled(merge_mixed(compact(labels, palette.collect()), img.width as usize, img.height as usize, &[]), img, &own), vec![])
         }
         // Logo mode traces without quantising; asked directly, it quantises like Color.
         Mode::Color | Mode::Logo => {
@@ -84,10 +90,24 @@ pub fn quantize(img: &Raster, params: &TraceParams) -> Quantized {
             let (every, calm) = (used(&every), used(&calm));
             let count = |u: &[Used]| u.iter().map(|b| b.2).sum::<f64>();
             let from = if palette_from_own(count(&calm), count(&every)) { &calm } else { &every };
+            // Automatic on flat art: colours too rare for its count, but distinct and drawn as
+            // regions of their own, are added (see `rare_colours`).
+            let detail = (params.color_detail / 100.0).clamp(0.0, 1.0);
+            let flat_auto = params.palette == Palette::Automatic && flat_colors(from, detail).is_some();
+            let mut rare: Vec<[u8; 3]> = vec![];
             // The picture with `colors` colours asked for; fewer come back when it has fewer, or
             // when noise made several of one (see `merge_mixed`).
-            let reduce = |colors: u32| {
-                let centers = color_palette(from, &TraceParams { colors, ..params.clone() });
+            let mut reduce = |colors: u32| {
+                let mut centers = color_palette(from, &TraceParams { colors, ..params.clone() });
+                if flat_auto {
+                    let found = rare_colours(img, &own, &hk, &centers);
+                    if !found.is_empty() {
+                        let common = centers.len();
+                        centers.extend(found);
+                        centers = refine_around(from, centers, common);
+                        rare = centers.iter().skip(common).map(|c| c.map(|v| v.round().clamp(0.0, 255.0) as u8)).collect();
+                    }
+                }
                 let mut lut = vec![0u16; 1 << 15];
                 let center_labs = labs(&centers);
                 for (i, c, _) in &every {
@@ -101,11 +121,13 @@ pub fn quantize(img: &Raster, params: &TraceParams) -> Quantized {
                 if params.palette == Palette::DocumentLibrary && !params.swatches.is_empty() {
                     q
                 } else {
-                    merge_mixed(q, img.width as usize, img.height as usize)
+                    merge_mixed(q, img.width as usize, img.height as usize, &rare)
                 }
             };
             let q = reduce(params.colors);
-            settled(q, img, &own)
+            let q = settled(q, img, &own);
+            rare.retain(|c| q.palette.contains(c));
+            (q, rare)
         }
     }
 }
@@ -170,6 +192,12 @@ fn oklab(c: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// [`oklab`] of an sRGB colour, for the tests.
+#[cfg(test)]
+pub(crate) fn tests_oklab(c: [u8; 3]) -> [f64; 3] {
+    oklab(c.map(f64::from))
+}
+
 /// `q` with the colours that noise made of one colour merged, largest mix first.
 ///
 /// Asked for more colours than a picture has, k-means splits a flat colour along its noise, and
@@ -178,9 +206,11 @@ fn oklab(c: [f64; 3]) -> [f64; 3] {
 /// taken in RGB) and thoroughly mixed: the pixels of the lesser one have, on average, more than
 /// half a neighbour of the other each; or they are closer still (under 12 levels) and mixed in
 /// patches (compression blocks). The bands of a gradient are close too, but each keeps to itself
-/// and they stay apart.
-fn merge_mixed(q: Quantized, w: usize, h: usize) -> Quantized {
+/// and they stay apart. The colours in `keep` merge with none.
+fn merge_mixed(q: Quantized, w: usize, h: usize, keep: &[[u8; 3]]) -> Quantized {
     let k = q.palette.len();
+    // A rare colour kept on purpose (see `rare_colours`) is distinct by choice: it merges with none.
+    let kept: Vec<bool> = q.palette.iter().map(|c| keep.contains(c)).collect();
     if k < 2 || q.labels.len() != w * h {
         return q;
     }
@@ -205,7 +235,7 @@ fn merge_mixed(q: Quantized, w: usize, h: usize) -> Quantized {
         let mut best: Option<(f64, usize, usize)> = None;
         for a in 0..k {
             for b in a + 1..k {
-                if into[a] != a || into[b] != b || count[a] <= 0.0 || count[b] <= 0.0 {
+                if into[a] != a || into[b] != b || count[a] <= 0.0 || count[b] <= 0.0 || kept[a] || kept[b] {
                     continue;
                 }
                 let mixed = touch[a * k + b] / count[a].min(count[b]);
@@ -363,6 +393,112 @@ fn compact(mut labels: Vec<u16>, palette: Vec<[u8; 3]>) -> Quantized {
         }
     }
     Quantized { labels, palette: out }
+}
+
+/// `q` with the semi-transparent pixels along the cut edge of `img` given the color beside them,
+/// and the colors that leaves unused dropped.
+///
+/// A traced pixel with an alpha of 128 to 254 and a pixel above, below, left or right of it with an
+/// alpha under 128 is on the cut edge. When its color is the color of a fully opaque pixel within
+/// two pixels of it, or a darker shade of that color (see [`edge_blend_of`]), it is that color
+/// blended with the transparent background, and its own color can lie nearest to an unrelated
+/// palette color, which would trace as a sliver of that color along the edge. Such a pixel takes
+/// the color that most of those opaque pixels have, and of colors that tie, the one nearest to its
+/// own color. Only the pixels it reaches through pixels of an alpha of 128 or more, going up, down,
+/// left or right, count, so that art across a transparent gap is left out. It keeps its own color
+/// when one of the fully opaque pixels it reaches has it, or when its color is a blend of none of
+/// them, as with a thin semi-transparent outline of another color. Pixels outside the image do not
+/// count as transparent. With `gray` (Grayscale), a pixel's color is its gray (see [`luma`]).
+pub(crate) fn settle_cut_edges(q: &mut Quantized, img: &Raster, gray: bool) {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let px = img.rgba.as_chunks::<4>().0;
+    if q.labels.len() != w * h || px.len() != w * h {
+        return;
+    }
+    let alpha = |j: usize| px.get(j).map_or(0, |p| p[3]);
+    let color = |p: &[u8; 4]| if gray { [luma(*p); 3] } else { [p[0], p[1], p[2]] };
+    let mut changed = false;
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for i in 0..w * h {
+        let mine = q.labels[i];
+        if mine == TRANSPARENT || !(128..=254).contains(&alpha(i)) {
+            continue;
+        }
+        let (x, y) = (i % w, i / w);
+        let cut =
+            (x > 0 && alpha(i - 1) < 128) || (x + 1 < w && alpha(i + 1) < 128) || (y > 0 && alpha(i - w) < 128) || (y + 1 < h && alpha(i + w) < 128);
+        if !cut {
+            continue;
+        }
+        let Some(p) = px.get(i) else { continue };
+        let own = oklab(color(p).map(f64::from));
+        // The colors of the fully opaque pixels within two pixels that it reaches and is a blend
+        // of, and how many have each.
+        let (x0, y0, x1, y1) = (x.saturating_sub(2), y.saturating_sub(2), (x + 2).min(w - 1), (y + 2).min(h - 1));
+        let mut reached = [[false; 5]; 5];
+        let mut near: Vec<(u16, usize)> = Vec::new();
+        let mut keep = false;
+        stack.clear();
+        stack.push((x, y));
+        if let Some(r) = reached.get_mut(y - y0).and_then(|row| row.get_mut(x - x0)) {
+            *r = true;
+        }
+        while let Some((cx, cy)) = stack.pop() {
+            let j = cy * w + cx;
+            let l = q.labels[j];
+            if alpha(j) == 255 && l != TRANSPARENT {
+                keep |= l == mine;
+                if px.get(j).is_some_and(|b| edge_blend_of(own, color(b), p[3])) {
+                    match near.iter_mut().find(|n| n.0 == l) {
+                        Some(n) => n.1 += 1,
+                        None => near.push((l, 1)),
+                    }
+                }
+            }
+            for (nx, ny) in [(cx.wrapping_sub(1), cy), (cx + 1, cy), (cx, cy.wrapping_sub(1)), (cx, cy + 1)] {
+                if nx < x0 || nx > x1 || ny < y0 || ny > y1 || alpha(ny * w + nx) < 128 {
+                    continue;
+                }
+                let Some(r) = reached.get_mut(ny - y0).and_then(|row| row.get_mut(nx - x0)) else { continue };
+                if !*r {
+                    *r = true;
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        if keep || near.is_empty() {
+            continue;
+        }
+        let most = near.iter().map(|n| n.1).max().unwrap_or(0);
+        let tied: Vec<(u16, [f64; 3])> =
+            near.iter().filter(|n| n.1 == most).filter_map(|n| Some((n.0, oklab(q.palette.get(n.0 as usize)?.map(f64::from))))).collect();
+        let tied_labs: Vec<[f64; 3]> = tied.iter().map(|t| t.1).collect();
+        let Some(&(to, _)) = tied.get(nearest_lab(&tied_labs, own)) else { continue };
+        q.labels[i] = to;
+        changed = true;
+    }
+    if changed {
+        *q = compact(std::mem::take(&mut q.labels), std::mem::take(&mut q.palette));
+    }
+}
+
+/// How far (Oklab × 100) the color of a pixel on a cut edge may lie from the color beside it, or
+/// from a darker shade of that color, and still count as a blend of it with the transparent
+/// background.
+const EDGE_BLEND: f64 = 8.0;
+
+/// Whether `own` (Oklab), the color of a pixel with an alpha of `alpha`, is `beside` (sRGB) blended
+/// with the transparent background: whether it lies within [`EDGE_BLEND`] of the line in Oklab from
+/// `beside` to `beside` with each channel scaled by `alpha` / 510.
+fn edge_blend_of(own: [f64; 3], beside: [u8; 3], alpha: u8) -> bool {
+    let to = oklab(beside.map(f64::from));
+    let k = f64::from(alpha) / 510.0;
+    let from = oklab(beside.map(|v| f64::from(v) * k));
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let t = if len2 > 0.0 { ((0..3).map(|c| (own[c] - from[c]) * d[c]).sum::<f64>() / len2).clamp(0.0, 1.0) } else { 0.0 };
+    let off2: f64 = (0..3).map(|c| (own[c] - from[c] - t * d[c]).powi(2)).sum();
+    off2 <= EDGE_BLEND * EDGE_BLEND
 }
 
 #[derive(Clone, Copy, Default)]
@@ -687,10 +823,226 @@ fn refine(used: &[Used], mut centers: Vec<[f64; 3]>) -> Vec<[f64; 3]> {
     centers
 }
 
+/// Automatic: the most rare colours added to a flat picture's count.
+const RARE_BUDGET: usize = 6;
+
+/// How far apart (Oklab × 100) a rare colour must be from every palette colour and from the main
+/// colour each stands for: a little more than the least difference one sees (about 2).
+const RARE_APART: f64 = 2.5;
+
+/// The fewest pixels of a 4-connected region that make a rare colour a colour of the picture (a
+/// stem one pixel wide and eight long): scattered noise makes none so large.
+const RARE_REGION: usize = 8;
+
+/// A rare colour drawn as several small regions (highlights) is a colour of the picture too when
+/// at least [`RARE_ISLANDS`] of its regions have this many pixels; noise kept by Noise removal is
+/// no smaller than this either.
+pub(crate) const RARE_ISLAND: usize = 4;
+
+/// How many regions of [`RARE_ISLAND`] pixels make a rare colour coherent.
+const RARE_ISLANDS: usize = 3;
+
+/// Automatic on flat art: the colours too rare to count among its colours (the count keeps colours
+/// on at least about 1% of the picture), or too close to a large one to get a box of their own,
+/// that are still colours of the picture: a highlight, a stem, a thin outline. A rare colour is
+/// kept when it is distinct, at least [`RARE_APART`] in Oklab (Ottosson 2020) from every colour of
+/// `centers` and from the main colour each stands for; flat, its pixels mostly of one histogram
+/// bin; and drawn, some 4-connected region of its own (not blended) pixels of at least
+/// [`RARE_REGION`] pixels, or [`RARE_ISLANDS`] regions of at least [`RARE_ISLAND`]. At most [`RARE_BUDGET`] are kept, those with the largest regions first.
+///
+/// The palette is otherwise median cut (Heckbert 1982) refined by k-means (Lloyd 1982); keeping
+/// salient colours that are rare by area follows the idea of salient-colour preservation in
+/// palette reduction (Fukuda et al. 2019, doi:10.1117/12.2521607). The rule and its numbers are
+/// VectorCraft's own.
+fn rare_colours(img: &Raster, own: &[bool], hk: &HistKey, centers: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    let px = img.rgba.as_chunks::<4>().0;
+    if centers.is_empty() || own.len() != px.len() {
+        return vec![];
+    }
+    // The picture's own (not blended) pixels by histogram bin.
+    let mut bins = vec![Bin::default(); 1 << 15];
+    for (p, _) in px.iter().zip(own).filter(|(p, f)| **f && p[3] >= 128) {
+        bins[hk.key(p[0], p[1], p[2])].add(p);
+    }
+    let used: Vec<(usize, [f64; 3], f64)> = bins.iter().enumerate().filter(|(_, b)| b.n > 0).map(|(i, b)| (i, b.mean(), b.n as f64)).collect();
+    let used_labs = labs(&used.iter().map(|u| u.1).collect::<Vec<_>>());
+    let center_labs = labs(centers);
+    // Each palette colour's main colour: its heaviest bin.
+    let mut peak: Vec<Option<(f64, [f64; 3])>> = vec![None; centers.len()];
+    for ((_, _, n), lab) in used.iter().zip(&used_labs) {
+        let j = nearest_lab(&center_labs, *lab);
+        if let Some(slot) = peak.get_mut(j)
+            && slot.is_none_or(|(m, _)| *n > m)
+        {
+            *slot = Some((*n, *lab));
+        }
+    }
+    let dist = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt();
+    let apart = |lab: [f64; 3]| center_labs.iter().chain(peak.iter().flatten().map(|(_, l)| l)).all(|c| dist(lab, *c) >= RARE_APART);
+    // The bins far from every colour, heaviest first, grouped: a bin joins the first group whose
+    // heaviest bin is nearer than RARE_APART.
+    let mut far: Vec<usize> = (0..used.len()).filter(|&u| used_labs.get(u).is_some_and(|l| apart(*l))).collect();
+    far.sort_by(|&a, &b| used[b].2.total_cmp(&used[a].2).then(a.cmp(&b)));
+    let mut group_of = vec![u16::MAX; 1 << 15];
+    let mut groups: Vec<Vec<usize>> = vec![];
+    for u in far {
+        let (Some(lab), Some(&(bin, ..))) = (used_labs.get(u), used.get(u)) else { continue };
+        let at = groups.iter().position(|g| g.first().and_then(|&f| used_labs.get(f)).is_some_and(|l| dist(*l, *lab) < RARE_APART));
+        let g = match at {
+            Some(g) => g,
+            None if groups.len() < 64 => {
+                groups.push(vec![]);
+                groups.len() - 1
+            }
+            None => continue,
+        };
+        if let Some(members) = groups.get_mut(g) {
+            members.push(u);
+        }
+        group_of[bin] = g as u16;
+    }
+    if groups.is_empty() {
+        return vec![];
+    }
+    // The largest 4-connected region of each group's own pixels.
+    let (w, h) = (img.width as usize, img.height as usize);
+    let group_at = |i: usize| -> Option<u16> {
+        let p = px.get(i)?;
+        (own.get(i).copied().unwrap_or(false) && p[3] >= 128).then(|| group_of[hk.key(p[0], p[1], p[2])]).filter(|&g| g != u16::MAX)
+    };
+    let mut largest = vec![0usize; groups.len()];
+    let mut islands = vec![0usize; groups.len()];
+    // Pixels of a group whose four neighbours are of it too: an edge's blend is a line one pixel
+    // wide and has next to none.
+    let mut inner = vec![0usize; groups.len()];
+    let mut seen = vec![false; w * h];
+    let mut stack = vec![];
+    for start in 0..w * h {
+        let Some(g) = group_at(start).filter(|_| !seen[start]) else { continue };
+        seen[start] = true;
+        stack.push(start);
+        let mut size = 0;
+        while let Some(i) = stack.pop() {
+            size += 1;
+            let (x, y) = (i % w, i / w);
+            let mut alike = 0;
+            for j in [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
+                if group_at(j) == Some(g) {
+                    alike += 1;
+                    if !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            if alike == 4
+                && let Some(n) = inner.get_mut(g as usize)
+            {
+                *n += 1;
+            }
+        }
+        if let Some(l) = largest.get_mut(g as usize) {
+            *l = (*l).max(size);
+        }
+        if let Some(n) = islands.get_mut(g as usize).filter(|_| size >= RARE_ISLAND) {
+            *n += 1;
+        }
+    }
+    // Coherent and flat groups, largest region first.
+    let mut chosen: Vec<(usize, f64, [f64; 3])> = vec![];
+    for (g, members) in groups.iter().enumerate() {
+        let weight: f64 = members.iter().filter_map(|&u| used.get(u)).map(|u| u.2).sum();
+        let heaviest = members.first().and_then(|&u| used.get(u)).map_or(0.0, |u| u.2);
+        let region = largest.get(g).copied().unwrap_or(0);
+        let coherent = region >= RARE_REGION || islands.get(g).is_some_and(|&n| n >= RARE_ISLANDS);
+        if !coherent || heaviest < 0.5 * weight || weight <= 0.0 {
+            continue;
+        }
+        let mut mean = [0.0; 3];
+        for u in members.iter().filter_map(|&u| used.get(u)) {
+            for (m, c) in mean.iter_mut().zip(u.1) {
+                *m += c * u.2 / weight;
+            }
+        }
+        // Not an edge's blend of two colours that the blend test let through (a thin ring of
+        // anti-aliasing between two bands is coherent too): a colour that lies between two others
+        // is kept only with an inside, pixels whose neighbours are all of it.
+        if is_mix(mean, centers) && inner.get(g).is_none_or(|&n| n < RARE_ISLAND) {
+            continue;
+        }
+        chosen.push((region, weight, mean));
+    }
+    chosen.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)).then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)));
+    let mut out: Vec<[f64; 3]> = vec![];
+    for (_, _, c) in chosen {
+        if out.len() >= RARE_BUDGET {
+            break;
+        }
+        let lab = oklab(c);
+        if out.iter().all(|o| dist(oklab(*o), lab) >= RARE_APART) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether `c` (sRGB) lies between two of `centers`, as anti-aliasing mixes them: within 12 levels
+/// of the line between them, and at least an eighth of the way from each.
+fn is_mix(c: [f64; 3], centers: &[[f64; 3]]) -> bool {
+    centers.iter().enumerate().any(|(i, a)| {
+        centers.iter().skip(i + 1).any(|b| {
+            let d = [0, 1, 2].map(|k| b[k] - a[k]);
+            let len2: f64 = d.iter().map(|v| v * v).sum();
+            if len2 <= 0.0 {
+                return false;
+            }
+            let t = (0..3).map(|k| (c[k] - a[k]) * d[k]).sum::<f64>() / len2;
+            let off2: f64 = (0..3).map(|k| (c[k] - a[k] - t * d[k]).powi(2)).sum();
+            (0.12..=0.88).contains(&t) && off2 < 144.0
+        })
+    })
+}
+
+/// `centers` refined over the bins `used` as k-means does, but the colours from `fixed` on (rare
+/// colours, see [`rare_colours`]) stay where they are: they take their own bins from the colours
+/// they were averaged into, and those move back to their own.
+fn refine_around(used: &[Used], mut centers: Vec<[f64; 3]>, fixed: usize) -> Vec<[f64; 3]> {
+    let bins = labs(&used.iter().map(|u| u.1).collect::<Vec<_>>());
+    for _ in 0..4 {
+        let center_labs = labs(&centers);
+        let mut sum = vec![[0.0; 3]; centers.len()];
+        let mut cnt = vec![0.0; centers.len()];
+        for ((_, c, n), lab) in used.iter().zip(&bins) {
+            let j = nearest_lab(&center_labs, *lab);
+            if let (Some(s), Some(k)) = (sum.get_mut(j), cnt.get_mut(j)) {
+                for ch in 0..3 {
+                    s[ch] += c[ch] * n;
+                }
+                *k += n;
+            }
+        }
+        for (j, center) in centers.iter_mut().enumerate().take(fixed) {
+            if let (Some(s), Some(&k)) = (sum.get(j), cnt.get(j))
+                && k > 0.0
+            {
+                *center = [s[0] / k, s[1] / k, s[2] / k];
+            }
+        }
+    }
+    centers
+}
+
 /// Merge whole 4-connected regions, smallest first, into their most common neighbouring label.
 /// The merge order does not depend on `min_area`: a higher threshold continues the same sequence
 /// instead of splitting a region already merged at a lower threshold. Transparency is a barrier.
 pub fn denoise(labels: &mut [u16], w: usize, h: usize, min_area: usize) {
+    denoise_keeping(labels, w, h, min_area, &[]);
+}
+
+/// [`denoise`], except that a region of a label `keep` marks (a rare colour kept on purpose, see
+/// [`rare_colours`]) that is at least [`RARE_ISLAND`] pixels stays whatever `min_area` is: Noise
+/// clears specks, not a colour's only regions. Smaller regions of it go as any other.
+pub(crate) fn denoise_keeping(labels: &mut [u16], w: usize, h: usize, min_area: usize, keep: &[bool]) {
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BinaryHeap};
 
@@ -736,6 +1088,9 @@ pub fn denoise(labels: &mut [u16], w: usize, h: usize, min_area: usize) {
         }
         if regions[id].pixels.len() != area {
             continue; // absorbed region or an old heap entry for a region that grew
+        }
+        if area >= RARE_ISLAND && keep.get(regions[id].label as usize).copied().unwrap_or(false) {
+            continue;
         }
         let mut borders: BTreeMap<usize, usize> = BTreeMap::new();
         for &i in &regions[id].pixels {

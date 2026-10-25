@@ -7,7 +7,7 @@ use vectorcraft_color::Color;
 use vectorcraft_color::cms::{self, Cms, Model, ProfileKind};
 use vectorcraft_color::swatch::REGISTRATION;
 use vectorcraft_doc::inks::{Link, inks, plates, visit_node_colors};
-use vectorcraft_doc::overprint::multiply_overprints;
+use vectorcraft_doc::overprint::darken_overprints;
 use vectorcraft_doc::{ColorMode, Document, Node};
 
 use super::{DEFAULT_FREQUENCY, PrintInk, PrintSettings};
@@ -42,16 +42,17 @@ pub fn print_inks(doc: &Document, set: &PrintSettings) -> (Vec<PrintInk>, Vec<St
     (list, warnings)
 }
 
-/// The colour settings separations convert with: the active ones, with the printer profile as
-/// their CMYK profile when it is a CMYK one.
-fn separation_cms(set: &PrintSettings) -> Arc<Cms> {
-    let active = cms::active();
+/// The colour settings separations of `doc` convert with: the document's colour spaces
+/// ([`crate::output::document_cms`]), with the printer profile as their CMYK profile when it is a
+/// CMYK one.
+fn separation_cms(doc: &Document, set: &PrintSettings) -> Arc<Cms> {
+    let (own, _) = crate::output::document_cms(doc);
     match cms::profile(set.color.profile.trim()) {
-        Some(p) if p.kind == ProfileKind::Cmyk && cms::canonical_name(&active.settings().cmyk) != p.name => {
-            let settings = cms::ColorSettings { cmyk: p.name, ..active.settings().clone() };
-            Cms::new(&settings).map_or(active, Arc::new)
+        Some(p) if p.kind == ProfileKind::Cmyk && cms::canonical_name(&own.settings().cmyk) != p.name => {
+            let settings = cms::ColorSettings { cmyk: p.name, ..own.settings().clone() };
+            Cms::new(&settings).map_or(own, Arc::new)
         }
-        _ => active,
+        _ => own,
     }
 }
 
@@ -64,7 +65,7 @@ pub(crate) struct Separator<'a> {
 
 impl<'a> Separator<'a> {
     pub fn new(doc: &'a Document, set: &'a PrintSettings) -> Self {
-        Self { doc, cms: separation_cms(set), set }
+        Self { doc, cms: separation_cms(doc, set), set }
     }
 
     /// How much of ink `plate` colour `c` (with swatch link `link`) prints, 0..1.
@@ -93,14 +94,14 @@ impl<'a> Separator<'a> {
     }
 
     /// The document as plate `plate`: art, symbols, pattern tiles and images in the grey of the
-    /// ink's coverage. Overprinting fills and strokes multiply, so where they have none of this
+    /// ink's coverage. Overprinting fills and strokes darken, so where they have none of this
     /// ink the plate below shows through instead of being knocked out.
     pub fn plate(&self, plate: &str) -> Document {
         let mut d = self.doc.clone();
         let discard_white = d.setup.discard_white_overprint;
         let nodes = d.layers.iter_mut().chain(d.symbols.iter_mut().map(|s| &mut s.art)).chain(d.patterns.iter_mut().flat_map(|p| p.art.iter_mut()));
         for n in nodes {
-            multiply_overprints(n, discard_white);
+            darken_overprints(n, discard_white);
             self.node(plate, Arc::make_mut(n));
         }
         for blob in d.images.values_mut() {

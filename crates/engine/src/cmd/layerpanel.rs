@@ -271,8 +271,19 @@ fn merge(s: &mut Session, p: &Value) -> Result<Value> {
     if ids.len() < 2 {
         return Err(bad(C, "highlight two or more rows to merge"));
     }
-    let into =
-        ids.iter().rev().copied().find(|id| d.node(*id).is_some_and(Node::is_layer)).ok_or_else(|| bad(C, "highlight a layer to merge into"))?;
+    // The last highlighted layer that is not inside another highlighted row: with a layer and its
+    // sublayer both highlighted (Select All in the panel), the sublayer travels with its layer
+    // instead of becoming the target (#2383).
+    let roots: HashSet<NodeId> = row_roots(d, &ids).into_iter().collect();
+    let is_layer = |id: &NodeId| d.node(*id).is_some_and(Node::is_layer);
+    let into = ids
+        .iter()
+        .rev()
+        .copied()
+        .filter(is_layer)
+        .find(|id| roots.contains(id))
+        .or_else(|| ids.iter().rev().copied().find(is_layer))
+        .ok_or_else(|| bad(C, "highlight a layer to merge into"))?;
     let around = d.ancestry(into).unwrap_or_default();
     // (Rows inside the target layer merge too: only rows inside other listed rows go with those.)
     let rest: Vec<NodeId> = ids.iter().copied().filter(|id| *id != into).collect();
@@ -377,6 +388,10 @@ fn release(s: &mut Session, p: &Value) -> Result<Value> {
         let ch = d.children_mut(Some(parent))?;
         let at = index.min(ch.len());
         ch.splice(at..at, layers);
+        // Copied type whose layout caches `reid` dropped has them again.
+        if build {
+            super::typecmd::refresh_bounds_of(d, &new);
+        }
         sel.prune(d);
         Ok(new)
     })?;

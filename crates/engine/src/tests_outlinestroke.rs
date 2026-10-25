@@ -162,3 +162,21 @@ fn brushed_strokes_outline_to_their_brush_art() {
     assert!(near(n.opacity as f64, 0.5, 1e-6), "the stroke opacity stays on the art");
     assert!(!doc.layers[0].children().unwrap().iter().any(|c| vectorcraft_brush::has_brush(c)));
 }
+
+#[test]
+fn a_brushed_stroke_keeps_its_effects_on_its_brush_art() {
+    let mut s = session();
+    line(&mut s, json!({"weight": 2}));
+    s.execute("brush.apply", &json!({"name": "Tapered Stroke"})).unwrap();
+    s.execute("effect.apply", &json!({"effect": "stylize.dropShadow", "item": 1})).unwrap();
+    s.execute("effect.apply", &json!({"effect": "path.offsetPath", "params": {"offset": 3}, "item": 1})).unwrap();
+    let n = outline(&mut s);
+    let count = |id: &str| {
+        let mut k = 0;
+        n.walk(&mut |m| k += m.appearance.effects.iter().filter(|e| e.id == id).count());
+        k
+    };
+    assert_eq!(count("stylize.dropShadow"), 1, "the drop shadow is on the brush art: {n:?}");
+    // A geometry effect changes the path the brush follows; it is not applied to the brush art.
+    assert_eq!(count("path.offsetPath"), 0);
+}

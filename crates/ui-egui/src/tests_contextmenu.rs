@@ -185,10 +185,14 @@ fn the_menu_follows_the_selection() {
     let (a, b) = (rect(&mut app, 0.0, 0.0), rect(&mut app, 50.0, 50.0));
     app.run("select.set", json!({"ids": [a.0, b.0]})).unwrap();
     let l = labels(&menus::context_items(&app));
-    for label in ["Group", "Join", "Make Clipping Mask", "Make Compound Path", "Bring to Front", "Move…"] {
+    for label in ["Group", "Join", "Make Clipping Mask", "Make Compound Path", "Objects on Path", "Bring to Front", "Move…"] {
         assert!(l.contains(&label), "{label} in {l:?}");
     }
     assert!(!l.contains(&"Ungroup") && !l.contains(&"Isolate Selected Group"));
+    // Objects on Path chooses its tool, which attaches the selection to the path clicked next.
+    menus::invoke(&mut app, "object.objectsOnPath.attach", json!({}));
+    assert_eq!(app.session.tool_id(), "objectsOnPath");
+    app.select_tool("selection");
     app.run("object.group", json!({})).unwrap();
     let l = labels(&menus::context_items(&app));
     assert!(l.contains(&"Ungroup") && l.contains(&"Isolate Selected Group"));
@@ -207,6 +211,49 @@ fn the_menu_follows_the_selection() {
     let items = menus::context_items(&app);
     assert!(!matches!(items.first(), Some(Item::Sep)) && !matches!(items.last(), Some(Item::Sep)));
     assert!(items.windows(2).all(|w| !matches!(w, [Item::Sep, Item::Sep])));
+}
+
+/// Selected type has Bullets and Numbering › Apply Bullets in the context menu and the Type menu,
+/// which makes its paragraphs a bulleted list; other art has no such item.
+#[test]
+fn selected_type_has_apply_bullets() {
+    let mut app = app();
+    let r = rect(&mut app, 0.0, 0.0);
+    app.run("select.set", json!({"ids": [r.0]})).unwrap();
+    let bullets = |app: &VectorcraftApp| menus::context_entries(app).into_iter().find(|e| e.command.as_deref() == Some("type.applyBullets"));
+    assert!(bullets(&app).is_none(), "a rectangle has no paragraphs");
+    let t = NodeId(app.run("text.create", json!({"x": 10, "y": 200, "text": "Item"})).unwrap()["id"].as_u64().unwrap());
+    app.run("select.set", json!({"ids": [t.0]})).unwrap();
+    let e = bullets(&app).expect("Apply Bullets");
+    assert_eq!((e.path.as_slice(), e.label.as_str(), e.enabled), (&["Bullets and Numbering".to_string()][..], "Apply Bullets", true));
+    let typed = menus::menu_entries(&app).into_iter().find(|e| e.command.as_deref() == Some("type.applyBullets")).expect("in the Type menu");
+    assert_eq!(typed.path, ["Type", "Bullets and Numbering"]);
+    menus::invoke(&mut app, "type.applyBullets", json!({}));
+    let Some(NodeKind::Text(text)) = app.session.active().unwrap().doc.node(t).map(|n| &n.kind) else { panic!("text") };
+    assert!(text.para_at(0).list.is_some());
+}
+
+/// Selected type has Bullets and Numbering › Apply Numbers in the context menu and the Type menu,
+/// after Apply Bullets, which makes its paragraphs a numbered list; other art has no such item.
+#[test]
+fn selected_type_has_apply_numbers() {
+    let mut app = app();
+    let r = rect(&mut app, 0.0, 0.0);
+    app.run("select.set", json!({"ids": [r.0]})).unwrap();
+    let numbers = |app: &VectorcraftApp| menus::context_entries(app).into_iter().position(|e| e.command.as_deref() == Some("type.applyNumbers"));
+    assert!(numbers(&app).is_none(), "a rectangle has no paragraphs");
+    let t = NodeId(app.run("text.create", json!({"x": 10, "y": 200, "text": "Item"})).unwrap()["id"].as_u64().unwrap());
+    app.run("select.set", json!({"ids": [t.0]})).unwrap();
+    let entries = menus::context_entries(&app);
+    let at = numbers(&app).expect("Apply Numbers");
+    let e = &entries[at];
+    assert_eq!((e.path.as_slice(), e.label.as_str(), e.enabled), (&["Bullets and Numbering".to_string()][..], "Apply Numbers", true));
+    assert_eq!(entries.get(at.wrapping_sub(1)).and_then(|e| e.command.as_deref()), Some("type.applyBullets"));
+    let typed = menus::menu_entries(&app).into_iter().find(|e| e.command.as_deref() == Some("type.applyNumbers")).expect("in the Type menu");
+    assert_eq!(typed.path, ["Type", "Bullets and Numbering"]);
+    menus::invoke(&mut app, "type.applyNumbers", json!({}));
+    let Some(NodeKind::Text(text)) = app.session.active().unwrap().doc.node(t).map(|n| &n.kind) else { panic!("text") };
+    assert_eq!(text.para_at(0).list.and_then(|l| l.number), Some(vectorcraft_doc::text::NumberStyle::Arabic));
 }
 
 /// Every label the context menu can show is a menu string, so complete catalogs must translate it.

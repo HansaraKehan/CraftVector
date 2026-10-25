@@ -19,7 +19,7 @@ fn place_embedded(s: &mut Session, path: &str) -> NodeId {
 
 /// A PNG that says it is `w` × `h` 1-bit grey pixels (its header and no rows, which is all that
 /// placing and listing read).
-fn png_header(w: u32, h: u32) -> Vec<u8> {
+pub(crate) fn png_header(w: u32, h: u32) -> Vec<u8> {
     let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
     let ihdr: Vec<u8> = [&b"IHDR"[..], &w.to_be_bytes(), &h.to_be_bytes(), &[1, 0, 0, 0, 0]].concat();
     for chunk in [&ihdr[..], b"IDAT\x78\x9c", b"IEND"] {
@@ -48,6 +48,36 @@ fn an_image_too_large_to_draw_is_reported() {
     // Opened as a document: said too. An image that decodes (16,000 px square) has no note.
     assert_eq!(crate::cmd::fileio::load("wall.png", &png_header(200_000, 200_000)).unwrap().warnings, [NOTE]);
     assert!(crate::cmd::fileio::load("fine.png", &png_header(16_000, 16_000)).unwrap().warnings.is_empty());
+}
+
+/// A gray image is counted as RGBA, 4 bytes a pixel: 23,171 × 23,170 1-bit pixels decode to 537 MB
+/// of gray and are 2,147,488,280 bytes as RGBA, past the 2 GiB allowance; 23,170 × 23,170 are
+/// 2,147,395,600 bytes, within it.
+#[test]
+fn a_gray_image_too_large_as_rgba_is_reported_on_place() {
+    const NOTE: &str = "an image of 23171 × 23170 pixels is too large to draw";
+    let dir = Folder::new("huge-gray-place");
+    let (over, within) = (dir.file("over.png"), dir.file("within.png"));
+    write(&over, &png_header(23_171, 23_170));
+    write(&within, &png_header(23_170, 23_170));
+    let mut s = session();
+    assert_eq!(run(&mut s, "file.place", json!({"path": over, "at": [200, 150], "link": false}))["warnings"], json!([NOTE]));
+    assert_eq!(run(&mut s, "file.place", json!({"path": within, "at": [20, 20], "link": false}))["warnings"], json!([]));
+    let l = run(&mut s, "links.list", json!({}));
+    let notes: Vec<&Value> = l["links"].as_array().unwrap().iter().map(|r| &r["note"]).collect();
+    assert_eq!(notes, [&Value::Null, &json!(NOTE)], "top first: the image within the allowance has nothing to say");
+}
+
+/// File › Open says the same of a gray image past the allowance as RGBA, and nothing of one within it.
+#[test]
+fn a_gray_image_too_large_as_rgba_is_reported_on_open() {
+    let dir = Folder::new("huge-gray-open");
+    let (over, within) = (dir.file("over.png"), dir.file("within.png"));
+    write(&over, &png_header(23_171, 23_170));
+    write(&within, &png_header(23_170, 23_170));
+    let mut s = session();
+    assert_eq!(open(&mut s, &over)["warnings"], json!(["an image of 23171 × 23170 pixels is too large to draw"]));
+    assert_eq!(open(&mut s, &within)["warnings"], json!([]));
 }
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6

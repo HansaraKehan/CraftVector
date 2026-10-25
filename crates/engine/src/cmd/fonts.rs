@@ -47,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Font List",
             [],
             None,
-            "{family?} → {families: [names]} sorted: the bundled fonts, fonts added and the fonts installed on the system (none on the web), each the family's English (canonical) name for `text.setStyle` and documents (without the system's hidden families, whose names start with a dot; they still resolve by name). Preferences › Type › Show Font Names in English only changes the UI menu labels, not this list; with family: {family, styles: [names]} (upright styles by weight, then italics; an error when the family isn't available)",
+            "{family?, style?} → {families: [names]} sorted: the bundled fonts, fonts added and the fonts installed on the system (none on the web), each the family's English (canonical) name for `text.setStyle` and documents (without the system's hidden families, whose names start with a dot; they still resolve by name). Preferences › Type › Show Font Names in English only changes the UI menu labels, not this list; with family: {family, styles: [names] (upright styles by weight, then italics; an error when the family isn't available), axes: [{tag, name, min, default, max, value, hidden}] (a variable font's variation axes, the Character panel's Variable Font sliders, with `value` the setting of `style`, else of the first style; empty for a static font; `hidden`: the font asks for the axis not to be shown)}",
             always,
             font_list
         ),
@@ -101,6 +101,12 @@ pub(super) fn font_label((family, style, version): &UsedFont) -> String {
 
 /// The fonts (family, style, version) of the type in the layers and symbols of `d`.
 pub(super) fn used_fonts(d: &Document) -> BTreeSet<UsedFont> {
+    art_fonts(d, &[])
+}
+
+/// The fonts (family, style, version) of the type in the layers and symbols of `d` and in `art`
+/// (art read from a file, its resources in `d`).
+pub(super) fn art_fonts(d: &Document, art: &[Node]) -> BTreeSet<UsedFont> {
     let mut fonts = BTreeSet::new();
     let mut add = |n: &Node| {
         if let NodeKind::Text(t) = &n.kind {
@@ -110,6 +116,9 @@ pub(super) fn used_fonts(d: &Document) -> BTreeSet<UsedFont> {
     d.walk(&mut add);
     for s in &d.symbols {
         s.art.walk(&mut add);
+    }
+    for n in art {
+        n.walk(&mut add);
     }
     fonts
 }
@@ -134,6 +143,19 @@ pub(super) fn printed_type(d: &Document, layers: &[Arc<Node>], areas: &[Rect]) -
         walk.node(l, Some(areas));
     }
     (walk.fonts, walk.overflow)
+}
+
+/// The warning of an export that draws `layers` of `d` over `areas` (document space; `None`: the
+/// whole of them) about the area type and type on a path that it draws and whose text doesn't fit,
+/// found as [`printed_type`] finds them for Print: visible objects of the document that aren't on
+/// a template layer.
+pub(super) fn export_overflow_warning(d: &Document, layers: &[Arc<Node>], areas: Option<&[Rect]>) -> Option<String> {
+    let mut walk = Printed { d, own: true, fonts: BTreeSet::new(), overflow: BTreeSet::new(), symbols: BTreeSet::new(), patterns: BTreeSet::new() };
+    for l in layers {
+        walk.node(l, areas);
+    }
+    let overflow: Vec<NodeId> = walk.overflow.into_iter().collect();
+    super::typecmd::export_overflow_warning(&overflow)
 }
 
 /// The walk of [`printed_type`].
@@ -288,7 +310,8 @@ fn drawn_runs(t: &vectorcraft_doc::TextObject) -> (Vec<&TextRun>, bool) {
 }
 
 /// What an export that draws type (as outlines, embedded fonts or pixels) says when `d` uses font
-/// families that aren't available: their type is drawn in the fallback font, not the font it names.
+/// families that aren't available (their type is drawn in the fallback font, not the font it
+/// names) or styles that its family doesn't have (the closest style is drawn).
 pub(super) fn substitution_warning(d: &Document) -> Option<String> {
     substitution_warning_of(used_fonts(d))
 }
@@ -296,20 +319,34 @@ pub(super) fn substitution_warning(d: &Document) -> Option<String> {
 /// [`substitution_warning`] for type set in `fonts`.
 pub(super) fn substitution_warning_of(fonts: BTreeSet<UsedFont>) -> Option<String> {
     let db = vectorcraft_text::FontDb::global();
-    let mut missing: Vec<String> = fonts
-        .into_iter()
-        .filter(|(family, style, _)| db.resolve(family, style).is_none_or(|(_, m)| m == vectorcraft_text::FontMatch::Missing))
-        .map(|(family, _, _)| family)
-        .collect();
+    let mut missing: Vec<String> = Vec::new();
+    let mut styles: BTreeSet<String> = BTreeSet::new();
+    for (family, style, _) in fonts {
+        match db.resolve(&family, &style) {
+            None | Some((_, vectorcraft_text::FontMatch::Missing)) => missing.push(family),
+            Some((face, vectorcraft_text::FontMatch::Style)) => {
+                styles.insert(format!("{family} {style} was drawn in {} {}", face.family, face.style));
+            }
+            Some(_) => {}
+        }
+    }
     // Sorted by family: its styles and versions are neighbours.
     missing.dedup();
-    (!missing.is_empty()).then(|| {
-        format!(
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!(
             "fonts that aren't available were written in the fallback font, {}: {} (install them, or replace them with Find Font)",
             vectorcraft_text::FALLBACK_FAMILY,
             missing.join(", ")
-        )
-    })
+        ));
+    }
+    if !styles.is_empty() {
+        parts.push(format!(
+            "font styles that aren't available were written in the closest style: {} (pick a style the family has)",
+            styles.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 fn text(d: &Document, id: NodeId) -> Option<&vectorcraft_doc::TextObject> {
@@ -395,8 +432,9 @@ fn replace(s: &mut Session, p: &Value) -> Result<Value> {
                         .unwrap_or_else(|| r.style.font_style.clone());
                     r.style.font_family = tf.clone();
                     r.style.font_style = style;
-                    // Another font: none of the old one's versions.
+                    // Another font: none of the old one's versions or Variable Font settings.
                     r.style.font_version = None;
+                    r.style.font_axes.clear();
                     changed = true;
                     n += 1;
                 }
@@ -440,7 +478,23 @@ fn font_list(_: &mut Session, p: &Value) -> Result<Value> {
             }
             // The name as the font spells it.
             let name = db.family_list().iter().find(|f| f.eq_ignore_ascii_case(family)).cloned().unwrap_or_else(|| family.to_string());
-            Ok(json!({ "family": name, "styles": db.styles(family) }))
+            let styles = db.styles(family);
+            let style = str_param(p, "style").map(str::to_string).or_else(|| styles.first().cloned()).unwrap_or_else(|| "Regular".into());
+            let axes: Vec<Value> = db
+                .face(family, &style)
+                .map(|face| {
+                    let axes = face.axes();
+                    axes.iter()
+                        .map(|a| {
+                            json!({
+                                "tag": String::from_utf8_lossy(&a.tag), "name": a.name, "min": a.min, "default": a.default, "max": a.max,
+                                "value": face.axis_value(a.tag).unwrap_or(a.default), "hidden": a.hidden,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(json!({ "family": name, "styles": styles, "axes": axes }))
         }
         None => Ok(json!({ "families": *db.menu_family_list() })),
     }
@@ -462,16 +516,14 @@ pub(crate) fn rescan(s: &mut Session, _: &Value) -> Result<Value> {
             }
         });
         if !texts.is_empty() {
-            let saved = !d.is_dirty();
-            let doc = std::sync::Arc::make_mut(&mut d.doc);
-            for id in texts {
-                if let Some(NodeKind::Text(t)) = doc.node_mut(id).map(|n| &mut n.kind) {
-                    refresh_bounds(t);
+            d.change_unsaved(|doc| {
+                let doc = std::sync::Arc::make_mut(doc);
+                for id in texts {
+                    if let Some(NodeKind::Text(t)) = doc.node_mut(id).map(|n| &mut n.kind) {
+                        refresh_bounds(t);
+                    }
                 }
-            }
-            if saved {
-                d.mark_saved();
-            }
+            });
         }
         d.revision += 1;
     }
@@ -555,6 +607,16 @@ mod open_tests {
         s.execute("text.create", &json!({"x": 10, "y": 90, "text": "Ab 雅楽", "font": "Inter"})).unwrap();
         let inter = s.execute("text.fonts", &json!({})).unwrap().as_array().unwrap().iter().find(|f| f["family"] == "Inter").cloned().unwrap();
         assert_eq!(inter["missingGlyphs"], 2, "雅 and 楽 come from a fallback font: {inter}");
+    }
+
+    #[test]
+    fn export_warns_when_a_style_is_drawn_in_another_style() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"width": 200, "height": 200})).unwrap();
+        s.execute("text.create", &json!({"x": 10, "y": 20, "text": "Hi", "font": "Source Sans 3", "style": "Black Wide"})).unwrap();
+        let out = s.execute("document.export", &json!({"format": "pdf"})).unwrap();
+        let warnings = out["warnings"].to_string();
+        assert!(warnings.contains("Source Sans 3 Black Wide was drawn in Source Sans 3"), "{out}");
     }
 
     #[test]

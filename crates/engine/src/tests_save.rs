@@ -373,3 +373,35 @@ fn a_template_places_like_a_native_file() {
     let st = s.doc().unwrap();
     assert!(st.doc.node_count() > empty && !st.selection.is_empty(), "the template's art is placed and selected");
 }
+
+#[test]
+fn transparency_grid_round_trips_without_dirtying() {
+    let d = dir("transparency-grid");
+    let mut s = session();
+    let native = path(&d, "grid.vectorcraft");
+    for on in [true, false] {
+        s.execute("view.transparencyGrid", &json!({"on": on})).unwrap();
+        assert!(!s.doc().unwrap().is_dirty(), "the grid is view state, not an edit");
+        s.execute("document.save", &json!({"path": native})).unwrap();
+        s.execute("document.open", &json!({"path": native})).unwrap();
+        assert_eq!(s.doc().unwrap().transparency_grid, on);
+        assert!(s.doc().unwrap().history.undo.is_empty());
+        assert!(!s.doc().unwrap().is_dirty());
+        if on {
+            let svg = path(&d, "grid.svg");
+            s.execute("file.saveCopy", &json!({"path": svg})).unwrap();
+            s.execute("document.open", &json!({"path": svg})).unwrap();
+            assert!(!s.doc().unwrap().transparency_grid, "SVG does not store view state");
+            s.execute("document.open", &json!({"path": native})).unwrap();
+            assert!(s.doc().unwrap().transparency_grid);
+        }
+    }
+    // A native file written before this setting existed still opens with the grid hidden.
+    let old = path(&d, "old.vectorcraft");
+    let bytes = vectorcraft_format::save(&Document::new(5.0, 5.0), false);
+    assert!(!String::from_utf8_lossy(&bytes).contains("transparency_grid"));
+    std::fs::write(&old, bytes).unwrap();
+    s.execute("document.open", &json!({"path": old})).unwrap();
+    assert!(!s.doc().unwrap().transparency_grid);
+    let _ = std::fs::remove_dir_all(d);
+}

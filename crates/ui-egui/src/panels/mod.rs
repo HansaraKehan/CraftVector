@@ -9,6 +9,7 @@ pub mod appearance;
 pub mod artboards;
 pub mod asset_export;
 pub mod attributes;
+pub mod blend;
 pub mod brushes;
 pub mod character;
 pub mod color;
@@ -36,6 +37,7 @@ pub mod pattern_options;
 pub mod properties;
 pub mod separations;
 pub mod stroke;
+pub mod svg_interactivity;
 pub mod swatches;
 pub mod symbols;
 pub mod tabs;
@@ -146,6 +148,7 @@ pub fn show_icon_panel(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) {
         "graphicStyles" => graphic_styles::show(app, ui),
         "align" => align::show(app, ui),
         "pathfinder" => pathfinder::show(app, ui),
+        blend::ID => blend::show(app, ui),
         "transform" => transform::show(app, ui),
         "history" => history::show(app, ui),
         "actions" => actions::show(app, ui),
@@ -169,11 +172,13 @@ pub fn show_icon_panel(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) {
         "tabs" => tabs::show(app, ui),
         flattener_preview::ID => flattener_preview::show(app, ui),
         "attributes" => attributes::show(app, ui),
+        svg_interactivity::ID => svg_interactivity::show(app, ui),
         variables::ID => variables::show(app, ui),
         "colorThemes" => color_themes::show(app, ui),
         links::ID => links::show(app, ui),
         asset_export::ID => asset_export::show(app, ui),
         css_properties::ID => css_properties::show(app, ui),
+        id if library_panel::parse(id).is_some() => library_panel::show(app, ui, id),
         _ => {
             dim_label(ui, tl!("This panel is on the roadmap (see the parity plan)."));
         }
@@ -216,6 +221,7 @@ pub fn panel_menu_items(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) -> bool
         "libraries" => libraries::menu(app, ui),
         flattener_preview::ID => flattener_preview::menu(app, ui),
         "attributes" => attributes::menu(app, ui),
+        svg_interactivity::ID => svg_interactivity::menu(app, ui),
         "colorThemes" => color_themes::menu(app, ui),
         "layers" => layers::menu(app, ui),
         links::ID => links::menu(app, ui),
@@ -223,6 +229,7 @@ pub fn panel_menu_items(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) -> bool
         css_properties::ID => css_properties::menu(app, ui),
         variables::ID => variables::menu(app, ui),
         "actions" => actions::menu(app, ui),
+        id if library_panel::parse(id).is_some() => library_panel::menu(app, ui, id),
         _ => return false,
     }
     true
@@ -375,6 +382,12 @@ pub(crate) fn proxy(app: &mut VectorcraftApp, ui: &mut Ui, size: f32) {
     if let Some(stroke) = c.pick {
         app.run("ui.colorPicker", json!({ "stroke": stroke })).ok();
     }
+    if let Some(p) = c.dropped_fill {
+        app.run("paint.setFill", p).ok();
+    }
+    if let Some(p) = c.dropped_stroke {
+        app.run("paint.setStroke", p).ok();
+    }
 }
 
 /// The Fill (or `stroke`) chip of the Control bar and the Properties panel, `size` square (with a
@@ -385,13 +398,13 @@ pub(crate) fn paint_chip(app: &mut VectorcraftApp, ui: &mut Ui, stroke: bool, si
     let (fill, stroke_paint) = current_paints(app);
     let mixed = mixed_paints(app, ui.ctx());
     let (paint, mixed) = if stroke { (stroke_paint, mixed.1) } else { (fill, mixed.0) };
-    let resp = crate::widgets::chip_button(ui, size, chevron, |ui, chip| {
-        crate::widgets::proxy_chip(ui, chip, &paint, mixed, stroke.then_some(size * 0.25));
-    });
-    let resp = resp.on_hover_text(if stroke {
-        "Stroke: click for swatches, Shift-click for the color mixer"
+    let tip = if stroke {
+        tl!("Stroke: click for swatches, Shift-click for the color mixer")
     } else {
-        "Fill: click for swatches, Shift-click for the color mixer"
+        tl!("Fill: click for swatches, Shift-click for the color mixer")
+    };
+    let resp = crate::widgets::chip_button_named(ui, size, chevron, tip, |ui, chip| {
+        crate::widgets::proxy_chip(ui, chip, &paint, mixed, stroke.then_some(size * 0.25));
     });
     if resp.clicked() {
         app.run("paint.toggleActive", json!({ "fill": !stroke })).ok();
@@ -498,6 +511,16 @@ pub(crate) fn paint_params(p: &Paint) -> Value {
     }
 }
 
+/// [`paint_params`] for a swatch made from paint the app shows: a color and a gradient's stops
+/// and points keep their color models (`keepModel`), in a CMYK document too.
+pub(crate) fn swatch_paint_params(p: &Paint) -> Value {
+    let mut v = paint_params(p);
+    if matches!(p, Paint::Solid { swatch: None, .. } | Paint::Gradient(_)) {
+        v["keepModel"] = json!(true);
+    }
+    v
+}
+
 /// Egui colour of a document colour.
 pub(crate) fn c32(c: &Color) -> egui::Color32 {
     let [r, g, b, _] = c.to_rgba8(1.0);
@@ -522,6 +545,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dropping_a_proxy_paint_on_the_other_proxy_applies_it() {
+        use egui::{Event, Modifiers, PointerButton};
+        use vectorcraft_color::{Color, Paint};
+
+        use crate::widgets::PanelDrag;
+
+        let mut app = crate::VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 200})).unwrap();
+        app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 40, "height": 40})).unwrap();
+        app.run("paint.setFill", json!({"color": "#ff0000"})).unwrap();
+        app.run("paint.setStroke", json!({"color": "#0000ff"})).unwrap();
+        let ctx = egui::Context::default();
+        let stroke_at = std::cell::Cell::new(egui::Pos2::ZERO);
+        let frame = |app: &mut crate::VectorcraftApp, events: Vec<Event>| {
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                proxy(app, ui, 36.0);
+                if let Some(c) = ctx.read_response(ui.id().with("stroke-proxy")).map(|r| r.rect.center()) {
+                    stroke_at.set(c);
+                }
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        let at = stroke_at.get();
+        let red = PanelDrag::paint(Paint::solid(Color::from_hex("#ff0000").unwrap()));
+        egui::DragAndDrop::set_payload(&ctx, red);
+        let release = Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE };
+        frame(&mut app, vec![Event::PointerMoved(at), release]);
+        let stroke = app.session.shown_stroke().unwrap();
+        assert_eq!(stroke.paint.color().map(|c| c.to_hex()), Some("#ff0000".into()), "{}", app.ui.status);
+        let st = app.session.active().unwrap();
+        let id = st.selection.objects[0];
+        assert_eq!(st.doc.node(id).unwrap().appearance.fill_paint().color().map(|c| c.to_hex()), Some("#ff0000".into()));
+        assert!(egui::DragAndDrop::payload::<PanelDrag>(&ctx).is_none());
+    }
+
+    #[test]
     fn paint_params_roundtrip_shapes() {
         assert_eq!(paint_params(&Paint::None), json!({"none": true}));
         let p = paint_params(&Paint::solid(Color::cmyk(0.1, 0.2, 0.3, 0.4)));
@@ -540,6 +600,8 @@ mod tests {
 mod tests_appearance;
 #[cfg(test)]
 mod tests_asset_export;
+#[cfg(test)]
+mod tests_blend;
 #[cfg(test)]
 mod tests_constrain;
 #[cfg(test)]
@@ -562,5 +624,7 @@ mod tests_strokedepth;
 mod tests_strokeux;
 #[cfg(test)]
 mod tests_style_libraries;
+#[cfg(test)]
+mod tests_symbol_libraries;
 #[cfg(test)]
 mod tests_units;

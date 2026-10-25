@@ -2,7 +2,7 @@
 //! on keyboard focus, a released focus click or double-click so typing replaces it; a drag
 //! keeps the pressed character as its selection anchor.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, Rect, vec2};
 use vectorcraft_doc::Unit;
@@ -174,6 +174,56 @@ fn a_gap_field_passed_through_with_tab_commits_nothing() {
     }
 }
 
+/// #3497: committing a visible dash field must not replace an extended pattern with six values.
+/// Passing through the next field without typing must not commit anything else.
+#[test]
+fn dash_tab_and_enter_commits_preserve_the_unshown_pattern_tail() {
+    use crate::panels::stroke::{dash_fields, edited_dash_pattern};
+    for end in [key(Key::Tab, Modifiers::NONE), enter()] {
+        let original = vec![12.0, 6.0, 2.0, 3.0, 4.0, 5.0, 20.0, 10.0];
+        let pattern = RefCell::new(original.clone());
+        let edits = RefCell::new([None; 6]);
+        let draw = |ui: &mut egui::Ui| {
+            let fields = dash_fields(&pattern.borrow());
+            for (i, value) in fields.iter().enumerate() {
+                edits.borrow_mut()[i] = widgets::opt_field(ui, ("dash", i), *value, Unit::Points, 40.0);
+            }
+            None
+        };
+        let step = |f: &mut Field, events: Vec<Event>| {
+            f.frame(events, &draw);
+            let mut fields = dash_fields(&pattern.borrow());
+            let mut changed = false;
+            for (field, edit) in fields.iter_mut().zip(edits.borrow_mut().iter_mut()) {
+                if let Some(value) = edit.take() {
+                    *field = value;
+                    changed = true;
+                }
+            }
+            if changed {
+                let next = edited_dash_pattern(&fields, &pattern.borrow());
+                *pattern.borrow_mut() = next;
+            }
+            changed
+        };
+        let mut f = Field::new();
+        let tab = || key(Key::Tab, Modifiers::NONE);
+        for events in [vec![], vec![tab()], vec![], vec![tab()], vec![]] {
+            assert!(!step(&mut f, events));
+        }
+        assert_eq!(*pattern.borrow(), original, "tabbing without editing changes nothing");
+        // Shift+Tab back to the first dash, replace it, then commit with Tab or Enter.
+        for events in [vec![key(Key::Tab, Modifiers::SHIFT)], vec![], vec![Event::Text("14".into())]] {
+            assert!(!step(&mut f, events));
+        }
+        assert!(step(&mut f, vec![end]));
+        assert!(!step(&mut f, vec![]));
+        assert_eq!(*pattern.borrow(), vec![14.0, 6.0, 2.0, 3.0, 4.0, 5.0, 20.0, 10.0]);
+        assert!(!step(&mut f, vec![tab()]));
+        assert!(!step(&mut f, vec![]));
+    }
+}
+
 /// Headless frames of one field: its rect and id as last drawn.
 struct Field {
     ctx: egui::Context,
@@ -316,6 +366,93 @@ fn plain_fields_do_math_with_their_suffix() {
     assert_eq!(f.frame(vec![enter()], &draw), Some(90.0));
 }
 
+/// Shift+Enter applies what is typed into a field and keeps the field active, its new value all
+/// selected so typing replaces it; Enter then ends its editing. In a dialog, Shift+Enter ends the
+/// editing as Enter does.
+#[test]
+fn shift_enter_applies_the_value_and_keeps_the_field_active() {
+    let shift_enter = || key(Key::Enter, Modifiers::SHIFT);
+    let has_focus = |f: &Field| f.ctx.memory(|m| m.has_focus(f.id.get()));
+    // A unit field, a plain field with a suffix and a field that may be empty, each applying what
+    // it returns. → (text typed, value applied, text shown afterwards).
+    let px = Cell::new(100.0);
+    let num = |ui: &mut egui::Ui| widgets::num_field(ui, "f", Some(px.get()), Unit::Pixels, 80.0).inspect(|&v| px.set(v));
+    let deg = Cell::new(10.0);
+    let plain = |ui: &mut egui::Ui| widgets::plain_field(ui, "f", deg.get(), "°", 2, 80.0).inspect(|&v| deg.set(v));
+    let dash = Cell::new(Some(20.0));
+    let opt = |ui: &mut egui::Ui| widgets::opt_field(ui, "f", dash.get(), Unit::Points, 60.0).map(|v| dash.set(v)).and(dash.get());
+    type Draw<'a> = &'a dyn Fn(&mut egui::Ui) -> Option<f64>;
+    let fields: [(&str, Draw, &str, f64, &str); 3] =
+        [("num_field", &num, "150", 150.0, "150 px"), ("plain_field", &plain, "45", 45.0, "45°"), ("opt_field", &opt, "2+3", 5.0, "5")];
+    for (name, draw, typed, want, shows) in fields {
+        let mut f = Field::new();
+        f.frame(vec![], draw);
+        f.frame(f.click(1), draw);
+        f.frame(vec![], draw);
+        f.frame(vec![Event::Text(typed.into())], draw);
+        assert_eq!(f.frame(vec![shift_enter()], draw), Some(want), "{name}: Shift+Enter applies the value");
+        assert!(has_focus(&f), "{name}: the field keeps the focus");
+        assert_eq!(f.frame(vec![], draw), None, "{name}: applied once");
+        assert_eq!(f.selection(), Some((0, shows.chars().count())), "{name}: the value shown is selected");
+        assert_eq!(f.ctx.data(|d| d.get_temp::<String>(f.id.get())).as_deref(), Some(shows), "{name}");
+        // Typing replaces it, and Enter applies that and ends the editing.
+        f.frame(vec![Event::Text("2".into())], draw);
+        assert_eq!(f.frame(vec![enter()], draw), Some(2.0), "{name}: Enter after it");
+        assert!(!has_focus(&f), "{name}: Enter ends the editing");
+    }
+    // A text field and a hex field (its color shown in capitals) the same way; a field of several
+    // lines takes Shift+Enter as a line break.
+    let (text, hex, hex_id) = (Cell::new(None), Cell::new(None), Cell::new(egui::Id::NULL));
+    let color = RefCell::new(String::from("FF8000"));
+    let draw = |ui: &mut egui::Ui| {
+        text.set(widgets::text_field(ui, "f", Some("Name"), 120.0, 1).or(text.take()));
+        hex_id.set(ui.id().with("hex"));
+        let shown = color.borrow().clone();
+        let applied = widgets::hex_field(ui, "hex", &shown);
+        if let Some(h) = &applied {
+            color.replace(h.to_uppercase());
+        }
+        hex.set(applied.or(hex.take()));
+        None
+    };
+    let mut f = Field::new();
+    f.frame(vec![], &draw);
+    f.frame(vec![key(Key::Tab, Modifiers::NONE)], &draw);
+    f.frame(vec![key(Key::A, Modifiers::COMMAND)], &draw);
+    f.frame(vec![Event::Text("Logo".into()), shift_enter()], &draw);
+    assert_eq!(text.take().as_deref(), Some("Logo"));
+    assert!(has_focus(&f), "the text field keeps the focus");
+    f.frame(vec![key(Key::Tab, Modifiers::NONE)], &draw);
+    f.frame(vec![key(Key::A, Modifiers::COMMAND)], &draw);
+    f.frame(vec![Event::Text("00ff00".into()), shift_enter()], &draw);
+    assert_eq!((text.take(), hex.take().as_deref()), (None, Some("00ff00")));
+    assert!(f.ctx.memory(|m| m.has_focus(hex_id.get())), "the hex field keeps the focus");
+    f.frame(vec![], &draw);
+    assert_eq!(f.ctx.data(|d| d.get_temp::<String>(hex_id.get())).as_deref(), Some("00FF00"), "the hex field shows the color applied");
+    let selected = egui::TextEdit::load_state(&f.ctx, hex_id.get()).and_then(|st| st.cursor.char_range()).map(|r| r.as_sorted_char_range());
+    assert_eq!(selected.map(|r| (r.start.0, r.end.0)), Some((0, 6)), "the hex field's color is selected");
+    let lines = Cell::new(None);
+    let draw = |ui: &mut egui::Ui| {
+        lines.set(widgets::text_field(ui, "f", Some(""), 120.0, 3).or(lines.take()));
+        None
+    };
+    let mut f = Field::new();
+    f.frame(vec![], &draw);
+    f.frame(f.click(1), &draw);
+    f.frame(vec![Event::Text("a".into()), shift_enter(), Event::Text("b".into())], &draw);
+    assert!(has_focus(&f) && lines.take().is_none(), "a line break, nothing applied");
+    f.frame(vec![key(Key::Escape, Modifiers::NONE)], &draw);
+    // In a dialog, Shift+Enter applies the value and ends the editing.
+    let mut f = Field::new();
+    widgets::set_dialog_open(&f.ctx, true);
+    px.set(100.0);
+    f.frame(vec![], &num);
+    f.frame(f.click(1), &num);
+    f.frame(vec![Event::Text("150".into())], &num);
+    assert_eq!(f.frame(vec![shift_enter()], &num), Some(150.0));
+    assert!(!has_focus(&f), "a dialog's field ends its editing");
+}
+
 /// Preferences › Units › Numbers Without Units Are Points (#394): on (the default), a number typed
 /// with no unit into a field in picas is read in points; a typed unit still wins (`2p6`, `1in`);
 /// off, it is in picas. A field in any other unit reads it in its unit either way.
@@ -360,14 +497,93 @@ fn arrow_keys_step_a_focused_field() {
         (Key::ArrowUp, Modifiers::NONE, 5.0),
         (Key::ArrowUp, Modifiers::SHIFT, 15.0),
         (Key::ArrowDown, Modifiers::COMMAND, 14.9),
-        (Key::ArrowDown, Modifiers::NONE, 13.9),
+        (Key::ArrowDown, Modifiers::NONE, 14.0),
     ] {
         assert!(f.frame(vec![key(k, mods)], &draw).is_some(), "{k:?} {mods:?}");
         assert!((mm.get() - want).abs() < 1e-6, "{k:?} {mods:?}: {}", mm.get());
     }
-    assert_eq!(f.selection(), Some((0, "13.9 mm".len())), "the new value is selected");
+    assert_eq!(f.selection(), Some((0, "14 mm".len())), "the new value is selected");
     // Enter after the steps commits nothing more.
     assert_eq!(f.frame(vec![enter()], &draw), None);
+}
+
+/// #2881, #2793: ↑/↓ and the wheel step a fractional value to the next whole unit in their
+/// direction (5.1 mm: up to 6, down to 5), and Ctrl/Cmd steps to the next tenth; Shift adds or takes
+/// ten and keeps the fraction. In each field's own unit: millimeters, points, percent, degrees.
+#[test]
+fn steps_go_to_the_next_whole_unit_or_tenth() {
+    use egui::MouseWheelUnit::Line;
+    let u = Unit::Millimeters;
+    let mm = Cell::new(0.0);
+    let mm_field = |ui: &mut egui::Ui| widgets::num_field(ui, "f", Some(u.to_pt(mm.get())), u, 80.0).inspect(|&v| mm.set(u.from_pt(v)));
+    let mut f = Field::new();
+    f.frame(vec![], &mm_field);
+    f.frame(f.click(1), &mm_field);
+    f.frame(vec![], &mm_field);
+    let at = f.rect.get().center();
+    // From `from` (set from outside, which the focused field follows), the value `events` give.
+    let mut step = |from: f64, events: Vec<Event>| {
+        mm.set(from);
+        f.frame(vec![], &mm_field);
+        assert!(f.frame(events, &mm_field).is_some(), "from {from}");
+        // The field shows the new value before the next one is set.
+        f.frame(vec![], &mm_field);
+        mm.get()
+    };
+    let arrow = |k, mods| vec![key(k, mods)];
+    let turn = |dy, mods| wheel(at, Line, dy, mods);
+    for (from, events, want) in [
+        (5.1, arrow(Key::ArrowUp, Modifiers::NONE), 6.0),
+        (5.1, arrow(Key::ArrowDown, Modifiers::NONE), 5.0),
+        (5.0, arrow(Key::ArrowUp, Modifiers::NONE), 6.0),
+        (5.0, arrow(Key::ArrowDown, Modifiers::NONE), 4.0),
+        (-2.5, arrow(Key::ArrowUp, Modifiers::NONE), -2.0),
+        (-2.5, arrow(Key::ArrowDown, Modifiers::NONE), -3.0),
+        (5.13, arrow(Key::ArrowUp, Modifiers::COMMAND), 5.2),
+        (5.13, arrow(Key::ArrowDown, Modifiers::COMMAND), 5.1),
+        (5.1, arrow(Key::ArrowUp, Modifiers::SHIFT), 15.1),
+        (5.1, arrow(Key::ArrowDown, Modifiers::SHIFT), -4.9),
+        (5.1, vec![key(Key::ArrowUp, Modifiers::NONE), key(Key::ArrowUp, Modifiers::NONE)], 7.0),
+        // Several presses in one frame step in the order they came.
+        (5.1, vec![key(Key::ArrowUp, Modifiers::NONE), key(Key::ArrowDown, Modifiers::NONE)], 5.0),
+        (5.13, vec![key(Key::ArrowUp, Modifiers::NONE), key(Key::ArrowUp, Modifiers::COMMAND)], 6.1),
+        (24.8, turn(1.0, Modifiers::NONE), 25.0),
+        (24.8, turn(-1.0, Modifiers::NONE), 24.0),
+        (24.8, turn(2.0, Modifiers::NONE), 26.0),
+        (24.8, turn(-2.0, Modifiers::NONE), 23.0),
+        (24.0, turn(1.0, Modifiers::NONE), 25.0),
+        (24.83, turn(1.0, Modifiers::COMMAND), 24.9),
+        (24.8, turn(1.0, Modifiers::SHIFT), 34.8),
+    ] {
+        let got = step(from, events);
+        assert!((got - want).abs() < 1e-6, "{from} mm to {got}, not {want}");
+    }
+    // A points field steps whole points.
+    let pt = Cell::new(12.25);
+    let pt_field = |ui: &mut egui::Ui| widgets::num_field(ui, "f", Some(pt.get()), Unit::Points, 80.0).inspect(|&v| pt.set(v));
+    let mut f = Field::new();
+    f.frame(vec![], &pt_field);
+    f.frame(f.click(1), &pt_field);
+    f.frame(vec![], &pt_field);
+    assert_eq!(f.frame(vec![key(Key::ArrowUp, Modifiers::NONE)], &pt_field), Some(13.0));
+    // Percent and degree fields step whole percents and degrees.
+    for suffix in ["%", "°"] {
+        let mut f = Field::new();
+        let value = Cell::new(37.5);
+        let plain = |ui: &mut egui::Ui| widgets::plain_field(ui, "f", value.get(), suffix, 2, 80.0).inspect(|&v| value.set(v));
+        f.frame(vec![], &plain);
+        f.frame(f.click(1), &plain);
+        f.frame(vec![], &plain);
+        for (k, mods, want) in [
+            (Key::ArrowDown, Modifiers::NONE, 37.0),
+            (Key::ArrowUp, Modifiers::NONE, 38.0),
+            (Key::ArrowUp, Modifiers::COMMAND, 38.1),
+            (Key::ArrowUp, Modifiers::NONE, 39.0),
+        ] {
+            assert_eq!(f.frame(vec![key(k, mods)], &plain), Some(want), "{suffix} {k:?} {mods:?}");
+            f.frame(vec![], &plain);
+        }
+    }
 }
 
 /// Plain fields (degrees, percent, counts) step too, at their precision.
@@ -411,17 +627,17 @@ fn the_wheel_steps_a_focused_field_under_the_pointer() {
     f.frame(f.click(1), &draw);
     f.frame(vec![], &draw);
     for (dy, mods, want) in
-        [(1.0, Modifiers::NONE, 5.0), (2.0, Modifiers::SHIFT, 25.0), (-1.0, Modifiers::COMMAND, 24.9), (-1.0, Modifiers::NONE, 23.9)]
+        [(1.0, Modifiers::NONE, 5.0), (2.0, Modifiers::SHIFT, 25.0), (-1.0, Modifiers::COMMAND, 24.9), (-1.0, Modifiers::NONE, 24.0)]
     {
         assert!(f.frame(wheel(at, Line, dy, mods), &draw).is_some(), "{dy} {mods:?}");
         assert!((mm.get() - want).abs() < 1e-6, "{dy} {mods:?}: {}", mm.get());
     }
-    assert_eq!(f.selection(), Some((0, "23.9 mm".len())), "the new value is selected");
+    assert_eq!(f.selection(), Some((0, "24 mm".len())), "the new value is selected");
     // Points: a step for each line's worth, what is left carried to the next turn.
     let line = f.ctx.options(|o| o.input_options.line_scroll_speed);
     assert_eq!(f.frame(wheel(at, Point, line * 0.6, Modifiers::NONE), &draw), None);
     assert!(f.frame(wheel(at, Point, line * 0.6, Modifiers::NONE), &draw).is_some());
-    assert!((mm.get() - 24.9).abs() < 1e-6, "{}", mm.get());
+    assert!((mm.get() - 25.0).abs() < 1e-6, "{}", mm.get());
     assert_eq!(f.frame(wheel(Pos2::new(390.0, 190.0), Line, 1.0, Modifiers::NONE), &draw), None, "the pointer elsewhere");
     // Plain fields (degrees, percent, counts) too.
     let mut f = Field::new();

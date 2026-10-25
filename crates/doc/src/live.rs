@@ -60,12 +60,75 @@ pub enum BlendOrientation {
     AlignToPath,
 }
 
+/// Distribution of blend steps, as offered by the Blend panel's Type menu.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BlendEaseType {
+    #[default]
+    In,
+    Out,
+    InOut,
+    OutIn,
+}
+
+impl BlendEaseType {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::In => "easeIn",
+            Self::Out => "easeOut",
+            Self::InOut => "easeInOut",
+            Self::OutIn => "easeOutIn",
+        }
+    }
+}
+
+/// Blend panel Type and Ramp. Ramp is a fraction from 0 (even) to 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BlendEase {
+    #[serde(default)]
+    pub kind: BlendEaseType,
+    #[serde(default, deserialize_with = "blend_ramp")]
+    pub ramp: f64,
+}
+
+impl BlendEase {
+    pub fn is_linear(&self) -> bool {
+        self.ramp <= 0.0
+    }
+
+    /// Only the default Type and Ramp can be omitted without losing a chosen Type at Ramp 0.
+    pub fn is_default(&self) -> bool {
+        self.kind == BlendEaseType::In && self.ramp == 0.0
+    }
+
+    /// A monotone polynomial distribution, blended with even spacing by Ramp. Public help
+    /// describes the four distributions, not their numeric curves; these curves are original.
+    pub fn apply(&self, u: f64) -> f64 {
+        let u = if u.is_finite() { u.clamp(0.0, 1.0) } else { 0.0 };
+        let r = if self.ramp.is_finite() { self.ramp.clamp(0.0, 1.0) } else { 0.0 };
+        let eased = match self.kind {
+            BlendEaseType::In => u * u,
+            BlendEaseType::Out => u * (2.0 - u),
+            BlendEaseType::InOut => u * u * (3.0 - 2.0 * u),
+            BlendEaseType::OutIn if u < 0.5 => 2.0 * u * (1.0 - u),
+            BlendEaseType::OutIn => 0.5 + 2.0 * (u - 0.5) * (u - 0.5),
+        };
+        u + r * (eased - u)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BlendSpec {
     #[serde(default)]
     pub spacing: BlendSpacing,
     #[serde(default)]
     pub orientation: BlendOrientation,
+    /// Acceleration of the steps' shapes and positions along the spine between two keys.
+    #[serde(default, skip_serializing_if = "BlendEase::is_default")]
+    pub ease: BlendEase,
+    /// Independent color acceleration. -100..100, with 0 preserving the even color ramp.
+    #[serde(default, rename = "colorShift", skip_serializing_if = "is_zero", deserialize_with = "blend_color_shift")]
+    pub color_shift: f64,
     /// Replaced spine. `None` = the straight lines between the key objects' centres.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spine: Option<PathData>,
@@ -228,12 +291,15 @@ pub struct GradientMesh {
     pub points: Vec<MeshPoint>,
 }
 
-/// One tessellated piece of a mesh (a small quad with a solid colour).
+/// One tessellated piece of a mesh: a small quad, its colour at the centre, and its colour and
+/// opacity at each corner (in `pts` order), which a renderer shades between so neighbouring quads
+/// meet without a step.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshQuad {
     pub pts: [Point; 4],
     pub color: Color,
     pub opacity: f32,
+    pub corners: [(Color, f32); 4],
 }
 
 /// Create Gradient Mesh → Appearance.
@@ -401,11 +467,49 @@ fn cumulative_lengths(pts: &[Point]) -> Vec<f64> {
     cum
 }
 
+/// Most pieces [`map_nonlinear`] splits one segment into.
+const MAX_PIECES: usize = 64;
+
+/// How many pieces of about `piece` a segment of length `len` is split into: one to `most`.
+pub fn pieces(len: f64, piece: f64, most: usize) -> usize {
+    ((len / piece).ceil() as usize).clamp(1, most.max(1))
+}
+
+/// The piece length to split segments of lengths `lens` with ([`pieces`], at most `most` each) so
+/// that the pieces past each segment's first number at most `room`: `piece` when they already do,
+/// longer pieces otherwise. A segment of `n` pieces adds `n - 1 ≤ len / piece` points to a path,
+/// so pieces of the total length over `room` fit; with no room every segment stays one piece.
+pub fn fit_piece(lens: &[f64], piece: f64, most: usize, room: usize) -> f64 {
+    let added = lens.iter().map(|&len| pieces(len, piece, most) - 1).fold(0, usize::saturating_add);
+    if added <= room {
+        return piece;
+    }
+    if room == 0 {
+        return f64::INFINITY;
+    }
+    // A NaN length is always one piece.
+    piece.max(lens.iter().filter(|len| !len.is_nan()).sum::<f64>() / room as f64)
+}
+
 /// Map every point of `path` through the non-linear function `f`. Segments are split into pieces
 /// no longer than about `max_piece` (up to 64 per segment) and their control points mapped, which
 /// approximates the image curve to O(h²). Closedness and subpath structure are preserved.
 pub fn map_nonlinear(path: &PathData, max_piece: f64, f: impl Fn(Point) -> Point) -> PathData {
-    let max_piece = max_piece.max(1e-3);
+    map_nonlinear_within(path, max_piece, usize::MAX, f)
+}
+
+/// [`map_nonlinear`] whose result has at most `max` anchors, or `path`'s count when that is more:
+/// where pieces of `max_piece` would make more, the pieces grow until they don't ([`fit_piece`]),
+/// a coarser approximation of the image curve. Geometry effects map within their anchor budget.
+pub fn map_nonlinear_within(path: &PathData, max_piece: f64, max: usize, f: impl Fn(Point) -> Point) -> PathData {
+    let mut max_piece = max_piece.max(1e-3);
+    // Each segment adds one anchor per piece past its first.
+    let room = max.saturating_sub(path.anchor_count());
+    let segs = path.subpaths.iter().map(SubPath::segment_count).fold(0, usize::saturating_add);
+    if segs.saturating_mul(MAX_PIECES - 1) > room {
+        let lens: Vec<f64> = path.subpaths.iter().flat_map(|sp| (0..sp.segment_count()).map(|i| poly_len(&seg_cubic(sp, i)))).collect();
+        max_piece = fit_piece(&lens, max_piece, MAX_PIECES, room);
+    }
     let mut subs = Vec::with_capacity(path.subpaths.len());
     for sp in &path.subpaths {
         let n = sp.anchors.len();
@@ -421,7 +525,7 @@ pub fn map_nonlinear(path: &PathData, max_piece: f64, f: impl Fn(Point) -> Point
             res.push(Anchor { p: f(a.p), h_in, h_out: f(a.h_out), kind: a.kind });
             if i < segs {
                 let c = seg_cubic(sp, i);
-                let k = ((poly_len(&c) / max_piece).ceil() as usize).clamp(1, 64);
+                let k = pieces(poly_len(&c), max_piece, MAX_PIECES);
                 for j in 0..k {
                     let sub = c.subsegment((j as f64 / k as f64)..((j + 1) as f64 / k as f64));
                     if let Some(last) = res.last_mut() {
@@ -587,12 +691,18 @@ fn even_steps(n: u32) -> Vec<f64> {
     (0..=n).map(|i| i as f64 / n as f64).collect()
 }
 
+/// The number of points of a `(rows+1)×(cols+1)` grid, `None` past `usize`: counts come from
+/// files, and u32::MAX rows and columns (65,535 on 32-bit targets) would wrap to an empty grid.
+fn grid_len(rows: u32, cols: u32) -> Option<usize> {
+    (rows as usize).checked_add(1)?.checked_mul((cols as usize).checked_add(1)?)
+}
+
 impl GradientMesh {
     pub fn idx(&self, r: usize, c: usize) -> usize {
         r * (self.cols as usize + 1) + c
     }
     pub fn is_valid(&self) -> bool {
-        self.rows >= 1 && self.cols >= 1 && self.points.len() == (self.rows as usize + 1) * (self.cols as usize + 1)
+        self.rows >= 1 && self.cols >= 1 && grid_len(self.rows, self.cols) == Some(self.points.len())
     }
 
     /// A 1×1 mesh from its four corners (bottom-left, top-left, top-right, bottom-right in u/v
@@ -730,24 +840,40 @@ impl GradientMesh {
             .to_point()
     }
 
-    /// Bilinear colour and opacity of patch (r, c) at local (u, v).
+    /// Bilinear colour and opacity of patch (r, c) at local (u, v). Corners all in CMYK (or all
+    /// grey) mix in that space, as a PDF shading mixes in its own colour space: the inks come out
+    /// exact, and a CMYK document separates no colour to draw them. Other corners mix in RGB.
     pub fn color_at(&self, r: usize, c: usize, u: f64, v: f64) -> (Color, f32) {
         let q =
             [&self.points[self.idx(r, c)], &self.points[self.idx(r, c + 1)], &self.points[self.idx(r + 1, c)], &self.points[self.idx(r + 1, c + 1)]];
         let w = [(1.0 - u) * (1.0 - v), u * (1.0 - v), (1.0 - u) * v, u * v];
-        let mut rgb = [0.0f32; 3];
-        let mut op = 0.0f32;
-        for k in 0..4 {
-            let c = q[k].color.to_rgb();
-            for (ch, x) in rgb.iter_mut().zip(c) {
-                *ch += x * w[k] as f32;
+        let op = q.iter().zip(w).map(|(p, w)| p.opacity * w as f32).sum();
+        let cmyk: Option<Vec<[f32; 4]>> =
+            q.iter().map(|p| if let Color::Cmyk { c, m, y, k } = p.color { Some([c, m, y, k]) } else { None }).collect();
+        if let Some(inks) = cmyk {
+            let mut mix = [0.0f32; 4];
+            for (ink, w) in inks.iter().zip(w) {
+                for (m, x) in mix.iter_mut().zip(ink) {
+                    *m += x * w as f32;
+                }
             }
-            op += q[k].opacity * w[k] as f32;
+            let [c, m, y, k] = mix;
+            return (Color::Cmyk { c, m, y, k }, op);
+        }
+        let grey: Option<Vec<f32>> = q.iter().map(|p| if let Color::Gray { k } = p.color { Some(k) } else { None }).collect();
+        if let Some(ks) = grey {
+            return (Color::Gray { k: ks.iter().zip(w).map(|(k, w)| k * w as f32).sum() }, op);
+        }
+        let mut rgb = [0.0f32; 3];
+        for (p, w) in q.iter().zip(w) {
+            for (ch, x) in rgb.iter_mut().zip(p.color.to_rgb()) {
+                *ch += x * w as f32;
+            }
         }
         (Color::rgb(rgb[0], rgb[1], rgb[2]), op)
     }
 
-    /// Tessellate into `n`×`n` quads per patch, each coloured at its centre.
+    /// Tessellate into `n`×`n` quads per patch, each coloured at its centre and its corners.
     pub fn quads(&self, n: usize) -> Vec<MeshQuad> {
         if !self.is_valid() {
             return vec![];
@@ -755,18 +881,27 @@ impl GradientMesh {
         let n = n.clamp(1, 64);
         let mut out = Vec::with_capacity(self.rows as usize * self.cols as usize * n * n);
         let mut grid = vec![Point::ZERO; (n + 1) * (n + 1)];
+        let mut colors = vec![(Color::default(), 0.0f32); (n + 1) * (n + 1)];
         for r in 0..self.rows as usize {
             for c in 0..self.cols as usize {
                 for j in 0..=n {
                     for i in 0..=n {
-                        grid[j * (n + 1) + i] = self.eval(r, c, i as f64 / n as f64, j as f64 / n as f64);
+                        let (u, v) = (i as f64 / n as f64, j as f64 / n as f64);
+                        grid[j * (n + 1) + i] = self.eval(r, c, u, v);
+                        colors[j * (n + 1) + i] = self.color_at(r, c, u, v);
                     }
                 }
                 for j in 0..n {
                     for i in 0..n {
                         let (color, opacity) = self.color_at(r, c, (i as f64 + 0.5) / n as f64, (j as f64 + 0.5) / n as f64);
                         let g = |a: usize, b: usize| grid[b * (n + 1) + a];
-                        out.push(MeshQuad { pts: [g(i, j), g(i + 1, j), g(i + 1, j + 1), g(i, j + 1)], color, opacity });
+                        let k = |a: usize, b: usize| colors[b * (n + 1) + a];
+                        out.push(MeshQuad {
+                            pts: [g(i, j), g(i + 1, j), g(i + 1, j + 1), g(i, j + 1)],
+                            color,
+                            opacity,
+                            corners: [k(i, j), k(i + 1, j), k(i + 1, j + 1), k(i, j + 1)],
+                        });
                     }
                 }
             }
@@ -1010,7 +1145,8 @@ impl GradientMesh {
 
     /// Mesh tool Alt-click: delete the mesh lines through point `index` (interior lines only).
     pub fn remove_point_lines(&mut self, index: usize) -> bool {
-        if index >= self.points.len() {
+        // A mesh from a file may not have the points its rows and columns need: it is indexed below.
+        if !self.is_valid() || index >= self.points.len() {
             return false;
         }
         let w = self.cols as usize + 1;
@@ -1142,7 +1278,7 @@ fn surface_of<'a>(kind: &'a EnvelopeKind, src: Rect, frame: Affine) -> Box<dyn F
             {
                 return Box::new(move |u: f64, v: f64| mesh_at(&m, u, v));
             }
-            if *rows == 0 || *cols == 0 || points.len() as u64 != (u64::from(*rows) + 1) * (u64::from(*cols) + 1) {
+            if *rows == 0 || *cols == 0 || grid_len(*rows, *cols) != Some(points.len()) {
                 return Box::new(flat);
             }
             let (rows, cols) = (*rows as usize, *cols as usize);
@@ -1194,8 +1330,7 @@ pub fn smooth_handles(rows: u32, cols: u32, points: &[Point]) -> Vec<[Vec2; 4]> 
 /// the smooth ones, see [`smooth_handles`]) as a gradient mesh with black points: what the
 /// canvas draws and the Mesh tool and Direct Selection edit. `None` for a malformed grid.
 pub fn envelope_grid(rows: u32, cols: u32, points: &[Point], handles: &[[Vec2; 4]]) -> Option<GradientMesh> {
-    // (Counts come from files: no overflow on 32-bit targets.)
-    if rows == 0 || cols == 0 || points.len() as u64 != (u64::from(rows) + 1) * (u64::from(cols) + 1) {
+    if rows == 0 || cols == 0 || grid_len(rows, cols) != Some(points.len()) {
         return None;
     }
     let smooth;
@@ -1341,6 +1476,9 @@ pub struct Hooks<'a> {
     pub appearance: Outliner<'a>,
     /// Distort Pattern Fills: the tiles a pattern fill lays (see [`PatternTiles`]).
     pub pattern: Option<PatternTiles<'a>>,
+    /// The document whose symbols' art counts toward the instance budget of a Repeat of their
+    /// instances ([`crate::RepeatSpec::expand`]).
+    pub symbols: Option<&'a crate::Document>,
 }
 
 impl<'a> From<Outliner<'a>> for Hooks<'a> {
@@ -1476,6 +1614,14 @@ fn affine_between(s: [Point; 3], d: [Point; 3]) -> Option<Affine> {
 /// edges (at most half a point) so neighbours overlap and no seams show.
 fn warp_image(n: &Node, im: &ImageObject, w: &Warper) -> Node {
     let k = w.cells.max(1);
+    // Two triangles a cell, three objects each; an image an inner envelope already cut into
+    // pieces is cut again here, so the pieces count against [`MAX_GENERATED`]. Past it, the image
+    // is left out.
+    if !Generating::charge(k.saturating_mul(k).saturating_mul(6)) {
+        let mut g = n.clone();
+        g.kind = NodeKind::Group { children: vec![], clip: false };
+        return g;
+    }
     let (pw, ph) = (im.width as f64, im.height as f64);
     let at = |i: usize, j: usize| Point::new(pw * i as f64 / k as f64, ph * j as f64 / k as f64);
     let mut pieces = Vec::with_capacity(2 * k * k);
@@ -1653,11 +1799,12 @@ pub fn expand_live_with(n: &Node, outline: Outliner) -> Vec<Node> {
 
 /// [`expand_live_with`] with everything an envelope can ask of the crates above (see [`Hooks`]).
 pub fn expand_live_hooks(n: &Node, hooks: Hooks) -> Vec<Node> {
+    let _generating = Generating::enter();
     match &n.kind {
         NodeKind::Blend { children, spec } => blend_expand(children, spec),
         NodeKind::Envelope { content, kind, fidelity, options, frame, .. } => expand_envelope(content, kind, *fidelity, *options, **frame, hooks),
         NodeKind::Mesh(m) => mesh_quad_nodes(m, 8),
-        NodeKind::Repeat(r) => r.expand(),
+        NodeKind::Repeat(r) => r.expand(hooks.symbols),
         NodeKind::PlacedDocument(p) => p.art(n),
         NodeKind::Intertwine { children } => crate::intertwine::expand(children),
         _ => vec![n.clone()],
@@ -1671,6 +1818,7 @@ pub fn expanded_group(n: &Node, outline: Outliner) -> Node {
 
 /// [`expanded_group`] with [`Hooks`].
 pub fn expanded_group_hooks(n: &Node, hooks: Hooks) -> Node {
+    let _generating = Generating::enter();
     let children = expand_live_hooks(n, hooks).into_iter().map(Arc::new).collect();
     let mut g = Node::new(n.id, NodeKind::Group { children, clip: false });
     g.name = n.name.clone();
@@ -1694,9 +1842,21 @@ pub fn expand_deep(n: &Node, outline: Outliner) -> Node {
     expand_deep_hooks(n, outline.into())
 }
 
-/// [`expand_deep`] with [`Hooks`].
+/// [`expand_deep`] with [`Hooks`]. The objects live art makes here count against one
+/// [`MAX_GENERATED`] ([`Generating`]): blends of blends kept their inner blends live, and each
+/// copy expanded on its own, so step counts capped one by one multiplied. Past it, live art
+/// expands to nothing.
 pub fn expand_deep_hooks(n: &Node, hooks: Hooks) -> Node {
-    let mut out = if is_live(n) { expanded_group_hooks(n, hooks) } else { n.clone() };
+    let _generating = Generating::enter();
+    let mut out = if is_live(n) {
+        let g = expanded_group_hooks(n, hooks);
+        if !Generating::charge(g.count()) {
+            return Node::new(n.id, NodeKind::Group { children: vec![], clip: false });
+        }
+        g
+    } else {
+        n.clone()
+    };
     if let Some(ch) = out.children_mut() {
         for c in ch.iter_mut() {
             if subtree_has_live(c) {
@@ -1705,6 +1865,48 @@ pub fn expand_deep_hooks(n: &Node, hooks: Hooks) -> Node {
         }
     }
     out
+}
+
+/// Most objects one evaluation of live art (an expansion, an envelope's mapping and everything
+/// inside them) may make.
+pub const MAX_GENERATED: usize = 4_000_000;
+
+std::thread_local! {
+    /// What is left of [`MAX_GENERATED`] for the evaluation running on this thread; `None` outside
+    /// one.
+    static GENERATED_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The outermost live evaluation on this thread: it starts [`GENERATED_LEFT`] and ends it.
+struct Generating(bool);
+
+impl Generating {
+    fn enter() -> Self {
+        let outermost = GENERATED_LEFT.get().is_none();
+        if outermost {
+            GENERATED_LEFT.set(Some(MAX_GENERATED));
+        }
+        Self(outermost)
+    }
+
+    /// Spend `n` objects; `false` (and nothing left) when there aren't that many.
+    fn charge(n: usize) -> bool {
+        match GENERATED_LEFT.get() {
+            None => true,
+            Some(left) => {
+                GENERATED_LEFT.set(Some(left.saturating_sub(n)));
+                n <= left
+            }
+        }
+    }
+}
+
+impl Drop for Generating {
+    fn drop(&mut self) {
+        if self.0 {
+            GENERATED_LEFT.set(None);
+        }
+    }
 }
 
 /// Does `n` or any descendant need live evaluation?
@@ -1735,9 +1937,77 @@ pub(crate) fn max_outset(nodes: &[Arc<Node>], symbols: Option<&crate::SymbolBoxe
     o
 }
 
+/// Reading a native file never fails over one bad blend number: out-of-range values clamp,
+/// and anything that is not a finite number (NaN, null, text) becomes the default. The
+/// commands still refuse such input (`ease_param`).
+fn blend_number<'de, D: serde::Deserializer<'de>>(d: D, min: f64, max: f64) -> Result<f64, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_f64().filter(|n| n.is_finite()).map_or(0.0, |n| n.clamp(min, max)))
+}
+
+fn blend_ramp<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    blend_number(d, 0.0, 1.0)
+}
+
+fn blend_color_shift<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    blend_number(d, -100.0, 100.0)
+}
+
+/// Whether an optional stored color shift has its unchanged default.
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+impl BlendSpec {
+    /// Shift the color transition independently of shape placement. The exponential curve is
+    /// original; the documented behavior specifies the direction, not numeric sample values.
+    pub fn color_position(&self, u: f64) -> f64 {
+        let u = if u.is_finite() { u.clamp(0.0, 1.0) } else { 0.0 };
+        let shift = if self.color_shift.is_finite() { self.color_shift.clamp(-100.0, 100.0) } else { 0.0 };
+        if shift == 0.0 { u } else { u.powf(2.0f64.powf(shift / 50.0)) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bad Ramp or Shift in a file clamps (non-finite values take the default) instead of
+    /// failing the whole document.
+    #[test]
+    fn blend_easing_numbers_clamp_when_read() {
+        use serde::de::value::{Error, F64Deserializer};
+        let spec: BlendSpec = serde_json::from_str(r#"{"ease":{"kind":"out","ramp":7.5},"colorShift":-900}"#).unwrap();
+        assert_eq!((spec.ease.ramp, spec.color_shift), (1.0, -100.0));
+        let spec: BlendSpec = serde_json::from_str(r#"{"ease":{"ramp":-3},"colorShift":250}"#).unwrap();
+        assert_eq!((spec.ease.ramp, spec.color_shift), (0.0, 100.0));
+        let spec: BlendSpec = serde_json::from_str(r#"{"ease":{"ramp":null},"colorShift":"NaN"}"#).unwrap();
+        assert_eq!((spec.ease.ramp, spec.color_shift), (0.0, 0.0));
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(blend_ramp(F64Deserializer::<Error>::new(bad)).unwrap(), 0.0);
+            assert_eq!(blend_color_shift(F64Deserializer::<Error>::new(bad)).unwrap(), 0.0);
+        }
+    }
+
+    /// #3578: a non-linear map within an anchor budget splits its segments into longer pieces,
+    /// down to one a segment, and matches the plain map where the budget leaves room.
+    #[test]
+    fn map_nonlinear_within_keeps_to_its_anchor_budget() {
+        let square = vectorcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let f = |p: Point| Point::new(p.x + (p.y / 10.0).sin(), p.y);
+        let full = map_nonlinear(&square, 1.0, f);
+        assert_eq!(full.anchor_count(), 4 * 64);
+        assert_eq!(map_nonlinear_within(&square, 1.0, 4 * 64, f), full);
+        // Every side takes the same pieces: of 400 / (max - 4) pt, so 12 a side for 50 anchors.
+        for (max, want) in [(0, 4), (4, 4), (5, 4), (50, 4 * 12), (255, 4 * 63)] {
+            assert_eq!(map_nonlinear_within(&square, 1.0, max, f).anchor_count(), want, "{max}");
+        }
+        // Lengths that are not numbers stay one piece; with no room every segment is one piece.
+        assert_eq!(fit_piece(&[f64::NAN, 10.0], 1.0, 64, 5), 2.0);
+        assert_eq!(fit_piece(&[f64::INFINITY, 10.0], 1.0, 64, 0), f64::INFINITY);
+        assert_eq!(pieces(f64::INFINITY, f64::INFINITY, 64), 1);
+        assert_eq!(pieces(10.0, 1.0, 0), 1);
+    }
 
     /// #1578: Arc bends in the box's real proportions. In half-width units (y scaled by the
     /// aspect), the top and bottom edges are concentric circles about the bend's centre, at their
@@ -1813,6 +2083,20 @@ mod tests {
         assert!((p.x - 37.0).abs() < 1e-6 && (p.y - 81.0).abs() < 1e-6, "{p:?}");
     }
 
+    /// A file's rows and columns can be anything: a point count too large to compute is no match
+    /// for the points (u32::MAX × u32::MAX wrapped to 0 and passed for a grid without points).
+    #[test]
+    fn a_grid_too_large_to_count_is_malformed() {
+        let m = GradientMesh { rows: u32::MAX, cols: u32::MAX, points: vec![] };
+        assert!(!m.is_valid());
+        assert_eq!((m.lines(), m.outline(), m.quads(8).len()), (PathData::default(), PathData::default(), 0));
+        assert!(envelope_grid(u32::MAX, u32::MAX, &[], &[]).is_none());
+        // A mesh envelope without handles maps through its points: malformed, it leaves art as it is.
+        let kind = EnvelopeKind::Mesh { rows: u32::MAX, cols: u32::MAX, points: vec![], handles: vec![] };
+        let p = Point::new(25.0, 50.0);
+        assert_eq!(envelope_mapper(&kind, Rect::new(0.0, 0.0, 100.0, 100.0))(p), p);
+    }
+
     #[test]
     fn mesh_insert_and_remove_lines() {
         let mut m =
@@ -1822,5 +2106,34 @@ mod tests {
         assert!(m.points[i].p.distance(Point::new(30.0, 60.0)) < 0.5, "{:?}", m.points[i].p);
         assert!(m.remove_point_lines(i));
         assert_eq!((m.rows, m.cols), (1, 1));
+    }
+
+    /// Corners all in CMYK mix in CMYK (the inks halfway), not in RGB.
+    #[test]
+    fn a_cmyk_mesh_mixes_its_inks() {
+        let cyan = Color::Cmyk { c: 1.0, m: 0.0, y: 0.0, k: 0.0 };
+        let mut m = GradientMesh::for_path(&shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0)), 1, 1, cyan, MeshAppearance::Flat, 0.0).unwrap();
+        m.points[0].color = Color::Cmyk { c: 0.0, m: 0.0, y: 0.0, k: 1.0 };
+        let (c, op) = m.color_at(0, 0, 0.0, 0.0);
+        assert_eq!((c, op), (Color::Cmyk { c: 0.0, m: 0.0, y: 0.0, k: 1.0 }, 1.0));
+        let Color::Cmyk { c, k, .. } = m.color_at(0, 0, 0.5, 0.5).0 else { panic!("mixed out of CMYK") };
+        assert!((c - 0.75).abs() < 1e-6 && (k - 0.25).abs() < 1e-6, "{c} {k}");
+        // A corner in another space mixes them all in RGB.
+        m.points[1].color = Color::rgb(1.0, 0.0, 0.0);
+        assert!(matches!(m.color_at(0, 0, 0.5, 0.5).0, Color::Rgb { .. }));
+    }
+
+    /// Alt-clicking a point of a mesh from a file with fewer points than its rows and columns need
+    /// deletes nothing (it indexed past the points, a panic).
+    #[test]
+    fn mesh_lines_of_a_malformed_mesh_stay() {
+        let point = |i: u32| MeshPoint { p: Point::new(f64::from(i), 0.0), color: Color::BLACK, opacity: 1.0, handles: [Vec2::ZERO; 4] };
+        // An interior row's point and an interior column's point, each with 3 of the 6 points.
+        for (rows, cols, index) in [(2, 1, 2), (1, 2, 1)] {
+            let mut m = GradientMesh { rows, cols, points: (0..3).map(point).collect() };
+            let before = m.clone();
+            assert!(!m.remove_point_lines(index), "{rows}×{cols}, point {index}");
+            assert_eq!(m, before);
+        }
     }
 }

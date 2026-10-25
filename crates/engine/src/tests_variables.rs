@@ -131,6 +131,44 @@ fn mismatched_and_missing_bindings_are_skipped_and_counted() {
     assert_eq!(plain(&s, t), "y");
 }
 
+/// A row with no value for any bound variable, such as one from Import Data Sets… before anything
+/// is bound, applies nothing, and the reply's `warning` names it. A bound variable with a value in
+/// the row gives no warning, even when its object is locked and skipped.
+#[test]
+fn a_row_with_no_value_for_a_bound_variable_warns_that_nothing_was_applied() {
+    let mut s = session();
+    let t = text(&mut s, "x");
+    s.execute("dataset.import", &json!({"csv": "name,Name,Title\nA,Ann,Boss\nB,Bob,Chief\n"})).unwrap();
+    let warning = |row: &str| format!("nothing in data set {row} was applied: no object is bound to a variable it has a value for");
+    let v = s.execute("dataset.select", &json!({"name": "A"})).unwrap();
+    assert_eq!((v["applied"].as_u64(), v["skipped"].as_u64(), &v["warning"]), (Some(0), Some(0), &json!(warning("A"))), "{v}");
+    let v = s.execute("dataset.next", &json!({})).unwrap();
+    assert_eq!(v["warning"], json!(warning("B")), "{v}");
+    let v = s.execute("dataset.prev", &json!({})).unwrap();
+    assert_eq!(v["warning"], json!(warning("A")), "{v}");
+    assert_eq!(plain(&s, t), "x");
+
+    // A bound variable that the row has no value for still applies nothing.
+    s.execute("variable.define", &json!({"name": "Other", "kind": "text"})).unwrap();
+    s.execute("variable.bind", &json!({"variable": "Other", "ids": [t.0]})).unwrap();
+    let v = s.execute("dataset.select", &json!({"name": "B"})).unwrap();
+    assert_eq!((v["applied"].as_u64(), v["skipped"].as_u64(), &v["warning"]), (Some(0), Some(1), &json!(warning("B"))), "{v}");
+
+    // Bound to a variable with a value, the row applies it and gives no warning.
+    s.execute("variable.bind", &json!({"variable": "Title", "ids": [t.0]})).unwrap();
+    let v = s.execute("dataset.select", &json!({"name": "A"})).unwrap();
+    assert_eq!(v["applied"].as_u64(), Some(1), "{v}");
+    assert!(v.get("warning").is_none(), "{v}");
+    assert_eq!(plain(&s, t), "Boss");
+
+    // Locked art is skipped, and its binding still counts as bound.
+    s.execute("select.set", &json!({"ids": [t.0]})).unwrap();
+    s.execute("object.lock", &json!({})).unwrap();
+    let v = s.execute("dataset.select", &json!({"name": "B"})).unwrap();
+    assert_eq!(v["applied"].as_u64(), Some(0), "{v}");
+    assert!(v.get("warning").is_none(), "{v}");
+}
+
 #[test]
 fn deleting_a_variable_cleans_bindings_values_and_leaves_datasets_alone() {
     let mut s = session();
@@ -368,6 +406,79 @@ fn make_dynamic_errors_name_the_command() {
     s.execute("object.group", &json!({})).unwrap();
     let e = s.execute("variable.makeTextDynamic", &json!({})).unwrap_err().to_string();
     assert!(e.contains("`variable.makeTextDynamic`") && e.contains("is not type"), "{e}");
+}
+
+/// Lock Variables refuses defining, deleting and renaming variables, Make … Dynamic included,
+/// while binding, unbinding and the dataset commands still run.
+#[test]
+fn locked_variables_refuse_new_deleted_and_renamed_variables() {
+    let mut s = session();
+    let t = text(&mut s, "Alice");
+    let r = rect(&mut s);
+    s.execute("variable.define", &json!({"name": "Name", "kind": "text"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Show", "kind": "visibility"})).unwrap();
+    assert_eq!(s.execute("variable.list", &json!({})).unwrap()["locked"], false);
+    assert_eq!(s.execute("variable.lock", &json!({})).unwrap()["locked"], true, "without `locked` it toggles");
+    assert_eq!(s.execute("variable.list", &json!({})).unwrap()["locked"], true);
+
+    s.execute("select.set", &json!({"ids": [t.0]})).unwrap();
+    for (cmd, p) in [
+        ("variable.define", json!({"name": "Other", "kind": "text"})),
+        ("variable.delete", json!({"names": ["Name"]})),
+        ("variable.rename", json!({"name": "Name", "newName": "Renamed"})),
+        ("variable.makeTextDynamic", json!({})),
+        ("variable.makeVisibilityDynamic", json!({})),
+    ] {
+        let e = s.execute(cmd, &p).unwrap_err();
+        assert!(matches!(&e, EngineError::Disabled(_, why) if why == "variables are locked"), "{cmd}: {e}");
+    }
+    let names = |s: &mut Session| {
+        s.execute("variable.list", &json!({})).unwrap()["variables"].as_array().unwrap().iter().map(|v| v["name"].clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(names(&mut s), [json!("Name"), json!("Show")], "the variables are as they were");
+
+    // Binding and unbinding still work, and so do the datasets.
+    s.execute("variable.bind", &json!({"variable": "Name", "ids": [t.0]})).unwrap();
+    s.execute("variable.bind", &json!({"variable": "Show", "ids": [r.0]})).unwrap();
+    s.execute("variable.unbind", &json!({"ids": [r.0], "variable": "Show"})).unwrap();
+    s.execute("dataset.capture", &json!({})).unwrap();
+    s.execute("dataset.new", &json!({"name": "Bob", "values": {"Name": "Bob"}})).unwrap();
+    s.execute("dataset.import", &json!({"csv": "name,Name\nCarol,Carol\n"})).unwrap();
+    s.execute("dataset.select", &json!({"name": "Carol"})).unwrap();
+    assert_eq!(plain(&s, t), "Carol");
+
+    // Unlocking lets a variable be defined again; `locked` sets the state rather than toggling.
+    assert_eq!(s.execute("variable.lock", &json!({"locked": false})).unwrap()["locked"], false);
+    assert_eq!(s.execute("variable.lock", &json!({"locked": false})).unwrap()["locked"], false);
+    s.execute("variable.define", &json!({"name": "Other", "kind": "text"})).unwrap();
+}
+
+/// Locking is an undo step only when it changes the state, and the lock is saved with the
+/// document: a file saved locked opens locked, and a file without the key opens unlocked.
+#[test]
+fn the_variables_lock_is_an_undo_step_and_is_saved() {
+    let mut s = session();
+    let steps = |s: &Session| s.doc().unwrap().history.undo.len();
+    let before = steps(&s);
+    s.execute("variable.lock", &json!({"locked": true})).unwrap();
+    assert_eq!(steps(&s), before + 1);
+    s.execute("variable.lock", &json!({"locked": true})).unwrap();
+    assert_eq!(steps(&s), before + 1, "locking locked variables is not a step");
+    assert!(s.doc().unwrap().is_dirty());
+
+    let saved = vectorcraft_format::save(&s.doc().unwrap().doc, false);
+    assert!(vectorcraft_format::load(&saved).unwrap().variables.locked, "a document saved locked opens locked");
+    let mut v: Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(v["document"]["variables"]["locked"], true);
+    v["document"]["variables"].as_object_mut().unwrap().remove("locked");
+    assert!(!vectorcraft_format::load(&serde_json::to_vec(&v).unwrap()).unwrap().variables.locked, "a file without the key opens unlocked");
+
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(!s.doc().unwrap().doc.variables.locked, "undo unlocks");
+    let v: Value = serde_json::from_slice(&vectorcraft_format::save(&s.doc().unwrap().doc, false)).unwrap();
+    assert!(v["document"].get("variables").is_none_or(|v| v.get("locked").is_none()), "unlocked variables write no key: {v}");
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert!(s.doc().unwrap().doc.variables.locked, "redo locks again");
 }
 
 /// Capture Data Set records what the art holds now, which is how rows are made — the art is
@@ -688,6 +799,70 @@ fn a_hidden_object_comes_back_and_is_captured_hidden() {
     s.execute("variable.bind", &json!({"variable": "More", "ids": [r.0]})).unwrap();
 }
 
+/// A row selected while a layer is hidden rewrites the type on it and applies its other values,
+/// and leaves the layer hidden: showing the layer shows that row's text. A layer that is locked
+/// as well as hidden is still left alone.
+#[test]
+fn a_row_rewrites_type_on_a_hidden_layer_but_not_on_a_locked_one() {
+    let mut s = session();
+    let layer = NodeId(s.execute("layer.new", &json!({})).unwrap()["id"].as_u64().unwrap());
+    let t = text(&mut s, "Alice");
+    let r = rect(&mut s);
+    s.execute("variable.define", &json!({"name": "Name", "kind": "text"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Show", "kind": "visibility"})).unwrap();
+    s.execute("variable.bind", &json!({"variable": "Name", "ids": [t.0]})).unwrap();
+    s.execute("variable.bind", &json!({"variable": "Show", "ids": [r.0]})).unwrap();
+    s.execute("dataset.new", &json!({"name": "A", "values": {"Name": "Alice", "Show": true}})).unwrap();
+    s.execute("dataset.new", &json!({"name": "B", "values": {"Name": "Bob", "Show": false}})).unwrap();
+    s.execute("dataset.select", &json!({"name": "A"})).unwrap();
+
+    s.execute("layer.setProps", &json!({"id": layer.0, "visible": false})).unwrap();
+    let v = s.execute("dataset.select", &json!({"name": "B"})).unwrap();
+    assert_eq!((v["applied"].as_u64(), v["skipped"].as_u64()), (Some(2), Some(0)), "{v}");
+    let doc = &s.doc().unwrap().doc;
+    assert_eq!(plain(&s, t), "Bob", "the type on the hidden layer holds the row's text");
+    assert!(!doc.node(r).unwrap().visible, "the row's visibility value applies on the hidden layer");
+    assert!(!doc.node(layer).unwrap().visible, "the row leaves the layer hidden");
+    let sets = s.execute("dataset.list", &json!({})).unwrap();
+    let matching: Vec<&Value> = sets["datasets"].as_array().unwrap().iter().filter(|d| d["matches"] == json!(true)).map(|d| &d["name"]).collect();
+    assert_eq!(matching, [&json!("B")], "only the row the hidden art holds matches: {sets}");
+    s.execute("layer.setProps", &json!({"id": layer.0, "visible": true})).unwrap();
+    assert_eq!(plain(&s, t), "Bob", "showing the layer shows the row's text");
+
+    // Locked and hidden: the row skips both objects and the type keeps its text.
+    s.execute("layer.setProps", &json!({"id": layer.0, "visible": false, "locked": true})).unwrap();
+    let v = s.execute("dataset.select", &json!({"name": "A"})).unwrap();
+    assert_eq!((v["applied"].as_u64(), v["skipped"].as_u64()), (Some(0), Some(2)), "{v}");
+    assert_eq!(plain(&s, t), "Bob", "the type on the locked layer keeps its text");
+    assert!(!s.doc().unwrap().doc.node(r).unwrap().visible);
+}
+
+/// Type inside a hidden group is rewritten too, and List and Capture Data Set read it.
+#[test]
+fn a_row_rewrites_type_in_a_hidden_group_and_capture_reads_it() {
+    let mut s = session();
+    let t = text(&mut s, "Alice");
+    let other = rect(&mut s);
+    let g = group(&mut s, &[t, other]);
+    s.execute("variable.define", &json!({"name": "Name", "kind": "text"})).unwrap();
+    s.execute("variable.bind", &json!({"variable": "Name", "ids": [t.0]})).unwrap();
+    s.execute("dataset.new", &json!({"name": "A", "values": {"Name": "Alice"}})).unwrap();
+    s.execute("dataset.new", &json!({"name": "B", "values": {"Name": "Bob"}})).unwrap();
+    s.execute("object.setProps", &json!({"ids": [g.0], "visible": false})).unwrap();
+
+    let v = s.execute("dataset.select", &json!({"name": "B"})).unwrap();
+    assert_eq!((v["applied"].as_u64(), v["skipped"].as_u64()), (Some(1), Some(0)), "{v}");
+    assert_eq!(plain(&s, t), "Bob");
+    assert!(!s.doc().unwrap().doc.node(g).unwrap().visible, "the group stays hidden");
+
+    let sets = s.execute("dataset.list", &json!({})).unwrap();
+    let matches: Vec<&Value> = sets["datasets"].as_array().unwrap().iter().map(|d| &d["matches"]).collect();
+    assert_eq!(matches, [&json!(false), &json!(true)], "the art holds B's text, not A's: {sets}");
+    let v = s.execute("dataset.capture", &json!({"name": "C"})).unwrap();
+    let sets = s.execute("dataset.list", &json!({})).unwrap();
+    assert_eq!(sets["datasets"][2]["values"], json!({"Name": {"text": "Bob"}}), "{v}: {sets}");
+}
+
 /// A row that hides selected objects deselects them, the key object included. Undo shows them
 /// and selects them again with the key object.
 #[test]
@@ -948,6 +1123,178 @@ fn datasets_csv_keeps_spaces_in_quoted_cells() {
     assert_eq!(value("C"), text_value(" quoted "));
 }
 
+/// A header row with a tab and no comma outside quotes makes tabs the separator; a quoted cell
+/// may then hold tabs and commas. A header row with a comma outside quotes keeps commas, even
+/// when a cell holds a tab. A tab-separated header with an unclosed quote fails with the reason.
+#[test]
+fn datasets_csv_reads_tab_separated_files() {
+    let mut s = session();
+    s.execute("variable.define", &json!({"name": "Title", "kind": "text"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Show", "kind": "visibility"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Last, First", "kind": "text"})).unwrap();
+    let tsv = "name\tTitle\tShow\r\nA\tTwo words\ttrue\r\nB\t\"a, b\tc\"\tfalse\r\n";
+    let imp = s.execute("dataset.import", &json!({"csv": tsv})).unwrap();
+    assert_eq!(imp["names"], json!(["A", "B"]));
+    s.execute("dataset.import", &json!({"csv": "name,Title\nC,one\ttwo"})).unwrap();
+    s.execute("dataset.import", &json!({"csv": "name\t\"Last, First\"\nD\tSmith, Jo"})).unwrap();
+    let value = |name: &str, var: &str| s.doc().unwrap().doc.variables.dataset(name).and_then(|d| d.values.get(var)).cloned();
+    let text_value = |v: &str| Some(vectorcraft_doc::DataValue::Text(v.into()));
+    assert_eq!(value("A", "Title"), text_value("Two words"));
+    assert_eq!(value("A", "Show"), Some(vectorcraft_doc::DataValue::Visible(true)));
+    assert_eq!(value("B", "Title"), text_value("a, b\tc"));
+    assert_eq!(value("B", "Show"), Some(vectorcraft_doc::DataValue::Visible(false)));
+    assert_eq!(value("C", "Title"), text_value("one\ttwo"));
+    assert_eq!(value("D", "Last, First"), text_value("Smith, Jo"));
+    let unclosed = s.execute("dataset.import", &json!({"csv": "name\tTitle\t\"Show\nA\tx\ttrue"})).unwrap_err().to_string();
+    assert!(unclosed.contains("unclosed quote"), "{unclosed}");
+}
+
+/// Without a `name` column every header cell is a variable, and the rows take the first free
+/// names Data Set 1, 2 and so on. A first header cell `name`, in any case, still holds the names.
+#[test]
+fn datasets_csv_without_a_name_column_numbers_the_rows() {
+    let mut s = session();
+    s.execute("variable.define", &json!({"name": "Title", "kind": "text"})).unwrap();
+    s.execute("dataset.new", &json!({"name": "Data Set 2", "values": {"Title": "kept"}})).unwrap();
+    let imp = s.execute("dataset.import", &json!({"csv": "Title\nx\ny\n"})).unwrap();
+    assert_eq!((imp["imported"].as_u64(), imp["updated"].as_u64()), (Some(2), Some(0)));
+    assert_eq!(imp["names"], json!(["Data Set 1", "Data Set 3"]));
+    let value = |s: &Session, name: &str| s.doc().unwrap().doc.variables.dataset(name).and_then(|d| d.values.get("Title")).cloned();
+    let text_value = |v: &str| Some(vectorcraft_doc::DataValue::Text(v.into()));
+    assert_eq!(value(&s, "Data Set 1"), text_value("x"));
+    assert_eq!(value(&s, "Data Set 2"), text_value("kept"));
+    assert_eq!(value(&s, "Data Set 3"), text_value("y"));
+    let named = s.execute("dataset.import", &json!({"csv": "NAME,Title\nData Set 1,z"})).unwrap();
+    assert_eq!((named["imported"].as_u64(), named["updated"].as_u64()), (Some(0), Some(1)));
+    assert_eq!(value(&s, "Data Set 1"), text_value("z"));
+}
+
+/// An error about a row's values or name gives the file line the row starts on, counting blank
+/// lines and line breaks inside quoted cells.
+#[test]
+fn datasets_csv_row_errors_name_the_file_line() {
+    let mut s = session();
+    s.execute("variable.define", &json!({"name": "Title", "kind": "text"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Show", "kind": "visibility"})).unwrap();
+    let error = |s: &mut Session, csv: &str| s.execute("dataset.import", &json!({"csv": csv})).unwrap_err().to_string();
+    let blank_line = error(&mut s, "name,Show\n\nX,maybe");
+    assert!(blank_line.contains("line 3:"), "{blank_line}");
+    let line_break = error(&mut s, "name,Title,Show\nA,\"one\ntwo\",true\nB,x,maybe");
+    assert!(line_break.contains("line 4:"), "{line_break}");
+    let twice = error(&mut s, "name,Title\nA,x\n\nA,y");
+    assert!(twice.contains("line 4:"), "{twice}");
+    let long = error(&mut s, &format!("name,Title\n\n{},x", "n".repeat(256)));
+    assert!(long.contains("line 3:") && long.contains("longer than 255"), "{long}");
+}
+
+/// A header cell that names no variable defines one, unbound, in the import's undo step: `#`
+/// defines a visibility variable, `@` defines an image variable, and a cell without a prefix
+/// defines a text variable. Importing the file again finds them; a prefix of the other kind, a
+/// bare prefix and a long name fail and define nothing.
+#[test]
+fn datasets_csv_header_prefixes_define_variables() {
+    let mut s = session();
+    let csv = "name,#Shown,@Photo,Title\nA,true,a.png,x";
+    let imp = s.execute("dataset.import", &json!({"csv": csv})).unwrap();
+    assert_eq!(imp["defined"], json!(["Shown", "Photo", "Title"]));
+    assert_eq!((imp["imported"].as_u64(), imp["names"].clone()), (Some(1), json!(["A"])));
+    let listed = s.execute("variable.list", &json!({})).unwrap();
+    assert_eq!(
+        listed["variables"],
+        json!([
+            {"name": "Shown", "kind": "visibility", "bindings": 0},
+            {"name": "Photo", "kind": "image", "bindings": 0},
+            {"name": "Title", "kind": "text", "bindings": 0},
+        ])
+    );
+    let value = |s: &Session, var: &str| s.doc().unwrap().doc.variables.dataset("A").and_then(|d| d.values.get(var)).cloned();
+    assert_eq!(value(&s, "Shown"), Some(vectorcraft_doc::DataValue::Visible(true)));
+    assert_eq!(value(&s, "Photo"), Some(vectorcraft_doc::DataValue::Image("a.png".into())));
+    assert_eq!(value(&s, "Title"), Some(vectorcraft_doc::DataValue::Text("x".into())));
+
+    let again = s.execute("dataset.import", &json!({"csv": "name\t#Shown\t@Photo\tTitle\nA\tfalse\tb.png\ty"})).unwrap();
+    assert_eq!((again["updated"].as_u64(), again["defined"].clone()), (Some(1), json!([])));
+    assert_eq!(value(&s, "Shown"), Some(vectorcraft_doc::DataValue::Visible(false)));
+
+    let error = |s: &mut Session, csv: &str| s.execute("dataset.import", &json!({"csv": csv})).unwrap_err().to_string();
+    let other_kind = error(&mut s, "name,New,#Title\nB,n,true");
+    assert!(other_kind.contains("column 3:") && other_kind.contains("text variable"), "{other_kind}");
+    let twice = error(&mut s, "Fresh,@Fresh\nn,f.png");
+    assert!(twice.contains("column 2:") && twice.contains("text variable"), "{twice}");
+    let bare = error(&mut s, "name,#\nB,true");
+    assert!(bare.contains("column 2:") && bare.contains("names no variable"), "{bare}");
+    let long = error(&mut s, &format!("name,@{}\nB,b.png", "n".repeat(256)));
+    assert!(long.contains("column 2:") && long.contains("longer than 255"), "{long}");
+    assert_eq!(s.doc().unwrap().doc.variables.variables.len(), 3, "a failed import defines nothing");
+
+    // Each import is one undo step, which takes back the variables it defined with its rows.
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(value(&s, "Shown"), Some(vectorcraft_doc::DataValue::Visible(true)));
+    assert_eq!(s.doc().unwrap().doc.variables.variables.len(), 3);
+    s.execute("edit.undo", &json!({})).unwrap();
+    let vars = &s.doc().unwrap().doc.variables;
+    assert!(vars.variables.is_empty() && vars.datasets.is_empty());
+}
+
+/// A header cell that is a variable's exact name names it, even when the name starts with `#`,
+/// `@` or `%`, so a file `dataset.export` wrote imports back without defining anything.
+#[test]
+fn datasets_csv_exact_names_win_over_prefixes() {
+    let mut s = session();
+    for (name, kind) in [("#Shown", "text"), ("@Photo", "visibility"), ("%Chart", "graph"), ("Shown", "visibility")] {
+        s.execute("variable.define", &json!({"name": name, "kind": kind})).unwrap();
+    }
+    let values = json!({"#Shown": "hello", "@Photo": true, "%Chart": ",Q\nX,3", "Shown": false});
+    s.execute("dataset.new", &json!({"name": "A", "values": values})).unwrap();
+    let csv = s.execute("dataset.export", &json!({})).unwrap()["csv"].as_str().unwrap().to_string();
+    assert!(csv.starts_with("name,#Shown,@Photo,%Chart,Shown\n"), "{csv}");
+    s.execute("dataset.delete", &json!({"names": ["A"]})).unwrap();
+    let imp = s.execute("dataset.import", &json!({"csv": csv})).unwrap();
+    assert_eq!((imp["imported"].as_u64(), imp["defined"].clone()), (Some(1), json!([])));
+    let value = |var: &str| s.doc().unwrap().doc.variables.dataset("A").and_then(|d| d.values.get(var)).cloned();
+    assert_eq!(value("#Shown"), Some(vectorcraft_doc::DataValue::Text("hello".into())));
+    assert_eq!(value("@Photo"), Some(vectorcraft_doc::DataValue::Visible(true)));
+    assert_eq!(value("%Chart"), Some(vectorcraft_doc::DataValue::Graph(",Q\nX,3".into())));
+    assert_eq!(value("Shown"), Some(vectorcraft_doc::DataValue::Visible(false)));
+    assert_eq!(s.doc().unwrap().doc.variables.variables.len(), 4);
+}
+
+/// A `%` header cell that isn't a variable's name (graph data files) is refused with its column,
+/// and the import defines nothing.
+#[test]
+fn datasets_csv_refuses_graph_data_file_columns() {
+    let mut s = session();
+    let error = |s: &mut Session, csv: &str| s.execute("dataset.import", &json!({"csv": csv})).unwrap_err().to_string();
+    let named = error(&mut s, "name,Title,%Sales\nA,x,sales.txt");
+    assert!(named.contains("column 3:") && named.contains("`%Sales`"), "{named}");
+    let unnamed = error(&mut s, "%Sales\tTitle\nsales.txt\tx");
+    assert!(unnamed.contains("column 1:") && unnamed.contains("`%Sales`"), "{unnamed}");
+    let vars = &s.doc().unwrap().doc.variables;
+    assert!(vars.variables.is_empty() && vars.datasets.is_empty());
+}
+
+/// While the variables are locked, an import is refused when a header cell would define a
+/// variable, as New Variable is, and a file whose headers all name variables imports.
+#[test]
+fn locked_variables_refuse_header_cells_that_define_variables() {
+    let mut s = session();
+    s.execute("variable.define", &json!({"name": "Shown", "kind": "visibility"})).unwrap();
+    s.execute("variable.define", &json!({"name": "Title", "kind": "text"})).unwrap();
+    s.execute("variable.lock", &json!({"locked": true})).unwrap();
+    for csv in ["name,#Shown,Title,New\nA,true,x,n", "@Photo\nb.png", "name,#Fresh\nA,true"] {
+        let e = s.execute("dataset.import", &json!({"csv": csv})).unwrap_err();
+        assert!(matches!(&e, EngineError::Disabled(cmd, why) if cmd == "dataset.import" && why == "variables are locked"), "{csv}: {e}");
+    }
+    let vars = &s.doc().unwrap().doc.variables;
+    assert!(vars.variables.len() == 2 && vars.datasets.is_empty(), "a refused import defines and imports nothing");
+
+    let imp = s.execute("dataset.import", &json!({"csv": "name,#Shown,Title\nA,true,x"})).unwrap();
+    assert_eq!((imp["imported"].as_u64(), imp["defined"].clone()), (Some(1), json!([])));
+    s.execute("variable.lock", &json!({"locked": false})).unwrap();
+    let imp = s.execute("dataset.import", &json!({"csv": "name,New\nB,n"})).unwrap();
+    assert_eq!(imp["defined"], json!(["New"]));
+}
+
 /// Import / export datasets as CSV: header `name` then variables; round-trip keeps values.
 #[test]
 fn datasets_csv_round_trips_and_rejects_bad_input() {
@@ -984,12 +1331,11 @@ fn datasets_csv_round_trips_and_rejects_bad_input() {
     assert!(!s.doc().unwrap().doc.node(r).unwrap().visible);
     assert_eq!(image(&s, img).link.as_ref().map(|l| l.path.as_str()), Some(blue_path.as_str()));
 
-    // Re-import updates in place; unknown variable and bad visibility are errors.
+    // Re-import updates in place and defines nothing; a bad visibility value is an error.
     let again = s.execute("dataset.import", &json!({"csv": csv})).unwrap();
     assert_eq!((again["imported"].as_u64(), again["updated"].as_u64()), (Some(0), Some(2)));
-    assert!(s.execute("dataset.import", &json!({"csv": "name,Ghost\nX,y"})).is_err());
+    assert_eq!(again["defined"], json!([]));
     assert!(s.execute("dataset.import", &json!({"csv": "name,Show\nX,maybe"})).is_err());
-    assert!(s.execute("dataset.import", &json!({"csv": "Title,Name\nX,y"})).is_err(), "first column must be name");
 
     let out = dir.file("sets.csv");
     s.execute("dataset.export", &json!({"path": out})).unwrap();
@@ -998,6 +1344,263 @@ fn datasets_csv_round_trips_and_rejects_bad_input() {
 
     // One undo undoes the last import's replacements.
     s.execute("edit.undo", &json!({})).unwrap();
+}
+
+/// A data set of [`library`]: its name, and each variable's name with its paragraphs.
+type LibrarySet<'a> = (&'a str, &'a [(&'a str, &'a [&'a str])]);
+
+/// A variable library written from its public grammar: a document type declaration with the
+/// namespace entities, `variableSets` › `variableSet` › `variables` with one `variable` element per
+/// `(varName, trait)`, then `sampleDataSets` with one `sampleDataSet` per data set, holding an
+/// element per variable with a `p` element per paragraph.
+fn library(vars: &[(&str, &str)], sets: &[LibrarySet]) -> String {
+    let mut x = String::from(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\" [\n\
+         \t<!ENTITY ns_vars \"http://ns.adobe.com/Variables/1.0/\">\n\
+         \t<!ENTITY ns_custom \"http://ns.adobe.com/GenericCustomNamespace/1.0/\">\n\
+         \t<!ENTITY ns_flows \"http://ns.adobe.com/Flows/1.0/\">\n\
+         ]>\n<svg>\n<variableSets xmlns=\"&ns_vars;\">\n<variableSet varSetName=\"binding1\" locked=\"none\">\n<variables>\n",
+    );
+    for (name, kind) in vars {
+        x += &format!("<variable varName=\"{name}\" trait=\"{kind}\" category=\"&ns_flows;\"></variable>\n");
+    }
+    x += "</variables>\n<v:sampleDataSets xmlns:v=\"&ns_vars;\" xmlns=\"&ns_custom;\">\n";
+    for (set, values) in sets {
+        x += &format!("<v:sampleDataSet dataSetName=\"{set}\">\n");
+        for (var, paras) in *values {
+            let paras: String = paras.iter().map(|p| format!("<p>{p}</p>")).collect();
+            x += &format!("<{var}>{paras}</{var}>\n");
+        }
+        x += "</v:sampleDataSet>\n";
+    }
+    x + "</v:sampleDataSets>\n</variableSet>\n</variableSets>\n</svg>\n"
+}
+
+/// Load Variable Library defines the library's text variables, unbound, and adds its data sets,
+/// in one undo step. A value is the text of the `p` elements, one paragraph each; an element
+/// without a `p` gives no value. A file, and base64 with a UTF-8 byte-order mark, load the same.
+#[test]
+fn a_variable_library_defines_text_variables_and_data_sets() {
+    let mut s = session();
+    let t = text(&mut s, "Alice");
+    let xml = library(
+        &[("Name", "textcontent"), ("Note", "textcontent")],
+        &[("Row 1", &[("Name", &["Bravo"]), ("Note", &["One", "Two &amp; three"])]), ("Row 2", &[("Name", &["Charlie"]), ("Note", &[])])],
+    );
+    let r = s.execute("variable.loadLibrary", &json!({"xml": xml})).unwrap();
+    assert_eq!(r["variables"], json!(["Name", "Note"]));
+    assert_eq!((r["deleted"].clone(), r["deletedDataSets"].clone()), (json!([]), json!([])));
+    assert_eq!(r["names"], json!(["Row 1", "Row 2"]));
+    assert_eq!((r["skipped"].clone(), r.get("warning")), (json!([]), None));
+    let listed = s.execute("variable.list", &json!({})).unwrap();
+    assert_eq!(listed["variables"], json!([{"name": "Name", "kind": "text", "bindings": 0}, {"name": "Note", "kind": "text", "bindings": 0}]));
+    let sets = s.execute("dataset.list", &json!({})).unwrap();
+    assert_eq!(sets["datasets"][0]["values"], json!({"Name": {"text": "Bravo"}, "Note": {"text": "One\nTwo & three"}}));
+    assert_eq!(sets["datasets"][1]["values"], json!({"Name": {"text": "Charlie"}}));
+    assert_eq!(sets["active"], Value::Null);
+    assert_eq!(plain(&s, t), "Alice", "loading binds nothing and applies nothing");
+
+    s.execute("variable.bind", &json!({"variable": "Name", "ids": [t.0]})).unwrap();
+    s.execute("dataset.select", &json!({"name": "Row 2"})).unwrap();
+    assert_eq!(plain(&s, t), "Charlie");
+
+    // One undo step each: the select, the bind, then the load.
+    for _ in 0..3 {
+        s.execute("edit.undo", &json!({})).unwrap();
+    }
+    let vars = &s.doc().unwrap().doc.variables;
+    assert!(vars.variables.is_empty() && vars.datasets.is_empty());
+
+    let dir = Folder::new("vars-library");
+    let path = dir.file("library.xml");
+    write(&path, xml.as_bytes());
+    let from_file = s.execute("variable.loadLibrary", &json!({"path": path})).unwrap();
+    assert_eq!(from_file["names"], json!(["Row 1", "Row 2"]));
+    let bom = [b"\xEF\xBB\xBF".as_slice(), xml.as_bytes()].concat();
+    let from_base64 = s.execute("variable.loadLibrary", &json!({"dataBase64": vectorcraft_format::base64_encode(&bom)})).unwrap();
+    assert_eq!((from_base64["deleted"].clone(), from_base64["deletedDataSets"].clone()), (json!(["Name", "Note"]), json!(["Row 1", "Row 2"])));
+    assert_eq!(s.doc().unwrap().doc.variables.datasets.len(), 2);
+}
+
+/// Load Variable Library replaces the document's variables and data sets: every variable goes with
+/// its bindings and values, a text variable of the same name included, and every data set goes,
+/// the active one included. The highlight of a variable that went highlights nothing. Undo brings
+/// back the variables, bindings, data sets and active data set as they were.
+#[test]
+fn a_variable_library_replaces_every_variable_and_data_set() {
+    let mut s = session();
+    let t = text(&mut s, "Alice");
+    let r = rect(&mut s);
+    for (name, kind, id) in [("Name", "text", t), ("Title", "visibility", r), ("Kept", "visibility", r)] {
+        s.execute("variable.define", &json!({"name": name, "kind": kind})).unwrap();
+        s.execute("variable.bind", &json!({"variable": name, "ids": [id.0]})).unwrap();
+    }
+    s.execute("dataset.new", &json!({"name": "A", "values": {"Name": "Old", "Title": true}})).unwrap();
+    s.execute("dataset.new", &json!({"name": "Other", "values": {"Name": "Stays", "Title": false, "Kept": true}})).unwrap();
+    s.execute("dataset.select", &json!({"name": "Other"})).unwrap();
+    s.execute("variable.highlight", &json!({"variable": "Kept"})).unwrap();
+    let before = s.doc().unwrap().doc.variables.clone();
+
+    let xml = library(&[("Name", "textcontent"), ("Title", "textcontent")], &[("A", &[("Name", &["New"]), ("Title", &["Heading"])])]);
+    let loaded = s.execute("variable.loadLibrary", &json!({"xml": xml})).unwrap();
+    assert_eq!(loaded["deleted"], json!(["Name", "Title", "Kept"]));
+    assert_eq!((loaded["deletedDataSets"].clone(), loaded["names"].clone()), (json!(["A", "Other"]), json!(["A"])));
+    let listed = s.execute("variable.list", &json!({})).unwrap();
+    assert_eq!(listed["variables"], json!([{"name": "Name", "kind": "text", "bindings": 0}, {"name": "Title", "kind": "text", "bindings": 0}]));
+    let sets = s.execute("dataset.list", &json!({})).unwrap();
+    assert_eq!(sets["datasets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(sets["datasets"][0]["values"], json!({"Name": {"text": "New"}, "Title": {"text": "Heading"}}));
+    assert_eq!(sets["active"], Value::Null);
+    assert!(s.doc().unwrap().doc.variables.bindings.is_empty(), "the bindings went with the variables");
+    assert!(s.doc().unwrap().variables_highlight.is_none(), "the highlighted variable went");
+    assert_eq!(plain(&s, t), "Stays", "loading applies nothing");
+
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.variables, before, "one undo step brings everything back");
+}
+
+/// A library that is refused leaves the document's variables and data sets as they were.
+#[test]
+fn a_refused_variable_library_deletes_nothing() {
+    let mut s = session();
+    let t = text(&mut s, "Alice");
+    s.execute("variable.define", &json!({"name": "Name", "kind": "text"})).unwrap();
+    s.execute("variable.bind", &json!({"variable": "Name", "ids": [t.0]})).unwrap();
+    s.execute("dataset.new", &json!({"name": "A", "values": {"Name": "Old"}})).unwrap();
+    let before = s.doc().unwrap().doc.variables.clone();
+    let dup = library(&[("Name", "textcontent")], &[("B", &[]), ("B", &[])]);
+    assert!(s.execute("variable.loadLibrary", &json!({"xml": dup})).is_err());
+    assert_eq!(s.doc().unwrap().doc.variables, before);
+}
+
+/// A library's variables of other kinds are left out with their values, named in `skipped` and
+/// in a warning that gives each kind once with its count; its text variables load.
+#[test]
+fn a_variable_library_leaves_out_variables_that_are_not_text() {
+    let mut s = session();
+    let xml = library(
+        &[("Shown", "kindB"), ("Name", "textcontent"), ("Photo", "kindC"), ("Other", "kindB")],
+        &[("A", &[("Shown", &["true"]), ("Name", &["Bravo"]), ("Photo", &["a.png"])])],
+    );
+    let r = s.execute("variable.loadLibrary", &json!({"xml": xml})).unwrap();
+    assert_eq!(r["variables"], json!(["Name"]));
+    assert_eq!(r["skipped"], json!([{"name": "Shown", "trait": "kindB"}, {"name": "Photo", "trait": "kindC"}, {"name": "Other", "trait": "kindB"}]));
+    assert_eq!(r["warning"], "variables that aren't text were left out: kindB (2), kindC (1)");
+    let vars = &s.doc().unwrap().doc.variables;
+    assert_eq!(vars.variables.len(), 1);
+    assert_eq!(vars.dataset("A").map(|d| d.values.len()), Some(1));
+}
+
+/// A library that isn't one, or that breaks its grammar or the caps, is refused, and the document
+/// is left as it was.
+#[test]
+fn malformed_variable_libraries_are_refused() {
+    let mut s = session();
+    let ok = library(&[("Name", "textcontent")], &[("A", &[("Name", &["x"])])]);
+    let deep = format!("{}<variableSets/>{}", "<a>".repeat(300), "</a>".repeat(300));
+    let markup = "<!DOCTYPE svg [<!ENTITY deep \"<a><a></a></a>\">]><svg>&deep;<variableSets/></svg>".to_string();
+    // A document type declaration in a comment before the real one, and markup reached through
+    // another entity.
+    let hidden = format!("<!-- <!DOCTYPE svg> -->{markup}");
+    let nested = "<!DOCTYPE svg [<!ENTITY a \"&b;&b;\"><!ENTITY b 'x'>]><svg>&a;<variableSets/></svg>".to_string();
+    let parameter = "<!DOCTYPE svg [<!ENTITY % p \"x\">]><svg><variableSets/></svg>".to_string();
+    let element = "<!DOCTYPE svg [<!ELEMENT svg ANY>]><svg><variableSets/></svg>".to_string();
+    // A `>` and a comment opener inside a quoted system identifier, before elements nested too deep.
+    let quoted = format!("<!DOCTYPE svg SYSTEM \"x><!--\"><svg>{}<variableSets/>{}</svg>", "<a>".repeat(300), "</a>".repeat(300));
+    let entities: String = (0..65).map(|i| format!("<!ENTITY e{i} \"x\">")).collect();
+    let many_entities = format!("<!DOCTYPE svg [{entities}]><svg><variableSets/></svg>");
+    // 1 KiB of text referenced 9,000 times.
+    let expanding = format!("<!DOCTYPE svg [<!ENTITY big \"{}\">]><svg>{}<variableSets/></svg>", "x".repeat(1024), "&big;".repeat(9000));
+    // References that expand to just under the cap, then a comment that takes the text past it.
+    let then_literal = format!(
+        "<!DOCTYPE svg [<!ENTITY big \"{}\">]><svg>{}<!--{}--><variableSets/></svg>",
+        "x".repeat(1024),
+        "&big;".repeat(8000),
+        " ".repeat(300_000)
+    );
+    let cases = [
+        ("not well-formed XML", "<variableSets><variableSet>".to_string()),
+        ("no `variableSets` element", "<svg><variables/></svg>".to_string()),
+        ("declares no variables", "<variableSets><variableSet><variables/></variableSet></variableSets>".to_string()),
+        ("is declared twice", library(&[("Name", "textcontent"), ("Name", "textcontent")], &[])),
+        ("has no `trait`", ok.replace(" trait=\"textcontent\"", "")),
+        ("missing `varName`", ok.replace("varName=\"Name\"", "varName=\" \"")),
+        ("missing `dataSetName`", ok.replace(" dataSetName=\"A\"", "")),
+        ("data set `A` is declared twice", library(&[("Name", "textcontent")], &[("A", &[]), ("A", &[])])),
+        ("which the library doesn't declare", library(&[("Name", "textcontent")], &[("A", &[("Nmae", &["x"])])])),
+        ("holds two values for `Name`", library(&[("Name", "textcontent")], &[("A", &[("Name", &["x"]), ("Name", &["y"])])])),
+        ("nests elements more than 256 deep", deep),
+        ("something other than entities of plain text", markup),
+        ("something other than entities of plain text", hidden),
+        ("something other than entities of plain text", nested),
+        ("something other than entities of plain text", parameter),
+        ("something other than entities of plain text", element),
+        ("nests elements more than 256 deep", quoted),
+        ("more than 64 entities", many_entities),
+        ("entities expand to more than", expanding),
+        ("entities expand to more than", then_literal),
+        ("larger than", format!("{ok}<!--{}-->", " ".repeat(8 << 20))),
+    ];
+    for (why, xml) in cases {
+        let e = s.execute("variable.loadLibrary", &json!({"xml": xml})).unwrap_err().to_string();
+        assert!(e.contains(why), "{why}: {e}");
+    }
+    let names: Vec<String> = (0..257).map(|i| format!("V{i}")).collect();
+    let many: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "textcontent")).collect();
+    let e = s.execute("variable.loadLibrary", &json!({"xml": library(&many, &[])})).unwrap_err().to_string();
+    assert!(e.contains("more than 256 variables"), "{e}");
+    // A Latin-1 é in a comment.
+    let latin1 = [ok.as_bytes(), b"<!-- \xE9 -->"].concat();
+    let e = s.execute("variable.loadLibrary", &json!({"dataBase64": vectorcraft_format::base64_encode(&latin1)})).unwrap_err().to_string();
+    assert!(e.contains("not UTF-8"), "{e}");
+    let e = s.execute("variable.loadLibrary", &json!({})).unwrap_err().to_string();
+    assert!(e.contains("give `path`, `xml` or `dataBase64`"), "{e}");
+    let vars = &s.doc().unwrap().doc.variables;
+    assert!(vars.variables.is_empty() && vars.datasets.is_empty(), "a refused library loads nothing");
+}
+
+/// Entities whose values hold plain text expand to it, in attribute values too, and a reference in
+/// a CDATA section stays as written.
+#[test]
+fn a_variable_library_expands_entities_of_plain_text() {
+    let mut s = session();
+    let xml = "<!DOCTYPE svg [<!ENTITY a \"x\"><!ENTITY b 'y \"z\"'>]><svg><variableSets><variableSet><variables>\
+               <variable varName=\"Name\" trait=\"textcontent\"/></variables><sampleDataSets><sampleDataSet dataSetName=\"&b;\">\
+               <Name><p>&a;-&b;-&a;<![CDATA[&a;]]></p></Name></sampleDataSet></sampleDataSets></variableSet></variableSets></svg>";
+    s.execute("variable.loadLibrary", &json!({"xml": xml})).unwrap();
+    let value = s.doc().unwrap().doc.variables.dataset("y \"z\"").and_then(|d| d.values.get("Name")).cloned();
+    assert_eq!(value, Some(vectorcraft_doc::DataValue::Text("x-y \"z\"-x&a;".into())));
+}
+
+/// While the variables are locked, a library that would delete or define a variable is refused, as
+/// Delete Variable and New Variable are, and the document keeps its variables and data sets. That
+/// covers a library whose only variable is a text variable the document already has, and one
+/// without text variables loaded into a document with variables. A library without text variables
+/// loads into a document without variables, replacing its data sets.
+#[test]
+fn locked_variables_refuse_a_library_that_deletes_or_defines_variables() {
+    let mut s = session();
+    s.execute("variable.define", &json!({"name": "Name", "kind": "text"})).unwrap();
+    s.execute("dataset.new", &json!({"name": "A", "values": {"Name": "Old"}})).unwrap();
+    s.execute("variable.lock", &json!({"locked": true})).unwrap();
+    let before = s.doc().unwrap().doc.variables.clone();
+    for vars in [&[("Name", "textcontent")][..], &[("Shown", "other")][..]] {
+        let e = s.execute("variable.loadLibrary", &json!({"xml": library(vars, &[("B", &[])])})).unwrap_err();
+        assert!(matches!(&e, EngineError::Disabled(cmd, why) if cmd == "variable.loadLibrary" && why == "variables are locked"), "{e}");
+        assert_eq!(s.doc().unwrap().doc.variables, before);
+    }
+
+    let mut s = session();
+    s.execute("dataset.new", &json!({"name": "A"})).unwrap();
+    s.execute("variable.lock", &json!({"locked": true})).unwrap();
+    let e = s.execute("variable.loadLibrary", &json!({"xml": library(&[("Name", "textcontent")], &[])})).unwrap_err();
+    assert!(matches!(&e, EngineError::Disabled(_, why) if why == "variables are locked"), "{e}");
+    let r = s.execute("variable.loadLibrary", &json!({"xml": library(&[("Shown", "other")], &[("B", &[])])})).unwrap();
+    assert_eq!((r["deletedDataSets"].clone(), r["names"].clone()), (json!(["A"]), json!(["B"])));
+    let vars = &s.doc().unwrap().doc.variables;
+    assert!(vars.variables.is_empty() && vars.locked);
+    assert_eq!(vars.datasets.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["B"]);
 }
 
 #[test]

@@ -5,7 +5,8 @@
 //! `object.intertwine.arrange` picks overlap areas, by a click (`at`) or by an enclosed path drawn
 //! around them (`area`), and changes which member is drawn on top there: each member keeps the
 //! area where it is drawn over the others (`NodeExtras::intertwine`, see
-//! `vectorcraft_doc::intertwine`).
+//! `vectorcraft_doc::intertwine`). Object › Expand turns the group into a plain group of what it
+//! draws ([`expand_intertwines`]), which Ungroup takes apart.
 //!
 //! An overlap area is a face of the planar arrangement of what the members paint (their fills and
 //! strokes, type outlined; other objects by their bounds): the part where two or more of them
@@ -184,6 +185,41 @@ fn release(s: &mut Session, _: &Value) -> Result<Value> {
         Ok(out)
     })?;
     Ok(json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>() }))
+}
+
+// ---------- Expand ----------
+
+/// Replace Intertwine group `id` by a plain group of the art it draws
+/// ([`vectorcraft_doc::intertwine::expand`]: its objects, then each part drawn over the others as a
+/// clip group), keeping everything about the group itself; the generated art gets ids of its own.
+fn expand_group(d: &mut Document, id: NodeId) -> Result<()> {
+    let Some(mut g) = d.node(id).cloned() else { return Ok(()) };
+    let NodeKind::Intertwine { children } = &g.kind else { return Ok(()) };
+    g.kind = NodeKind::Group { children: vectorcraft_doc::intertwine::expand(children).into_iter().map(Arc::new).collect(), clip: false };
+    super::live::fix_ids(d, &mut g);
+    *d.node_mut(id).ok_or(EngineError::NoNode(id))? = g;
+    Ok(())
+}
+
+/// Object › Expand: every Intertwine group in the subtrees of `roots` becomes a group of the art
+/// it draws ([`expand_group`]), inner ones first so an outer one copies plain art. Returns how
+/// many. A live Intertwine is expanded before it can be ungrouped:
+/// <https://community.adobe.com/questions-652/expand-ungroup-800281>.
+pub(crate) fn expand_intertwines(d: &mut Document, roots: &[NodeId]) -> Result<usize> {
+    let mut groups = vec![];
+    for r in roots {
+        if let Some(n) = d.node(*r) {
+            n.walk(&mut |c| {
+                if is_intertwine(c) {
+                    groups.push(c.id);
+                }
+            });
+        }
+    }
+    for g in groups.iter().rev() {
+        expand_group(d, *g)?;
+    }
+    Ok(groups.len())
 }
 
 // ---------- Arrange ----------

@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::testutil::{cx, paint};
-use vectorcraft_doc::{CharStyle, Document, Node, Selection};
+use vectorcraft_doc::{CharStyle, Document, Node, NodeKind, Selection, TextObject};
+use vectorcraft_text::FontDb;
 
 fn doc_with_text(text: &str) -> (Document, NodeId) {
     let mut d = Document::new(500.0, 500.0);
@@ -42,6 +43,175 @@ fn apply(d: &mut Document, snapshot: &Document, acts: &[Action]) {
             }
         }
     }
+}
+
+#[test]
+fn type_arrows_keep_devanagari_clusters_with_an_rtl_suffix() {
+    // Use the text tests' installed-family order, requiring coverage of the unchanged Hindi input.
+    // The Hebrew suffix selects the Type tool's existing visual-arrow route.
+    let hindi = "हिन्दी";
+    let second = "हि".len();
+    assert_eq!((second, hindi.len()), (6, 18));
+    let db = FontDb::global();
+    let face = ["Kohinoor Devanagari", "ITF Devanagari", "Devanagari Sangam MN", "Noto Sans Devanagari", "Nirmala UI", "Mangal"]
+        .into_iter()
+        .filter_map(|name| db.face(name, "Regular").filter(|face| face.family == name))
+        .find(|face| hindi.chars().all(|ch| face.covers(ch)));
+    let Some(face) = face else {
+        eprintln!("SKIPPED: type_arrows_keep_devanagari_clusters_with_an_rtl_suffix; no installed candidate font covers the Hindi input");
+        return;
+    };
+    assert!(hindi.chars().all(|ch| face.covers(ch)), "the selected face covers the unchanged Hindi prefix");
+    let style = CharStyle { font_family: face.family.clone(), font_style: face.style.clone(), size: 20.0, ..Default::default() };
+
+    // The plain-LTR control runs first. Each case uses a fresh document and tool.
+    for (case, text, visual_route) in [("plain_ltr", "हिन्दी", false), ("mixed_rtl", "हिन्दी שלום", true)] {
+        let (mut d, id, mut tool) = editing(text);
+        let NodeKind::Text(t) = &mut d.node_mut(id).unwrap().kind else { panic!("text fixture") };
+        for run in &mut t.runs {
+            run.style = style.clone();
+        }
+        assert_eq!(t.plain_text(), text);
+        assert_eq!(&text[..hindi.len()], hindi);
+        let lay = vectorcraft_text::layout(db, t);
+        assert_eq!(lay.lines.len(), 1, "{case}: one ordinary horizontal line");
+        assert!(!lay.vertical, "{case}: horizontal Type");
+        let mut hindi_spans: Vec<_> = lay.glyphs.iter().filter(|g| g.byte < hindi.len()).map(|g| (g.byte, g.len)).collect();
+        hindi_spans.sort_unstable();
+        hindi_spans.dedup();
+        // Raw shaping spans are diagnostic; editing boundaries do not depend on their count.
+        assert!(!hindi_spans.is_empty(), "{case}: Hindi glyph source spans are present");
+        for glyph in lay.glyphs.iter().filter(|g| g.byte < hindi.len()) {
+            let used = db.face_by_id(glyph.font_id).expect("the Hindi glyph's loaded face");
+            assert!(used.file_data() == face.file_data(), "{case}: Hindi uses the selected face bytes");
+            assert_eq!(used.face_index(), face.face_index(), "{case}: Hindi uses the selected face index");
+            assert_ne!(glyph.gid, 0, "{case}: Hindi glyph is present");
+            assert!(!glyph.rtl, "{case}: Hindi prefix remains LTR");
+        }
+        assert_eq!(lay.glyphs.iter().any(|g| g.rtl), visual_route, "{case}: actual Type arrow-route predicate");
+        if visual_route {
+            assert!(lay.glyphs.iter().any(|g| g.rtl && g.byte > hindi.len()), "{case}: the ordinary suffix supplies RTL glyphs");
+        }
+        assert_eq!(edit::next_cluster(text, second), hindi.len(), "{case}: logical cluster end");
+        assert_eq!(edit::prev_cluster(text, hindi.len()), second, "{case}: logical cluster start");
+        tool.caret = second;
+        tool.anchor = second;
+        assert_eq!(tool.editing, Some(id));
+        assert_eq!(tool.sel(), (second, second), "{case}: collapsed caret before Right");
+        assert!(tool.typing.is_none(), "{case}: no pending typing session");
+        key(&mut tool, &d, ToolKey::Right, Mods::default());
+        assert_eq!((tool.caret, tool.anchor), (hindi.len(), hindi.len()), "{case}: Right must move 6 -> 18 across the Hindi cluster");
+        key(&mut tool, &d, ToolKey::Left, Mods::default());
+        assert_eq!((tool.caret, tool.anchor), (second, second), "{case}: Left must move 18 -> 6 across the Hindi cluster");
+    }
+}
+
+#[test]
+fn type_arrows_keep_devanagari_clusters_across_wrapped_lines() {
+    use vectorcraft_doc::{Composer, Justify};
+    use vectorcraft_geom::{Affine, PathData};
+
+    // Use the installed-family order and unchanged Hindi input from the single-line test.
+    // Shaping and wrapping capabilities vary by face; an eligibility skip is not arrow coverage.
+    let hindi = "हिन्दी";
+    let text = "हिन्दी שלום";
+    let second = "हि".len();
+    let split = "हिन्".len();
+    assert_eq!((second, split, hindi.len()), (6, 12, 18));
+    let db = FontDb::global();
+    let face = ["Kohinoor Devanagari", "ITF Devanagari", "Devanagari Sangam MN", "Noto Sans Devanagari", "Nirmala UI", "Mangal"]
+        .into_iter()
+        .filter_map(|name| db.face(name, "Regular").filter(|face| face.family == name))
+        .find(|face| hindi.chars().all(|ch| face.covers(ch)));
+    let Some(face) = face else {
+        eprintln!("SKIPPED: type_arrows_keep_devanagari_clusters_across_wrapped_lines; no installed candidate font covers the Hindi input");
+        return;
+    };
+    let style = CharStyle { font_family: face.family.clone(), font_style: face.style.clone(), size: 20.0, ..Default::default() };
+    let (mut d, id, mut tool) = editing(text);
+    let NodeKind::Text(t) = &mut d.node_mut(id).unwrap().kind else { panic!("text fixture") };
+    for run in &mut t.runs {
+        run.style = style.clone();
+    }
+    t.para.justify = Justify::Left;
+    t.para.composer = Composer::SingleLine;
+    t.para.hyphenate = false;
+    assert_eq!(t.plain_text(), text);
+    assert_eq!(&text[..hindi.len()], hindi);
+
+    // Measure once on the selected face. No width sweep or invented line endpoints.
+    let natural = vectorcraft_text::layout(db, t);
+    assert_eq!(natural.lines.len(), 1, "setup: natural point text is a single line");
+    assert!(!natural.vertical, "setup: horizontal text");
+    let hindi_glyphs: Vec<_> = natural.glyphs.iter().filter(|g| g.byte < hindi.len()).collect();
+    assert!(!hindi_glyphs.is_empty(), "setup: actual Hindi glyphs exist");
+    for glyph in &hindi_glyphs {
+        let used = db.face_by_id(glyph.font_id).expect("the Hindi glyph's loaded face");
+        assert!(used.file_data() == face.file_data(), "setup: Hindi uses the selected face bytes");
+        assert_eq!(used.face_index(), face.face_index(), "setup: Hindi uses the selected face index");
+        assert_ne!(glyph.gid, 0, "setup: Hindi glyph is present");
+        assert!(!glyph.rtl, "setup: Hindi prefix is LTR");
+        assert!(glyph.len > 0 && glyph.byte + glyph.len <= hindi.len(), "setup: Hindi glyph source range");
+        assert!(
+            text.is_char_boundary(glyph.byte) && text.is_char_boundary(glyph.byte + glyph.len),
+            "setup: glyph source ranges are UTF-8 boundaries"
+        );
+    }
+    let prefix_width: f64 = hindi_glyphs.iter().filter(|g| g.byte < split).map(|g| g.advance).sum();
+    let split_width: f64 = hindi_glyphs.iter().filter(|g| g.byte == split).map(|g| g.advance).sum();
+    assert!(prefix_width.is_finite() && prefix_width > 0.0, "setup: prefix has positive finite advance");
+    assert!(split_width.is_finite(), "setup: the internal raw-group advance is finite");
+    if split_width <= 0.0 {
+        eprintln!(
+            "SKIPPED: type_arrows_keep_devanagari_clusters_across_wrapped_lines; layout capability: the selected face has no positive-advance raw group at internal byte {split}"
+        );
+        return;
+    }
+    let width = prefix_width + split_width * 0.5;
+    assert!(width.is_finite() && width > prefix_width && width < prefix_width + split_width, "setup: one measured width separates the raw groups");
+
+    t.kind = TextKind::Area { frame: PathData::from_bezpath(&Rect::new(0.0, 0.0, width, 500.0).to_path(0.1)) };
+    t.xf = Affine::IDENTITY;
+    assert_eq!((t.area.rows, t.area.columns, t.area.inset), (1, 1, 0.0));
+    assert_eq!((t.para.left_indent, t.para.first_line_indent, t.para.right_indent), (0.0, 0.0, 0.0));
+    let lay = vectorcraft_text::layout(db, t);
+    assert!(!lay.overflow, "setup: the full RTL suffix fits the tall frame");
+    assert!(!lay.vertical, "setup: horizontal area text");
+    assert!(lay.glyphs.iter().any(|g| g.rtl && g.byte > hindi.len()), "setup: actual RTL suffix selects Type's visual-arrow route");
+    for glyph in lay.glyphs.iter().filter(|g| g.byte < hindi.len()) {
+        let used = db.face_by_id(glyph.font_id).expect("the wrapped Hindi glyph's loaded face");
+        assert!(used.file_data() == face.file_data(), "setup: wrapped Hindi uses the selected face bytes");
+        assert_eq!(used.face_index(), face.face_index(), "setup: wrapped Hindi uses the selected face index");
+        assert_ne!(glyph.gid, 0, "setup: wrapped Hindi glyph is present");
+        assert!(!glyph.rtl, "setup: wrapped Hindi prefix stays LTR");
+    }
+    assert_eq!(edit::next_cluster(text, second), hindi.len(), "setup: logical cluster end is 18");
+    assert_eq!(edit::prev_cluster(text, hindi.len()), second, "setup: logical cluster start is 6");
+    assert_eq!(edit::prev_cluster(text, split), second, "setup: raw line endpoint 12 is inside the grapheme");
+    assert_eq!(edit::next_cluster(text, split), hindi.len(), "setup: raw line endpoint 12 is not its end");
+    if lay.lines.len() < 2 || (lay.lines[0].start, lay.lines[0].end, lay.lines[1].start) != (0, split, split) {
+        eprintln!(
+            "SKIPPED: type_arrows_keep_devanagari_clusters_across_wrapped_lines; layout capability: the measured frame does not expose adjacent wrapped endpoints at internal byte {split}"
+        );
+        return;
+    }
+    assert!(lay.lines.len() >= 2, "setup: actual wrapping occurred");
+    assert_eq!(
+        (lay.lines[0].start, lay.lines[0].end, lay.lines[1].start),
+        (0, split, split),
+        "setup: actual adjacent line endpoints reach internal byte 12"
+    );
+    assert_eq!(lay.line_of(second), 0, "setup: caret 6 is on the preceding line");
+    assert!(!lay.lines[0].rtl, "setup: the preceding paragraph line is LTR");
+    tool.caret = second;
+    tool.anchor = second;
+    assert_eq!(tool.editing, Some(id));
+    assert_eq!(tool.sel(), (second, second), "setup: collapsed caret before Right");
+    assert!(tool.typing.is_none(), "setup: no pending typing session");
+    key(&mut tool, &d, ToolKey::Right, Mods::default());
+    assert_eq!((tool.caret, tool.anchor), (hindi.len(), hindi.len()), "wrapped Right must move 6 -> 18 across the Hindi grapheme");
+    key(&mut tool, &d, ToolKey::Left, Mods::default());
+    assert_eq!((tool.caret, tool.anchor), (second, second), "wrapped Left must move 18 -> 6 across the Hindi grapheme");
 }
 
 #[test]
@@ -249,6 +419,36 @@ fn area_and_path_tools_convert_clicked_paths() {
     assert!(acts.iter().any(|a| matches!(a, Action::Exec(cmd, p) if cmd == "text.createInPath" && p["mode"] == "onPath")), "{acts:?}");
 }
 
+/// Area Type and Type on a Path follow the reference app: click the path outline, not the fill interior
+/// (helpx: add-text-work-with-type-objects, creating-type-path).
+#[test]
+fn area_and_path_tools_hit_path_outline_not_fill_interior() {
+    let (mut d, rect) = crate::testutil::doc_with_rect();
+    if let Some(n) = d.node_mut(rect) {
+        n.appearance.set_stroke(vectorcraft_color::Paint::None);
+    }
+    let (sel, p) = (Selection::default(), paint());
+    let c = cx(&d, &sel, &p);
+    let edge = (100.0, 150.0);
+    let interior = (150.0, 150.0);
+    for tool_id in ["areaType", "typeOnPath"] {
+        let mut tool = TypeTool::new(tool_id);
+        tool.pointer(&c, &PointerEvent::new(PointerKind::Down, edge.0, edge.1));
+        let acts = tool.pointer(&c, &PointerEvent::new(PointerKind::Up, edge.0, edge.1));
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.createInPath" && v["path"] == json!(rect.0))),
+            "{tool_id} on outline: {acts:?}"
+        );
+        let mut tool = TypeTool::new(tool_id);
+        tool.pointer(&c, &PointerEvent::new(PointerKind::Down, interior.0, interior.1));
+        let acts = tool.pointer(&c, &PointerEvent::new(PointerKind::Up, interior.0, interior.1));
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::Exec(cmd, _) if cmd == "text.createInPath")),
+            "{tool_id} in fill interior should not attach to path: {acts:?}"
+        );
+    }
+}
+
 #[test]
 fn vertical_tools_preserve_their_ids_and_create_vertical_text() {
     for id in ["verticalType", "verticalAreaType", "verticalTypeOnPath"] {
@@ -339,6 +539,35 @@ fn hebrew_typing_and_visual_arrows_keep_logical_text() {
     assert_eq!(t.plain_text(), "שלום");
 }
 
+/// View › Snap to Glyph: new point type placed near live text snaps to its baseline.
+#[test]
+fn snap_to_glyph_lines_up_new_point_type_with_a_baseline() {
+    let (d, _) = doc_with_text("Baseline");
+    let (sel, p) = (Selection::default(), paint());
+    let mut c = cx(&d, &sel, &p);
+    c.snap_to_glyph = true;
+    let existing = match &d.layers[0].children().unwrap()[0].kind {
+        NodeKind::Text(t) => t,
+        _ => panic!("text"),
+    };
+    let lay = vectorcraft_text::layout(FontDb::global(), existing);
+    let baseline_y = (existing.xf * Point::new(0.0, lay.lines[0].baseline)).y;
+    let mut tool = TypeTool::new("type");
+    tool.pointer(&c, &PointerEvent::new(PointerKind::Down, 250.0, baseline_y + 2.0));
+    let acts = tool.pointer(&c, &PointerEvent::new(PointerKind::Up, 250.0, baseline_y + 2.0));
+    assert!(
+        acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.create" && (v["y"].as_f64().unwrap() - baseline_y).abs() < 0.5)),
+        "{acts:?}"
+    );
+    c.snap_to_glyph = false;
+    tool.pointer(&c, &PointerEvent::new(PointerKind::Down, 250.0, baseline_y + 2.0));
+    let acts = tool.pointer(&c, &PointerEvent::new(PointerKind::Up, 250.0, baseline_y + 2.0));
+    assert!(
+        acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.create" && (v["y"].as_f64().unwrap() - (baseline_y + 2.0)).abs() < 0.5)),
+        "{acts:?}"
+    );
+}
+
 /// Where new type goes snaps to Smart Guides (#506): a click beside a rect lines up with its
 /// centre, and hovering shows it first; an area's corners land on its anchors.
 #[test]
@@ -358,6 +587,20 @@ fn new_type_snaps_to_smart_guides() {
     let acts = tool.pointer(&c, &PointerEvent::new(PointerKind::Up, 199.0, 202.0));
     let area = json!({"width": 100.0, "height": 100.0});
     assert!(acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.create" && v["x"] == 100.0 && v["area"] == area)), "{acts:?}");
+}
+
+#[test]
+fn area_type_drag_measure_labels_honor_preference() {
+    let (d, _) = crate::testutil::doc_with_rect();
+    let (sel, p) = (Selection::default(), paint());
+    let on = ToolContext { measurement_labels: true, ..cx(&d, &sel, &p) };
+    let off = ToolContext { measurement_labels: false, ..cx(&d, &sel, &p) };
+    let mut tool = TypeTool::new("type");
+    tool.pointer(&on, &PointerEvent::new(PointerKind::Down, 100.0, 100.0));
+    tool.pointer(&on, &PointerEvent::new(PointerKind::Drag, 200.0, 150.0));
+    let want = on.size_label(100.0, 50.0);
+    assert!(tool.overlays(&on).iter().any(|o| matches!(o, Overlay::Measure { text, .. } if text == &want)));
+    assert!(!tool.overlays(&off).iter().any(|o| matches!(o, Overlay::Measure { .. })));
 }
 
 #[test]
@@ -399,4 +642,239 @@ fn escape_returns_to_previous_tool_when_set() {
     let (d2, _id2, mut tool2) = editing("World");
     let acts2 = key(&mut tool2, &d2, ToolKey::Escape, Mods::default());
     assert_eq!(acts2.last(), Some(&Action::SwitchTool("selection".into())));
+}
+
+/// A click from `tool` at (x, y) → the actions of the press and the release.
+fn click(tool: &mut TypeTool, c: &ToolContext, x: f64, y: f64) -> Vec<Action> {
+    let mut acts = tool.pointer(c, &PointerEvent::new(PointerKind::Down, x, y));
+    acts.extend(tool.pointer(c, &PointerEvent::new(PointerKind::Up, x, y)));
+    acts
+}
+
+fn creates(acts: &[Action]) -> bool {
+    acts.iter().any(|a| matches!(a, Action::Exec(cmd, _) if cmd == "text.create" || cmd == "text.createInPath"))
+}
+
+/// While type is being edited, a click on blank canvas ends the editing and makes no new type;
+/// the Type tool stays, and the next click makes point type (#2871, #2854). The same holds when
+/// the editing began with a double-click from a selection tool.
+#[test]
+fn a_click_away_from_the_type_being_edited_only_ends_editing() {
+    for prev in [None, Some("selection")] {
+        let (d, _, mut tool) = editing("Hello");
+        if let Some(prev) = prev {
+            tool.set_option("prevTool", &json!(prev));
+        }
+        let (sel, p) = (Selection::default(), paint());
+        let c = cx(&d, &sel, &p);
+        let acts = click(&mut tool, &c, 400.0, 400.0);
+        assert!(!creates(&acts), "{prev:?}: {acts:?}");
+        assert!(!acts.iter().any(|a| matches!(a, Action::SwitchTool(_))), "{prev:?}: {acts:?}");
+        assert_eq!((tool.id(), tool.editing), ("type", None));
+        assert_eq!(tool.prev_tool.as_deref(), prev);
+        let acts = click(&mut tool, &c, 400.0, 400.0);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.create" && v["x"] == 400.0 && v.get("area").is_none())),
+            "{acts:?}"
+        );
+    }
+}
+
+/// Point type a click placed and left empty is still discarded by the click away, and that click
+/// places no other type.
+#[test]
+fn a_click_away_from_empty_new_type_discards_it_and_makes_none() {
+    let (d, id, mut tool) = editing("");
+    tool.fresh = Some(id);
+    let (sel, p) = (Selection::default(), paint());
+    let acts = click(&mut tool, &cx(&d, &sel, &p), 400.0, 400.0);
+    assert_eq!(acts, vec![Action::Exec("text.discardEmpty".into(), json!({"id": id.0}))]);
+}
+
+/// Area Type and Type on a Path: a click on a path while other type is being edited ends the
+/// editing only; the next click turns the path into a frame or a baseline.
+#[test]
+fn a_click_on_a_path_while_editing_only_ends_editing() {
+    let (mut d, rect) = crate::testutil::doc_with_rect();
+    let l = d.layers[0].id;
+    let id = d.alloc_id();
+    let t = TextObject::point(Point::new(300.0, 400.0), "Hello", CharStyle { size: 20.0, ..Default::default() });
+    d.insert(Some(l), 1, Node::new(id, NodeKind::Text(Box::new(t)))).unwrap();
+    let (sel, p) = (Selection::default(), paint());
+    let c = cx(&d, &sel, &p);
+    for (tool_id, at) in [("areaType", (100.0, 150.0)), ("typeOnPath", (150.0, 100.0))] {
+        let mut tool = TypeTool::new(tool_id);
+        tool.start_editing(id, 0);
+        let acts = click(&mut tool, &c, at.0, at.1);
+        assert!(!creates(&acts), "{tool_id}: {acts:?}");
+        assert_eq!(tool.editing, None);
+        let acts = click(&mut tool, &c, at.0, at.1);
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.createInPath" && v["path"] == json!(rect.0))),
+            "{tool_id}: {acts:?}"
+        );
+    }
+}
+
+/// While type is being edited, a drag that draws an area-type frame still makes it, and a click
+/// on other type edits that type at once.
+#[test]
+fn a_drag_or_a_click_on_other_type_while_editing_acts_at_once() {
+    let (mut d, id, mut tool) = editing("Hello");
+    let (sel, p) = (Selection::default(), paint());
+    let acts = {
+        let c = cx(&d, &sel, &p);
+        tool.pointer(&c, &PointerEvent::new(PointerKind::Down, 300.0, 300.0));
+        tool.pointer(&c, &PointerEvent::new(PointerKind::Drag, 400.0, 400.0));
+        tool.pointer(&c, &PointerEvent::new(PointerKind::Up, 400.0, 400.0))
+    };
+    let area = json!({"width": 100.0, "height": 100.0});
+    assert!(acts.iter().any(|a| matches!(a, Action::Exec(cmd, v) if cmd == "text.create" && v["area"] == area)), "{acts:?}");
+    let l = d.layers[0].id;
+    let other = d.alloc_id();
+    let t = TextObject::point(Point::new(100.0, 300.0), "Other", CharStyle { size: 20.0, ..Default::default() });
+    d.insert(Some(l), 1, Node::new(other, NodeKind::Text(Box::new(t)))).unwrap();
+    let c = cx(&d, &sel, &p);
+    let t = TypeTool::text(&c, other).unwrap().clone();
+    let lay = vectorcraft_text::layout(FontDb::global(), &t);
+    let (top, bot) = vectorcraft_text::caret_position(&lay, 2);
+    let at = t.xf * top.midpoint(bot);
+    tool.start_editing(id, 0);
+    let acts = click(&mut tool, &c, at.x, at.y);
+    assert!(!creates(&acts), "{acts:?}");
+    assert!(acts.contains(&Action::Exec("select.set".into(), json!({"ids": [other.0]}))), "{acts:?}");
+    assert_eq!(tool.editing, Some(other));
+}
+
+/// #2572: selected area type shows its in and out ports with any tool, not only the Type tools
+/// (#2323): empty while its text fits and it isn't threaded, the out port's red "+" when the text
+/// doesn't fit, an arrow in the port on the side where it is threaded.
+#[test]
+fn selected_type_shows_its_ports_in_each_state() {
+    let (mut d, id) = crate::testutil::doc_with_area_type();
+    let (mut sel, p) = (Selection::default(), paint());
+    sel.set([id]);
+    let mut marks = PortMarks::default();
+    // (white boxes, outlines, glyph strokes, red outlines)
+    let count = |ov: &[Overlay]| {
+        let n = |f: &dyn Fn(&Overlay) -> bool| ov.iter().filter(|o| f(o)).count();
+        (
+            n(&|o| matches!(o, Overlay::Highlight { color: [255, 255, 255, 255], .. })),
+            n(&|o| matches!(o, Overlay::Path { .. })),
+            n(&|o| matches!(o, Overlay::Line { .. })),
+            n(&|o| matches!(o, Overlay::Path { color: [230, 30, 30], .. })),
+        )
+    };
+    assert_eq!(count(&thread_ports(&mut marks, &cx(&d, &sel, &p))), (2, 2, 0, 0), "the text fits: two empty ports");
+    let Some(NodeKind::Text(t)) = d.node(id).map(|n| &n.kind) else { panic!("not text") };
+    let (input, output) = (t.xf * Point::new(0.0, PORT_RISE_PX), t.xf * Point::new(120.0, 40.0 - PORT_RISE_PX));
+    let near = |a: Option<Point>, b: Point| a.is_some_and(|a| a.distance(b) < 1e-9);
+    assert!(near(port_centre(t, Port::In, 1.0), input), "on the left side, below the top-left corner");
+    assert!(near(port_centre(t, Port::Out, 1.0), output), "on the right side, above the bottom-right corner");
+    let ov = thread_ports(&mut marks, &cx(&d, &sel, &p));
+    let box_at = |c: Point| ov.iter().any(|o| matches!(o, Overlay::Highlight { quad, .. } if quad[0].midpoint(quad[2]).distance(c) < 1e-9));
+    assert!(box_at(input) && box_at(output), "{ov:?}");
+    if let Some(NodeKind::Text(t)) = d.node_mut(id).map(|n| &mut n.kind) {
+        t.runs = vec![TextRun::new("Words that fill more than the frame holds. ".repeat(20), CharStyle { size: 20.0, ..Default::default() })];
+    }
+    assert_eq!(count(&thread_ports(&mut marks, &cx(&d, &sel, &p))), (2, 2, 2, 1), "an empty in port and the red plus");
+    assert_eq!(port_states(&d, id, true), (PortState::Empty, PortState::Overflow));
+    // Threaded on both sides: arrows (three strokes each), the out port's in place of the plus.
+    let (a, b) = (d.alloc_id(), d.alloc_id());
+    d.text_threads = vec![vec![a, id, b]];
+    assert_eq!(port_states(&d, id, true), (PortState::Threaded, PortState::Threaded));
+    assert_eq!(count(&thread_ports(&mut marks, &cx(&d, &sel, &p))), (2, 2, 6, 0));
+    d.text_threads = vec![vec![id, a]];
+    assert_eq!(port_states(&d, id, false), (PortState::Empty, PortState::Threaded));
+    d.text_threads = vec![vec![a, id]];
+    assert_eq!(port_states(&d, id, false), (PortState::Threaded, PortState::Empty));
+    assert_eq!(port_states(&d, id, true), (PortState::Threaded, PortState::Overflow), "the last frame's text doesn't fit");
+    sel.clear();
+    assert!(thread_ports(&mut marks, &cx(&d, &sel, &p)).is_empty(), "only selected type shows them");
+}
+
+/// Past [`PORTS_MAX`] selected frames (select all of an opened PDF) no ports are drawn or clicked:
+/// they would bury the canvas in boxes; up to it every frame has its two.
+#[test]
+fn a_huge_selection_of_type_shows_no_ports() {
+    let (mut d, id) = crate::testutil::doc_with_area_type();
+    let node = d.node(id).unwrap().clone();
+    let l = d.layers[0].id;
+    let mut sel = Selection::default();
+    sel.set([id]);
+    for _ in 0..PORTS_MAX {
+        let copy = d.alloc_id();
+        d.insert(Some(l), 1, Node::new(copy, node.kind.clone())).unwrap();
+        sel.add(copy);
+    }
+    let p = paint();
+    let Some(NodeKind::Text(t)) = d.node(id).map(|n| &n.kind) else { panic!("not text") };
+    let out = port_centre(t, Port::Out, 1.0).unwrap();
+    let mut marks = PortMarks::default();
+    assert!(thread_ports(&mut marks, &cx(&d, &sel, &p)).is_empty());
+    assert_eq!(port_at(&cx(&d, &sel, &p), out), None);
+    sel.remove(id);
+    let ports = thread_ports(&mut marks, &cx(&d, &sel, &p));
+    assert_eq!(ports.iter().filter(|o| matches!(o, Overlay::Highlight { .. })).count(), 2 * PORTS_MAX, "at the limit");
+}
+
+/// Type in perspective has no ports, as it can't thread ([`crate::select::is_threadable`]): none
+/// are drawn with any tool, the Type tools included, and it doesn't count toward [`PORTS_MAX`].
+#[test]
+fn type_in_perspective_has_no_ports_and_doesnt_count() {
+    let (mut d, id) = crate::testutil::doc_with_area_type();
+    d.node_mut(id).unwrap().extras_mut().perspective = Some(Box::new(vectorcraft_doc::PerspectiveAttachment::new("left", 0.0)));
+    let (mut sel, p) = (Selection::default(), paint());
+    sel.set([id]);
+    let mut marks = PortMarks::default();
+    assert!(thread_ports(&mut marks, &cx(&d, &sel, &p)).is_empty(), "no ports on type in perspective");
+    let boxes = |o: &[Overlay]| o.iter().filter(|o| matches!(o, Overlay::Highlight { color: [255, 255, 255, 255], .. })).count();
+    assert_eq!(boxes(&TypeTool::new("type").overlays(&cx(&d, &sel, &p))), 0, "nor with the Type tool");
+    // With PORTS_MAX frames that have ports selected besides it, theirs still show.
+    let mut node = d.node(id).unwrap().clone();
+    node.extras_mut().perspective = None;
+    let l = d.layers[0].id;
+    for _ in 0..PORTS_MAX {
+        let copy = d.alloc_id();
+        d.insert(Some(l), 1, Node::new(copy, node.kind.clone())).unwrap();
+        sel.add(copy);
+    }
+    assert_eq!(boxes(&thread_ports(&mut marks, &cx(&d, &sel, &p))), 2 * PORTS_MAX);
+}
+
+/// The Type tool draws the ports of the type it edits as of the rest of the selection: none past
+/// [`PORTS_MAX`] selected frames, where they can't be clicked either.
+#[test]
+fn the_edited_types_ports_follow_the_limit_too() {
+    let (mut d, id) = crate::testutil::doc_with_area_type();
+    let node = d.node(id).unwrap().clone();
+    let l = d.layers[0].id;
+    let mut sel = Selection::default();
+    sel.set([id]);
+    for _ in 1..PORTS_MAX {
+        let copy = d.alloc_id();
+        d.insert(Some(l), 1, Node::new(copy, node.kind.clone())).unwrap();
+        sel.add(copy);
+    }
+    let p = paint();
+    let mut tool = TypeTool::new("type");
+    tool.start_editing(id, 0);
+    let boxes = |o: &[Overlay]| o.iter().filter(|o| matches!(o, Overlay::Highlight { color: [255, 255, 255, 255], .. })).count();
+    assert_eq!(boxes(&tool.overlays(&cx(&d, &sel, &p))), 2 * PORTS_MAX, "at the limit, the edited one's included");
+    let copy = d.alloc_id();
+    d.insert(Some(l), 1, Node::new(copy, node.kind.clone())).unwrap();
+    sel.add(copy);
+    assert_eq!(boxes(&tool.overlays(&cx(&d, &sel, &p))), 0, "past it, not even the edited one's");
+}
+
+/// Type on a path has its in port just before its start bracket and its out port just past its
+/// end bracket, along the path, clear of the brackets.
+#[test]
+fn type_on_a_path_has_its_ports_beyond_its_brackets() {
+    let (d, id) = crate::testutil::doc_with_path_type();
+    let Some(NodeKind::Text(t)) = d.node(id).map(|n| &n.kind) else { panic!("not text") };
+    let near = |a: Option<Point>, b: Point| a.is_some_and(|a| a.distance(b) < 1e-6);
+    assert!(near(port_centre(t, Port::In, 1.0), Point::new(160.0 - PORT_RISE_PX, 300.0)), "{:?}", port_centre(t, Port::In, 1.0));
+    assert!(near(port_centre(t, Port::Out, 1.0), Point::new(400.0 + PORT_RISE_PX, 300.0)), "{:?}", port_centre(t, Port::Out, 1.0));
+    assert!(near(port_centre(t, Port::In, 0.5), Point::new(160.0 - PORT_RISE_PX / 2.0, 300.0)), "screen pixels at 200%");
 }

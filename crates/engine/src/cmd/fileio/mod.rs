@@ -8,7 +8,7 @@
 //! - `svg`: the SVG Options (styling, fonts, images, object ids, artboards…).
 //! - `export`: `document.export` / `serialize` / `exportSelection` / `exportForOffice`.
 //! - `screens`: Export for Screens (`document.exportForScreens`, `document.exportSettings`); `zip`
-//!   packs its files as one download.
+//!   packs its files as one download, and reads the files of Word documents placed as type.
 //! - `save`: `document.save`, Save As / a Copy / as Template, New from Template, Revert and the
 //!   per-format options (`file.formatOptions`); [`save_with`] is the one save path of every frontend.
 //! - `pdf`: PDF settings and presets for every PDF export, `document.exportPdf`.
@@ -40,12 +40,14 @@ pub mod pdf;
 mod pdfimport;
 pub mod pngtext;
 pub mod ppi;
+pub mod progress;
 pub mod psdread;
 mod save;
 mod screens;
 mod svg;
 mod text;
-mod zip;
+mod tgaread;
+pub mod zip;
 
 use serde_json::{Value, json};
 
@@ -57,7 +59,9 @@ pub(crate) use export::{export_crop, isolated};
 pub(crate) use load::check_not_lossy_overwrite;
 use load::err;
 pub(crate) use load::import_svg;
+pub(crate) use load::is_placeholder;
 pub(crate) use load::native_file;
+pub(crate) use load::page_or_editing_data;
 pub(crate) use load::source;
 pub use load::{
     Loaded, RasterImage, ReadFile, detect, file_name, load, load_with, open_bytes, open_bytes_with, open_read, open_template, raster_image,
@@ -70,15 +74,17 @@ pub use native::with_compression_pref;
 pub use pdfimport::{LoadOptions, page_document};
 pub(crate) use save::job_for;
 pub use save::{
-    SAVE_FORMATS, SaveJob, SaveMode, SavePlan, StreamWrite, TEMPLATE_FORMATS, export_folder, save_filters, save_format, save_job, save_plan,
-    save_with, stamp_save_dates, template_filters, templates_dialog_folder, templates_folder,
+    SAVE_FORMATS, SaveJob, SaveMode, SavePlan, StreamWrite, TEMPLATE_FORMATS, export_folder, reads_option as save_reads_option,
+    remembered_save_options, save_filters, save_format, save_job, save_plan, save_with, stamp_save_dates, template_filters, templates_dialog_folder,
+    templates_folder,
 };
 pub use screens::{
-    PRESET_KEYS as SCREEN_EXPORT_PRESET_KEYS, PRESETS as SCREEN_PRESETS, ScreenExportPreset, ScreenSize,
-    builtin_presets as screen_export_builtin_presets, preset_rows as screen_preset_rows,
+    PRESET_KEYS as SCREEN_EXPORT_PRESET_KEYS, PRESETS as SCREEN_PRESETS, ScreenExport, ScreenExportPreset, ScreenSize,
+    builtin_presets as screen_export_builtin_presets, first_file as screen_first_file, preset_rows as screen_preset_rows,
 };
 pub(crate) use screens::{
-    SHARED_KEYS as SCREEN_SETTINGS_KEYS, check_settings as check_screen_settings, export as export_screens, store_settings as store_screen_settings,
+    SHARED_KEYS as SCREEN_SETTINGS_KEYS, check_settings as check_screen_settings, export as export_screens, safe_file_name,
+    store_settings as store_screen_settings,
 };
 pub use svg::options_map as svg_options;
 /// Atomic file writes (a temporary file renamed over the target: a failed write never damages the
@@ -114,7 +120,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Serialize Document",
             [],
             None,
-            "{format?: vectorcraft (default)|template|svg|svgz|pdf|ai|png|jpg|webp|gif|png8|txt|dxf|eps|emf|wmf|tiff|bmp|tga|psd, …the format's options (see document.formats; SVG ones also as svg: {…}), selectedOnly?: false (the selected objects alone, in their layers)} → {text, warnings} for svg (plus dataBase64, the file, when its encoding isn't UTF-8), else {dataBase64, warnings}; an SVG of several artboards also gives files: [{name, text}], linked images linked: [{name, dataBase64}]",
+            "{format?: vectorcraft (default)|template|svg|svgz|pdf|ai|png|jpg|webp|gif|png8|txt|dxf|eps|emf|wmf|tiff|bmp|tga|psd (ait, a .ait template, is written by file.saveAsTemplate), …the format's options (see document.formats; SVG ones also as svg: {…}), selectedOnly?: false (the selected objects alone, in their layers)} → {text, warnings} for svg (plus dataBase64, the file, when its encoding isn't UTF-8), else {dataBase64, warnings}; an SVG of several artboards also gives files: [{name, text}], linked images linked: [{name, dataBase64}]",
             has_doc,
             export::serialize
         ),
@@ -123,7 +129,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Document",
             [],
             None,
-            "{path?, format?: svg|svgz|pdf|ai|png|jpg|webp|gif|png8|txt|dxf|eps|emf|wmf|tiff|bmp|tga|psd|vectorcraft|template (default: from the path's extension, else png; png8 writes an indexed .png), selectedOnly?: false (the selected objects alone, in their layers), artboard?: 0, artboards?: [i…], range?: \"1-3, 5\" | \"all\" (1-based; PDF and .ai write one page per artboard, default all; SVG writes one file per artboard, {stem}-{artboard}.svg; raster formats write one artboard), useArtboards?: true (raster: one file per chosen artboard, default all, {stem}-{artboard}.{ext}; pdf/ai: every page) | false (pdf/ai/raster: the bounds of the visible art; SVG has it as an SVG option), ppi?: 72 (raster formats: pixels per inch, stored in the file; wins over scale), scale?: 1 (pixels per point), background?: transparent|white|black|\"#rrggbb\" (jpg: white when transparent), antiAlias?: none|art (default)|type (text snapped to pixels), interlaced?: false (png, Adam7), quality?: 90 (jpg: 0–100), colorModel?: rgb|cmyk|gray (jpg), method?: baseline|optimized|progressive, scans?: 3 (3–5, progressive), embedIcc?: true, imageMap?: none|client|server (an HTML or NCSA map of the objects with a URL, written as <stem>.html / <stem>.map), colors?: 256 (gif/png8: 2–256), reduction?: perceptual|selective (default)|adaptive|web|blackWhite|gray, dither?: none|diffusion (default)|pattern|noise, ditherAmount?: 100, transparency?: true, matte?: white|\"#rrggbb\"|none, interlaced?, lossless?: true (webp: lossy WebP isn't available yet: written lossless, with a warning), encoding?: utf8|utf16 (txt: the stories in stacking order, back to front, a thread once; utf16 with a byte order mark), lineEndings?: lf|crlf, selectionOnly?: false, svg?: {styling, outlineText, images, objectIds, decimals, minify, responsive, useArtboards, preserveEditing, metadata, fewerTspans, hiddenLayers, encoding, profile, embedFonts} (see document.formats), …the SVG options given flat instead, …the PDF options of document.exportPdf, …the DXF options of document.exportDxf (useArtboards: one drawing per artboard), …the EPS options of document.exportEps (useArtboards: one file per artboard, {stem}_{artboard}.eps; else the visible art), …emf and wmf write one picture of the artboard (useArtboards: true one file per chosen artboard, false the bounds of the visible art; EMF keeps curves, clipping, transparent images and gradients as images clipped to their shape; WMF flattens curves into polygons behind a placeable header; what a format leaves out comes back in warnings), colorModel?: rgb|cmyk|gray (tiff: rgb keeps transparency as an alpha channel), lzw?: true, byteOrder?: little|big, embedIcc?: true, colorModel?: rgb|gray (bmp), depth?: 24 (bmp: 1 black and white, 4|8 a palette by reduction and dither, 16, 24, 32 with alpha), fileFormat?: windows|os2 (1, 4, 8 or 24 bits), rle?: false (4 and 8 bits, windows), flipRows?: false (top-down rows), depth?: 24 (tga: 16 one-bit alpha, 24, 32 with alpha), colorModel?: rgb|cmyk|gray (psd), layers?: true (each top-level layer a pixel layer with its opacity and blend mode; a background colour is a Background layer; false: one flat image, on white), maxEditability?: false (layers and sublayers become groups, each object a layer named as in the Layers panel, text by its text; clipping, masked or knockout layers stay one layer), hiddenLayers?: false (hidden layers and objects written hidden instead of left out), embedIcc?: true (at most 30000 pixels a side; formats without alpha are flattened on white)} → {path, format, bytes, warnings, files?: [path…] (several), linked?: [path…] (linked images, image maps)}; no path → {dataBase64, format, bytes, warnings, files?: [{name, dataBase64}], linked?: [{name, dataBase64}]}. Never changes the document's path",
+            "{path?, format?: svg|svgz|pdf|ai|png|jpg|webp|gif|png8|txt|dxf|eps|emf|wmf|tiff|bmp|tga|psd|vectorcraft|template (default: from the path's extension, else png; png8 writes an indexed .png; ait, a .ait template, is written by file.saveAsTemplate; an exporter plug-in's format is plugin.<plug-in id>, which an extension only it lists picks too), params?: {…} (an exporter plug-in's parameters; missing ones take their defaults, see plugin.info), selectedOnly?: false (the selected objects alone, in their layers), artboard?: 0, artboards?: [i…], rect?: [x, y, width, height] (raster formats: that area of the page in points, y down, instead of an artboard; not with artboard, artboards, range or useArtboards), range?: \"1-3, 5\" | \"all\" (1-based; PDF and .ai write one page per artboard, default all; SVG writes one file per artboard, {stem}-{artboard}.svg; raster formats write one artboard), useArtboards?: true (raster: one file per chosen artboard, default all, {stem}-{artboard}.{ext}; pdf/ai: every page) | false (pdf/ai/raster: the bounds of the visible art; SVG has it as an SVG option), ppi?: 72 (raster formats: pixels per inch, stored in the file; wins over scale), scale?: 1 (pixels per point), background?: transparent|white|black|\"#rrggbb\" (jpg: white when transparent), antiAlias?: none|art (default)|type (text snapped to pixels), interlaced?: false (png, Adam7), embedIcc?: true (png: an sRGB chunk marks the colours as sRGB), quality?: 90 (jpg: 0–100), colorModel?: rgb|cmyk|gray (jpg), method?: baseline|optimized|progressive, scans?: 3 (3–5, progressive), embedIcc?: true, imageMap?: none|client|server (an HTML or NCSA map of the objects with a URL, written as <stem>.html / <stem>.map), colors?: 256 (gif/png8: 2–256), reduction?: perceptual|selective (default)|adaptive|web|blackWhite|gray, dither?: none|diffusion (default)|pattern|noise, ditherAmount?: 100, transparency?: true, matte?: white|\"#rrggbb\"|none, interlaced?, lossless?: true (webp: lossy WebP isn't available yet: written lossless, with a warning), encoding?: utf8|utf16 (txt: the stories in stacking order, back to front, a thread once; utf16 with a byte order mark), lineEndings?: lf|crlf, selectionOnly?: false, svg?: {styling, outlineText, images, objectIds, decimals, minify, responsive, useArtboards, preserveEditing, metadata, fewerTspans, hiddenLayers, encoding, profile, embedFonts} (see document.formats), …the SVG options given flat instead, …the PDF options of document.exportPdf, …the DXF options of document.exportDxf (useArtboards: one drawing per artboard), …the EPS options of document.exportEps (useArtboards: one file per artboard, {stem}_{artboard}.eps, after a central {stem}.eps of the whole document when there are two or more; else the visible art), …emf and wmf write one picture of the artboard (useArtboards: true one file per chosen artboard, false the bounds of the visible art; EMF keeps curves, clipping, transparent images and gradients as images clipped to their shape; WMF flattens curves into polygons behind a placeable header; what a format leaves out comes back in warnings), colorModel?: rgb|cmyk|gray (tiff: rgb keeps transparency as an alpha channel), lzw?: true, byteOrder?: little|big, embedIcc?: true, colorModel?: rgb|gray (bmp), depth?: 24 (bmp: 1 black and white, 4|8 a palette by reduction and dither, 16, 24, 32 with alpha), fileFormat?: windows|os2 (1, 4, 8 or 24 bits), rle?: false (4 and 8 bits, windows), flipRows?: false (top-down rows), depth?: 24 (tga: 16 one-bit alpha, 24, 32 with alpha), colorModel?: rgb|cmyk|gray (psd), layers?: true (each top-level layer a pixel layer with its opacity and blend mode; a background colour is a Background layer; false: one flat image, on white), maxEditability?: false (layers and sublayers become groups, each object a layer named as in the Layers panel, text by its text; clipping, masked or knockout layers stay one layer), hiddenLayers?: false (hidden layers and objects written hidden instead of left out), embedIcc?: true (at most 30000 pixels a side; formats without alpha are flattened on white)} → {path, format, bytes, warnings, files?: [path…] (several), linked?: [path…] (linked images, image maps)}; no path → {dataBase64, format, bytes, warnings, files?: [{name, dataBase64}], linked?: [{name, dataBase64}]}. Never changes the document's path",
             has_doc,
             export::export
         ),
@@ -141,7 +147,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export for Screens",
             ["File", "Export"],
             None,
-            "{folder?, zip?: false (one store-only .zip of every file: no folder → {name, dataBase64, bytes, files: [name…]}; with a folder it is written there → {path, bytes, files}), artboards?: [index…] | range?: \"1-3\" (default all), assets?: [asset id…] (instead of artboards: each asset's art alone, cropped to its bounds and named after the asset; see assets.list), layers?: [layer id…] (instead of artboards: each layer's art alone, sublayers included, named after the layer), selection?: one|each (instead of artboards: the selected art as one file, or a file per selected object, named after it), fullDocument?: false (one file per format instead: a PDF of every artboard, other formats the bounds of all visible art, named after the document), includeBleed?: false (artboards grown by the document's bleed), exportPreset?: (a preset of document.exportPresets.list: its settings, under these params), subfolders?: false (each row's files in a sub-folder: its folder, else its size for raster (1x, 2x, 100w…) or its format (SVG, PDF)), folders?: none|rows (as subfolders)|format (a folder per extension: png, svg, pdf…)|item (a folder per artboard, asset, layer or object)|itemFormat (item/extension) (default: rows with subfolders or a preset, else none), name?: (a file name pattern instead of the item's name, with <filename> for the document, <name> for the artboard, asset, layer or object, <index> from 1, #### for the counter zero-padded to the run of #, <format>, <scale>, <suffix> (else the row's suffix ends the name), YYYYMMDD, YYYY-MM-DD, YYYY, <date>, <time>, <YYYY>, <MM>, <DD>, <hh>, <mm> and <ss>; a trailing .ext is dropped, as in `COMPANY-Logo-<filename>-####-YYYYMMDD`; different files it names alike get -2, -3…), counterStart?: 1, counterPer?: item (every file of an item has its number)|file, date?: YYYY-MM-DD (the date the pattern uses; default today, UTC), preset?: mobile (PNG 1x, 2x, 3x) | density (PNG 0.75x–4x in ldpi…xxxhdpi sub-folders) instead of formats (turns subfolders on), formats?: [{format: png|png8|jpg|webp|gif|tiff|bmp|tga|psd|svg|svgz|pdf|eps|ai|vectorcraft, scale?: 1 | \"2x\" | \"100w\" | \"100h\" | \"72ppi\", width?: px | height?: px | ppi? (raster only; width, then height, then ppi win over scale), suffix?: (raster default: @2x, @100w, @100h, none at 1x; vector formats drop size suffixes), folder?: (its sub-folder), quality?: (jpg 0–100), …the format's options (antiAlias, background, preset (pdf)…)}], settings?: {png|png8|jpg|webp|gif|tiff|bmp|tga|psd|svg|svgz|pdf|eps|ai|vectorcraft: {…options for every row of that format}} (rows' own options win), prefix?, antiAlias?: none|art|type (raster rows without their own), openLocation?: (remembered; the app shows the files after exporting)} one file per artboard and format (a PDF holds its artboard alone; artboards with the same name, in any case, get -2, -3…; an unnamed one is Artboard-N) → {files: [path…]}; no folder → {files: [{name, dataBase64}]} (names include sub-folders: 2x/Icon@2x.png). eps, ai and vectorcraft rows write a document of the item alone (its one artboard). The params (but zip and assets) are remembered in the document (document.exportSettings; not an undo step)",
+            "{folder?, zip?: false (one store-only .zip of every file: no folder → {name, dataBase64, bytes, files: [name…]}; with a folder it is written there → {path, bytes, files}), artboards?: [index…] | range?: \"1-3\" (default all), assets?: [asset id…] (instead of artboards: each asset's art alone, cropped to its bounds and named after the asset; see assets.list), layers?: [layer id…] (instead of artboards: each layer's art alone, sublayers included, named after the layer), selection?: one|each (instead of artboards: the selected art as one file, or a file per selected object, named after it), fullDocument?: false (one file per format instead: a PDF of every artboard, other formats the bounds of all visible art, named after the document), includeBleed?: false (artboards grown by the document's bleed), exportPreset?: (a preset of document.exportPresets.list: its settings, under these params), subfolders?: false (each row's files in a sub-folder: its folder, else its size for raster (1x, 2x, 100w…) or its format (SVG, PDF)), folders?: none|rows (as subfolders)|format (a folder per extension: png, svg, pdf…)|item (a folder per artboard, asset, layer or object)|itemFormat (item/extension) (default: rows with subfolders or a preset, else none), name?: (a file name pattern instead of the item's name, with <filename> for the document, <name> for the artboard, asset, layer or object, <index> from 1, #### for the counter zero-padded to the run of #, <format>, <scale>, <suffix> (else the row's suffix ends the name), YYYYMMDD, YYYY-MM-DD, YYYY, <date>, <time>, <YYYY>, <MM>, <DD>, <hh>, <mm> and <ss>; a trailing .ext is dropped, as in `COMPANY-Logo-<filename>-####-YYYYMMDD`; different files it names alike get -2, -3…), counterStart?: 1, counterPer?: item (every file of an item has its number)|file, date?: YYYY-MM-DD (the date the pattern uses; default today, UTC), preset?: mobile (PNG 1x, 2x, 3x) | density (PNG 0.75x–4x in ldpi…xxxhdpi sub-folders) instead of formats (turns subfolders on), formats?: [{format: png|png8|jpg|webp|gif|tiff|bmp|tga|psd|svg|svgz|pdf|eps|ai|vectorcraft, scale?: 1 | \"2x\" | \"100w\" | \"100h\" | \"72ppi\", width?: px | height?: px | ppi? (raster only; width, then height, then ppi win over scale), suffix?: (raster default: @2x, @100w, @100h, none at 1x; vector formats drop size suffixes), folder?: (its sub-folder), quality?: (jpg 0–100), …the format's options (antiAlias, background, preset (pdf)…)}], settings?: {png|png8|jpg|webp|gif|tiff|bmp|tga|psd|svg|svgz|pdf|eps|ai|vectorcraft: {…options for every row of that format}} (rows' own options win), prefix?, antiAlias?: none|art|type (raster rows without their own), openLocation?: (remembered; the app shows the files after exporting)} one file per artboard and format (a PDF holds its artboard alone; artboards with the same name, in any case, get -2, -3…; an unnamed one is Artboard-N) → {files: [path…]}; no folder → {files: [{name, dataBase64}]} (names include sub-folders: 2x/Icon@2x.png); every reply has warnings: [the encoders' warnings for the files, each once: an image that couldn't be decoded, type written in the fallback font…]. eps, ai and vectorcraft rows write a document of the item alone (its one artboard). The params (but zip and assets) are remembered in the document (document.exportSettings; not an undo step)",
             has_doc,
             screens::export_for_screens
         ),
@@ -186,7 +192,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Batch…",
             [],
             None,
-            "{commands: [{command, params}] (the action's steps), source?: folder (default) | datasets, folder? (required for folder: the source folder), includeSubdirs?: false, destination?: none (default: leave each file open) | saveAndClose (save over the source and close) | folder (save or export into destinationFolder and close), destinationFolder? (required when destination is folder; also the folder Override Save/Export write into), overrideOpen?: true (skip document.open / file.open steps: the batch opens each source file), overrideSave?: true (point document.save / file.save / file.saveAs at destinationFolder/{stem}.{ext}), overrideExport?: true (point document.export / document.exportForScreens / document.exportSelection the same way), stopOnError?: true, label?} play the commands on every readable file in folder (and its subfolders when includeSubdirs), or on every data set of the open document (source: datasets; File + Data Set Name for Override Save/Export). Caps: 500 files or data sets, 8 folder levels, 256 steps. Batches cannot nest. → {processed: [{path|dataset, result|error}…], count, failed, stopped}",
+            "{commands: [{command, params}] (the action's steps), source?: folder (default) | datasets, folder? (required for folder: the source folder), includeSubdirs?: false, destination?: none (default: leave each file open) | saveAndClose (save over the source and close) | folder (save or export into destinationFolder and close), destinationFolder? (required when destination is folder; also the folder Override Save/Export write into), overrideOpen?: true (skip document.open / file.open steps: the batch opens each source file), overrideSave?: true (point document.save / file.save / file.saveAs at destinationFolder/{stem}.{ext}), overrideExport?: true (point document.export / document.exportForScreens / document.exportSelection the same way), stopOnError?: true, label?} play the commands on every readable file in folder (and its subfolders when includeSubdirs), or on every data set of the open document (source: datasets; File + Data Set Name for the folder destination and Override Save/Export, with `/`, `\\`, `:`, `<`, `>`, `\"`, `|`, `?`, `*` and control characters in the data set's name as `-`, and `-2`, `-3`… added to a name already used). Caps: 500 files or data sets, 8 folder levels, 256 steps. Batches cannot nest. → {processed: [{path|dataset, result|error}…], count, failed, stopped}",
             always,
             action_batch::action_batch
         ),
@@ -195,7 +201,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "File Formats",
             [],
             None,
-            "{} → {formats: [{id, label, extensions, mime, read, write, raster, options: {name: {type, default, description}}}], readable: [id…], writable: [id…], openExtensions: [ext…], unsupported: [{id, label, extensions, hint}] (formats asked for that can be neither opened nor written, such as DWG and PICT, with what to use instead)}",
+            "{} → {formats: [{id, label, extensions, mime, read, write, raster, options: {name: {type, default, description}}, plugin?: the id of the exporter plug-in that adds the format (its id is plugin.<plug-in id>; see plugin.list)}], readable: [id…], writable: [id…], openExtensions: [ext…], unsupported: [{id, label, extensions, hint}] (formats asked for that can be neither opened nor written, such as DWG and PICT, with what to use instead)}",
             always,
             formats
         ),
@@ -204,7 +210,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "PDF Info",
             [],
             None,
-            "{path | name? | dataBase64 (a file's path, or its bytes), password?, thumbnail?: page (1-based), thumbnailSize?: 160 (px, longest side), cropTo?: crop (the thumbnail's box)} → {pages, needsPassword, wrongPassword?, pageInfo: [{width, height (pt, as shown), rotation, boxes: {media, crop, bleed, trim, art: [x0, y0, x1, y1] (PDF space, pt)}}], thumbnail?: PNG dataBase64}; a page whose UserUnit (PDF 1.6) is above 1 gives its size and boxes in pt, its numbers times the UserUnit (one above 75,000 counts as 75,000); an encrypted PDF without its password → {pages: 0, needsPassword: true}",
+            "{path | name? | dataBase64 (a file's path, or its bytes), password?, thumbnail?: page (1-based), thumbnailSize?: 160 (px, longest side), cropTo?: crop (the thumbnail's box)} → {pages, needsPassword, wrongPassword?, pageInfo: [{width, height (pt, as shown), rotation, boxes: {media, crop, bleed, trim, art: [x0, y0, x1, y1] (PDF space, pt)}}], thumbnail?: PNG dataBase64}; a page whose UserUnit (PDF 1.6) is above 1 gives its size and boxes in pt, its numbers times the UserUnit (one above 75,000 counts as 75,000); an encrypted PDF without its password → {pages: 0, needsPassword: true}; a PostScript file (an EPS, a .ps file, a .ai in PostScript form) → {pages: 1, needsPassword: false, pageInfo: [{width, height (its bounding box, a US Letter page without one), rotation: 0, boxes: {}}]} (password and cropTo don't apply; thumbnail: 1 shows what the page prints)",
             always,
             pdfimport::pdf_info
         ),
@@ -213,7 +219,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Save for Office Documents…",
             ["File"],
             None,
-            "{path?, ppi?: 150 (72, 150, 300… pixels per inch), transparent?: false (else on white), artboard?: 0, acknowledgeLoss?: bool (write over the file the document was read from although reading it left things out)} the artboard as a PNG for office documents and slides → {path, bytes, width, height} (pixels); no path → {dataBase64, bytes, width, height}",
+            "{path?, ppi?: 150 (72, 150, 300… pixels per inch), transparent?: false (else on white), artboard?: 0, acknowledgeLoss?: bool (write over the file the document was read from although reading it left things out)} the artboard as a PNG for office documents and slides → {path, bytes, width, height, warnings} (pixels); no path → {dataBase64, bytes, width, height, warnings}; warnings as for document.export (an image that couldn't be decoded, type in the fallback font or that doesn't fit its frame)",
             has_doc,
             export::export_for_office
         ),
@@ -311,6 +317,12 @@ const USE_ARTBOARDS: FormatOption = FormatOption {
     default: "null",
     description: "true: every chosen artboard (default all), one file each named <file>-<artboard>.<ext> (PDF and AI: one page each); false: the bounds of the visible art",
 };
+const RECT: FormatOption = FormatOption {
+    name: "rect",
+    ty: "array",
+    default: "null",
+    description: "[x, y, width, height] in document points, y down: exports that area of the page (no artboard needed, the document is not changed); not with artboard, artboards, range or useArtboards",
+};
 const PPI: FormatOption = FormatOption {
     name: "ppi",
     ty: "number",
@@ -348,7 +360,7 @@ const EMBED_ICC: FormatOption = FormatOption {
     name: "embedIcc",
     ty: "boolean",
     default: "true",
-    description: "embed the colour profile: sRGB (RGB), the working CMYK space (CMYK) or gray with sRGB's tone curve",
+    description: "embed the colour profile: sRGB (RGB), the working CMYK space (CMYK) or gray with sRGB's tone curve; PNG: mark the file as sRGB (an sRGB chunk)",
 };
 const IMAGE_MAP: FormatOption = FormatOption {
     name: "imageMap",
@@ -398,6 +410,7 @@ const PALETTE_OPTIONS: &[FormatOption] = &[
     ARTBOARDS,
     RANGE,
     USE_ARTBOARDS,
+    RECT,
     PPI,
     SCALE,
     BACKGROUND,
@@ -419,7 +432,7 @@ const BYTE_ORDER: FormatOption = FormatOption {
     description: "the order of the bytes in the file's numbers: little (II, as on PCs) or big (MM)",
 };
 const TIFF_OPTIONS: &[FormatOption] =
-    &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, PPI, SCALE, BACKGROUND, ANTI_ALIAS, COLOR_MODEL, LZW, BYTE_ORDER, EMBED_ICC];
+    &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, RECT, PPI, SCALE, BACKGROUND, ANTI_ALIAS, COLOR_MODEL, LZW, BYTE_ORDER, EMBED_ICC];
 const BMP_COLOR_MODEL: FormatOption =
     FormatOption { name: "colorModel", ty: "string", default: "\"rgb\"", description: "rgb or gray (greys at every depth)" };
 const BMP_DEPTH: FormatOption = FormatOption {
@@ -447,6 +460,7 @@ const BMP_OPTIONS: &[FormatOption] = &[
     ARTBOARDS,
     RANGE,
     USE_ARTBOARDS,
+    RECT,
     PPI,
     SCALE,
     BACKGROUND,
@@ -466,7 +480,7 @@ const TGA_DEPTH: FormatOption = FormatOption {
     default: "24",
     description: "bits per pixel: 16 (one-bit alpha), 24 (flattened on white) or 32 (keeps transparency)",
 };
-const TGA_OPTIONS: &[FormatOption] = &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, PPI, SCALE, BACKGROUND, ANTI_ALIAS, TGA_DEPTH];
+const TGA_OPTIONS: &[FormatOption] = &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, RECT, PPI, SCALE, BACKGROUND, ANTI_ALIAS, TGA_DEPTH];
 const PSD_LAYERS: FormatOption = FormatOption {
     name: "layers",
     ty: "boolean",
@@ -490,6 +504,7 @@ const PSD_OPTIONS: &[FormatOption] = &[
     ARTBOARDS,
     RANGE,
     USE_ARTBOARDS,
+    RECT,
     PPI,
     SCALE,
     BACKGROUND,
@@ -560,7 +575,7 @@ pub const FORMATS: &[Format] = &[
         read: true,
         write: true,
         raster: true,
-        options: &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, PPI, SCALE, BACKGROUND, ANTI_ALIAS, INTERLACED],
+        options: &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, RECT, PPI, SCALE, BACKGROUND, ANTI_ALIAS, INTERLACED, EMBED_ICC],
     },
     Format {
         id: "jpg",
@@ -575,6 +590,7 @@ pub const FORMATS: &[Format] = &[
             ARTBOARDS,
             RANGE,
             USE_ARTBOARDS,
+            RECT,
             PPI,
             SCALE,
             BACKGROUND,
@@ -596,7 +612,7 @@ pub const FORMATS: &[Format] = &[
         read: true,
         write: true,
         raster: true,
-        options: &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, PPI, SCALE, BACKGROUND, ANTI_ALIAS, LOSSLESS, WEBP_QUALITY],
+        options: &[ARTBOARD, ARTBOARDS, RANGE, USE_ARTBOARDS, RECT, PPI, SCALE, BACKGROUND, ANTI_ALIAS, LOSSLESS, WEBP_QUALITY],
     },
     Format {
         id: "tiff",
@@ -625,7 +641,7 @@ pub const FORMATS: &[Format] = &[
     Format {
         id: "eps",
         label: "EPS",
-        extensions: &["eps"],
+        extensions: &["eps", "epsf"],
         mime: "application/postscript",
         read: true,
         write: true,
@@ -634,13 +650,24 @@ pub const FORMATS: &[Format] = &[
     },
     Format { id: "emf", label: "EMF", extensions: &["emf"], mime: "image/emf", read: true, write: true, raster: false, options: metafile::OPTIONS },
     Format { id: "wmf", label: "WMF", extensions: &["wmf"], mime: "image/wmf", read: true, write: true, raster: false, options: metafile::OPTIONS },
-    Format { id: "tga", label: "Targa", extensions: &["tga"], mime: "image/x-tga", read: false, write: true, raster: true, options: TGA_OPTIONS },
+    Format {
+        id: "tga",
+        label: "Targa",
+        extensions: &["tga", "vda", "icb", "vst"],
+        mime: "image/x-tga",
+        read: true,
+        write: true,
+        raster: true,
+        options: TGA_OPTIONS,
+    },
     Format { id: "psd", label: "PSD", extensions: &["psd"], mime: "image/x-psd", read: true, write: true, raster: true, options: PSD_OPTIONS },
     // Affinity Photo's `.afphoto` opens by its content but isn't listed: Finder shouldn't offer a
     // vector app for a raster editor's documents.
-    reader("affinity", "Affinity", &["af", "afdesign", "afpub"], "application/vnd.affinity", false),
+    reader("affinity", "Affinity", &["af", "afdesign", "afpub"], "application/x-affinity", false),
     // Photoshop's large document format: read like a PSD (its merged image), never written.
     reader("psb", "PSB", &["psb"], "image/x-psb", true),
+    // PostScript programs, read as EPS files are; Print to PostScript writes them, exports don't.
+    reader("ps", "PostScript", &["ps"], "application/postscript", false),
 ];
 
 /// Every extension `document.open` reads (the "All readable files" filter of open dialogs).
@@ -660,6 +687,10 @@ pub const OPEN_EXTS: &[&str] = &[
     "tif",
     "tiff",
     "bmp",
+    "tga",
+    "vda",
+    "icb",
+    "vst",
     "psd",
     "psb",
     "vctemplate",
@@ -667,21 +698,26 @@ pub const OPEN_EXTS: &[&str] = &[
     "emf",
     "wmf",
     "eps",
+    "epsf",
+    "ps",
     "af",
     "afdesign",
     "afpub",
 ];
 
-/// Extensions in [`OPEN_EXTS`] the desktop packaging doesn't associate with VectorCraft: Photoshop
-/// documents belong to raster editors, so Finder and file managers don't offer a vector app for
-/// them (File › Open and Place still read them).
-pub const UNASSOCIATED_EXTS: &[&str] = &["psd", "psb"];
+/// Extensions in [`OPEN_EXTS`] the packaging declares no type for: Photoshop documents belong to
+/// raster editors, so Finder and file managers don't offer a vector app for them, and there is no
+/// `.epsf`, `.ps` or Targa type (File › Open and Place still read them all). On Linux the desktop
+/// entry's EPS type (shared-mime-info's) also covers `.epsf`, so file managers offer VectorCraft
+/// for it.
+pub const UNASSOCIATED_EXTS: &[&str] = &["psd", "psb", "epsf", "ps", "tga", "vda", "icb", "vst"];
 
 /// The extension that picks each writable format when exporting (the format's first; PNG-8 shares
 /// `.png` with PNG, so `.png` comes once), in [`FORMATS`] order.
 pub fn export_extensions() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = Vec::new();
-    for e in FORMATS.iter().filter(|f| f.write).filter_map(|f| f.extensions.first()) {
+    let added = plugin_formats();
+    for e in FORMATS.iter().chain(added.iter().copied()).filter(|f| f.write).filter_map(|f| f.extensions.first()) {
         if !v.contains(e) {
             v.push(e);
         }
@@ -692,7 +728,14 @@ pub fn export_extensions() -> Vec<&'static str> {
 /// Text files: File → Place sets them as area type (Text Import Options).
 pub const TEXT_EXTS: &[&str] = &["txt"];
 
-/// Every extension File → Place reads: [`OPEN_EXTS`] and [`TEXT_EXTS`].
+/// RTF files: File → Place sets them as area type with their formatting.
+pub const RTF_EXTS: &[&str] = &["rtf"];
+
+/// Word documents: File → Place sets them as area type with their formatting.
+pub const DOCX_EXTS: &[&str] = &["docx"];
+
+/// Every extension File → Place reads: [`OPEN_EXTS`], [`TEXT_EXTS`], [`RTF_EXTS`] and
+/// [`DOCX_EXTS`].
 pub const PLACE_EXTS: &[&str] = &[
     "vectorcraft",
     "drawcraft",
@@ -709,6 +752,10 @@ pub const PLACE_EXTS: &[&str] = &[
     "tif",
     "tiff",
     "bmp",
+    "tga",
+    "vda",
+    "icb",
+    "vst",
     "psd",
     "psb",
     "vctemplate",
@@ -716,10 +763,14 @@ pub const PLACE_EXTS: &[&str] = &[
     "emf",
     "wmf",
     "eps",
+    "epsf",
+    "ps",
     "af",
     "afdesign",
     "afpub",
     "txt",
+    "rtf",
+    "docx",
 ];
 
 /// One dialog filter per readable format.
@@ -743,17 +794,68 @@ pub fn open_filters() -> impl Iterator<Item = (&'static str, &'static [&'static 
         .chain(std::iter::once(("Plug-ins", super::plugin::EXTS)))
 }
 
-/// File → Place dialog filters: "All placeable files", then one per placeable format, then text.
+/// Open-dialog filters for Swatch Libraries and Graphic Style Libraries Other Library… and Locate
+/// Library…. The library formats come first so Linux file portals (which grey out files that don't
+/// match the default filter) still list `.ase` and the other library extensions; then the same
+/// filters as [`open_filters`] so a document can be picked for its swatches or graphic styles.
+pub fn library_open_filters(
+    library_label: &'static str,
+    library_exts: &'static [&'static str],
+) -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
+    std::iter::once((library_label, library_exts)).chain(open_filters())
+}
+
+/// File → Place dialog filters: "All placeable files", then one per placeable format, then text,
+/// RTF and Word.
 pub fn place_filters() -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
     std::iter::once(("All placeable files", PLACE_EXTS))
         .chain(format_filters().filter(|(_, exts)| exts.iter().all(|ext| PLACE_EXTS.contains(ext))))
         .chain(std::iter::once(("Text", TEXT_EXTS)))
+        .chain(std::iter::once(("RTF", RTF_EXTS)))
+        .chain(std::iter::once(("Word", DOCX_EXTS)))
 }
 
-/// A format by id or extension (any case, leading dot allowed; `jpeg` finds `jpg`).
+/// A format by id or extension (any case, leading dot allowed; `jpeg` finds `jpg`): a built-in
+/// one, else one an exporter plug-in adds ([`plugin_formats`]). A built-in format keeps its
+/// extension, so an exporter that lists it too is found by its format id.
 pub fn format(id_or_ext: &str) -> Option<&'static Format> {
     let k = id_or_ext.trim_start_matches('.').to_ascii_lowercase();
-    FORMATS.iter().find(|f| f.id == k).or_else(|| FORMATS.iter().find(|f| f.extensions.contains(&k.as_str())))
+    FORMATS.iter().find(|f| f.id == k).or_else(|| FORMATS.iter().find(|f| f.extensions.contains(&k.as_str()))).or_else(|| {
+        let added = plugin_formats();
+        added.iter().find(|f| f.id.eq_ignore_ascii_case(&k)).or_else(|| added.iter().find(|f| f.extensions.contains(&k.as_str()))).copied()
+    })
+}
+
+/// The formats the installed exporter plug-ins add ([`vectorcraft_plugins::export`]), by plug-in
+/// id: write only, with the plug-in's name as the label and its extensions. Each is made once for
+/// each installation of its plug-in, its strings interned, so formats live as long as the catalogues
+/// that hold them.
+pub fn plugin_formats() -> Vec<&'static Format> {
+    use vectorcraft_plugins::{export, registry};
+    static MADE: std::sync::Mutex<Vec<(u64, &'static Format)>> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    export::installed()
+        .iter()
+        .map(|p| {
+            if let Some((_, f)) = made.iter().find(|(serial, _)| *serial == p.serial()) {
+                return *f;
+            }
+            let m = p.manifest();
+            let extensions: Vec<&'static str> = m.extensions.iter().map(|e| registry::intern(e)).collect();
+            let f: &'static Format = Box::leak(Box::new(Format {
+                id: registry::intern(&export::format_id(&m.id)),
+                label: registry::intern(&m.name),
+                extensions: Box::leak(extensions.into_boxed_slice()),
+                mime: "application/octet-stream",
+                read: false,
+                write: true,
+                raster: false,
+                options: &[],
+            }));
+            made.push((p.serial(), f));
+            f
+        })
+        .collect()
 }
 
 /// The lower-case extension of a file name or path (empty when it has none).
@@ -770,9 +872,12 @@ pub fn file_stem(name: &str) -> String {
 /// document that only has the Untitled-N name New gave it is titled after its file, as its tab is
 /// (the title PDF, PNG and SVG metadata carry). A title of its own stays, and native files keep
 /// the stored title.
+pub fn has_own_title(doc: &vectorcraft_doc::Document) -> bool {
+    !doc.title.trim().is_empty() && !doc.title.strip_prefix("Untitled-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn titled_for_export(doc: &vectorcraft_doc::Document, path: Option<&str>, format: &str) -> Option<vectorcraft_doc::Document> {
-    let untitled = doc.title.strip_prefix("Untitled-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    let path = path.filter(|_| untitled && !matches!(format, "vectorcraft" | "template" | "ai"))?;
+    let path = path.filter(|_| !has_own_title(doc) && !matches!(format, "vectorcraft" | "template" | "ai"))?;
     let mut d = doc.clone();
     d.title = file_stem(path);
     Some(d)
@@ -783,7 +888,8 @@ pub fn format_for_name(name: &str) -> Option<&'static Format> {
     Some(extension(name)).filter(|e| !e.is_empty()).and_then(|e| format(&e))
 }
 
-/// The format to write: `format` (an id or extension), else the path's extension, else PNG.
+/// The format to write: `format` (an id or extension), else the path's extension, else PNG. For a
+/// `.ait` template it returns an error that names `file.saveAsTemplate`, which writes it.
 pub fn writable_format(format_param: Option<&str>, path: Option<&str>) -> std::result::Result<&'static Format, String> {
     // Formats that can't be written say what to use instead.
     let unknown = |what: String, key: &str| unsupported(key).map_or(what, |u| u.hint.to_string());
@@ -792,7 +898,13 @@ pub fn writable_format(format_param: Option<&str>, path: Option<&str>) -> std::r
         (None, Some(e)) => format(&e).ok_or_else(|| unknown(format!("unknown extension `.{e}`: pass `format` (see document.formats)"), &e))?,
         (None, None) => format("png").ok_or("no PNG encoder")?,
     };
-    if f.write { Ok(f) } else { Err(format!("{} files can be opened but not written (see document.formats)", f.label)) }
+    if f.write {
+        Ok(f)
+    } else if TEMPLATE_FORMATS.contains(&f.id) {
+        Err(format!("{} files are written by file.saveAsTemplate", f.label))
+    } else {
+        Err(format!("{} files can be opened but not written (see document.formats)", f.label))
+    }
 }
 
 /// [`writable_format`] for command `cmd`.
@@ -801,9 +913,18 @@ fn writable(cmd: &str, format_param: Option<&str>, path: Option<&str>) -> Result
 }
 
 fn formats(_: &mut Session, _: &Value) -> Result<Value> {
-    let ids = |pick: fn(&Format) -> bool| FORMATS.iter().filter(|f| pick(f)).map(|f| f.id).collect::<Vec<_>>();
+    let added = plugin_formats();
+    let all = || FORMATS.iter().chain(added.iter().copied());
+    let ids = |pick: fn(&Format) -> bool| all().filter(|f| pick(f)).map(|f| f.id).collect::<Vec<_>>();
+    let listed = |f: &Format| {
+        let mut v = f.to_json();
+        if let Some(id) = vectorcraft_plugins::export::plugin_id(f.id) {
+            v["plugin"] = json!(id);
+        }
+        v
+    };
     Ok(json!({
-        "formats": FORMATS.iter().map(Format::to_json).collect::<Vec<_>>(),
+        "formats": all().map(listed).collect::<Vec<_>>(),
         "readable": ids(|f| f.read),
         "writable": ids(|f| f.write),
         "openExtensions": OPEN_EXTS,
@@ -820,7 +941,34 @@ fn formats(_: &mut Session, _: &Value) -> Result<Value> {
 /// `path` checked for reading against the automation roots in force.
 #[cfg(not(target_arch = "wasm32"))]
 fn may_read(path: &str) -> Result<()> {
+    #[cfg(test)]
+    touch(path);
     crate::file_access::check_read(path).map_err(EngineError::Other)
+}
+
+/// Paths read while [`touched`] runs, on any thread (the SVG importer reads on one of its own).
+#[cfg(test)]
+static TOUCHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static RECORDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn touch(path: &str) {
+    if RECORDING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        TOUCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_string());
+    }
+}
+
+/// Run `f` and list the paths read through this module meanwhile (by any test running then).
+#[cfg(test)]
+pub(crate) fn touched<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let start = TOUCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len();
+    RECORDING.fetch_add(1, SeqCst);
+    let out = f();
+    RECORDING.fetch_sub(1, SeqCst);
+    let seen = TOUCHED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(start..).unwrap_or_default().to_vec();
+    (out, seen)
 }
 
 /// `path` checked for writing against the automation roots in force.
@@ -832,6 +980,10 @@ fn may_write(path: &str) -> Result<()> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_file(path: &str) -> Result<Vec<u8>> {
     may_read(path)?;
+    // A device or pipe may never end: only a regular file is read to its end.
+    if !std::fs::metadata(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?.is_file() {
+        return Err(EngineError::Other(format!("{path}: not a file")));
+    }
     std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
 
@@ -851,6 +1003,8 @@ pub(crate) fn read_file_head(path: &str, max: usize) -> Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
+    // Work that stops early for a cancel can leave a truncated result: none of it is written.
+    vectorcraft_doc::cancel::check()?;
     may_write(path)?;
     // Never a half-written file: see [`write_atomic`].
     write_atomic(std::path::Path::new(path), bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))
@@ -859,6 +1013,7 @@ pub(crate) fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
 /// [`write_file`] with what `fill` writes into the file (a save streamed into it).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_file_with(path: &str, fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>) -> Result<()> {
+    vectorcraft_doc::cancel::check()?;
     may_write(path)?;
     vectorcraft_format::write_atomic_with(std::path::Path::new(path), |f| fill(f)).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
@@ -977,8 +1132,7 @@ fn list_dir(_: &str, _: usize) -> Result<(Vec<Value>, bool)> {
 /// keeps one); `None` when there is no file at `path` (or automation may not read it).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn file_stamp(path: &str) -> Option<(u64, Option<u64>)> {
-    may_read(path).ok()?;
-    let m = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
+    let m = file_metadata(path).filter(std::fs::Metadata::is_file)?;
     let modified = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64);
     Some((m.len(), modified))
 }
@@ -987,9 +1141,15 @@ pub(crate) fn file_stamp(path: &str) -> Option<(u64, Option<u64>)> {
 /// (and automation may read it).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn file_created(path: &str) -> Option<u64> {
-    may_read(path).ok()?;
-    let t = std::fs::metadata(path).ok()?.created().ok()?;
+    let t = file_metadata(path)?.created().ok()?;
     t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+}
+
+/// The file system's metadata of `path`, following links (when automation may read it).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn file_metadata(path: &str) -> Option<std::fs::Metadata> {
+    may_read(path).ok()?;
+    std::fs::metadata(path).ok()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1005,6 +1165,142 @@ pub(crate) fn absolute_path(path: &str) -> String {
         return path.to_string();
     }
     std::path::absolute(path).map_or_else(|_| path.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
+/// The file to open for `stored`, a path or `file:` URL stored in a document (a linked file, an
+/// SVG image's href), or why it is not followed. `document` is the path of the document it is
+/// stored in, when it has one: a relative path is taken from its folder. Only files on this
+/// computer, or on the network share the document is on, are followed (see `craft_docpath`); a
+/// path that is still relative (no document) is refused, as the working directory isn't the
+/// document's choice. On Windows, a document on a mapped drive is on the share behind the drive
+/// ([`share_path`]): a path refused as on another computer is checked again against the
+/// document's path on that share. A path on a drive mapped to a network share other than the
+/// document's ([`drive_share_path`]) is refused as on another computer. Every stored path
+/// reaches the file system through this.
+pub(crate) fn document_path(stored: &str, document: Option<&str>) -> std::result::Result<String, craft_docpath::Refused> {
+    document_path_on(stored, document, share_path, drive_share_path)
+}
+
+/// [`document_path`], with `share` giving a document's path on the network share behind its drive.
+pub(crate) fn document_path_with(
+    stored: &str,
+    document: Option<&str>,
+    share: impl FnOnce(&str) -> Option<String>,
+) -> std::result::Result<String, craft_docpath::Refused> {
+    use craft_docpath::Refused;
+    let document = document.map(absolute_path);
+    let resolve = |document: Option<&str>| craft_docpath::resolve_absolute(stored, document.map(std::path::Path::new));
+    let path = match resolve(document.as_deref()) {
+        Err(Refused::Network) => {
+            let share = document.as_deref().and_then(share).ok_or(Refused::Network)?;
+            resolve(Some(share.as_str()))?
+        }
+        path => path?,
+    };
+    path.into_os_string().into_string().map_err(|_| Refused::Invalid)
+}
+
+/// [`document_path_with`], also refusing a path on a drive that is mapped to a network share other
+/// than the document's (or, for a document on this computer or without a path, to any share) as
+/// [`craft_docpath::Refused::Network`]. `drive_share` gives a path's path on the share behind its
+/// drive (`Y:\art\x.png` on `\\server\other\art\x.png`), or `None` for a path on this computer. A
+/// path on the document's own drive is not looked up. A document written `\\?\Z:\…` is looked up
+/// on its share as `Z:\…` is.
+pub(crate) fn document_path_on(
+    stored: &str,
+    document: Option<&str>,
+    share: impl Fn(&str) -> Option<String>,
+    drive_share: impl FnOnce(&str) -> Option<String>,
+) -> std::result::Result<String, craft_docpath::Refused> {
+    let share = |d: &str| share(d.strip_prefix(r"\\?\").filter(|d| drive_letter(d).is_some()).unwrap_or(d));
+    let path = document_path_with(stored, document, share)?;
+    let document = document.map(absolute_path);
+    let Some(drive) = drive_letter(&path) else { return Ok(path) };
+    if document.as_deref().and_then(drive_letter).is_some_and(|d| d.eq_ignore_ascii_case(&drive)) {
+        return Ok(path);
+    }
+    let Some(on_share) = drive_share(&path) else { return Ok(path) };
+    let home = document.map(|d| share(&d).unwrap_or(d));
+    craft_docpath::resolve(&on_share, home.as_deref().map(std::path::Path::new))?;
+    Ok(path)
+}
+
+/// The drive letter of an absolute path on a drive (`C:\…`, `C:/…` or `\\?\C:\…`).
+fn drive_letter(path: &str) -> Option<char> {
+    let mut chars = path.strip_prefix(r"\\?\").unwrap_or(path).chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(l), Some(':'), Some('\\' | '/')) if l.is_ascii_alphabetic() => Some(l),
+        _ => None,
+    }
+}
+
+/// The path of `path` (on a drive, `Y:\art\x.png`) on the network share the drive is mapped to
+/// (`\\server\other\art\x.png`), when the drive's root folder is on one and automation may read
+/// `path`. The root folder's final path ([`std::fs::canonicalize`]) names the share.
+#[cfg(windows)]
+pub(crate) fn drive_share_path(path: &str) -> Option<String> {
+    may_read(path).ok()?;
+    drive_share_of(path, |root| std::fs::canonicalize(root).ok())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn drive_share_path(_: &str) -> Option<String> {
+    None
+}
+
+/// The path of `path` on the network share its drive is mapped to, given `final_path`, which
+/// returns the final path of the drive's root folder (`Y:\`): as [`share_of`] gives it for a
+/// document, also for a path written `\\?\Y:\…`.
+#[cfg(any(windows, test))]
+pub(crate) fn drive_share_of(path: &str, final_path: impl FnOnce(&str) -> Option<std::path::PathBuf>) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    share_of(path, |folder| {
+        let (root, rest) = (folder.get(..3)?, folder.get(3..)?);
+        let root = final_path(root)?;
+        let root = root.to_str()?.trim_end_matches('\\');
+        Some(if rest.is_empty() { root.into() } else { format!(r"{root}\{rest}").into() })
+    })
+}
+
+/// The path of `document` (on a drive, `Z:\jobs\doc.vectorcraft`) on the network share the drive is
+/// mapped to (`\\server\share\jobs\doc.vectorcraft`), when its folder is on one and automation may
+/// read the folder. The folder's final path ([`std::fs::canonicalize`]) names the share as
+/// `\\?\UNC\server\share\…`.
+#[cfg(windows)]
+pub(crate) fn share_path(document: &str) -> Option<String> {
+    share_of(document, |folder| {
+        may_read(folder).ok()?;
+        std::fs::canonicalize(folder).ok()
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn share_path(_: &str) -> Option<String> {
+    None
+}
+
+/// The path of `document` on the network share its drive is mapped to, given `final_path`, which
+/// returns the final path of a folder: `None` when `document` is not on a drive (`C:\` or `C:/`)
+/// or `final_path` gives no share (`\\?\UNC\server\share\…`), such as a folder on a local volume.
+#[cfg(any(windows, test))]
+pub(crate) fn share_of(document: &str, final_path: impl FnOnce(&str) -> Option<std::path::PathBuf>) -> Option<String> {
+    let mut chars = document.chars();
+    if !matches!((chars.next(), chars.next(), chars.next()), (Some(l), Some(':'), Some('\\' | '/')) if l.is_ascii_alphabetic()) {
+        return None;
+    }
+    // The drive's root folder keeps its separator (`Z:\`).
+    let split = document.rfind(['\\', '/'])?;
+    let (folder, name) = (document.get(..split.max(3))?, document.get(split + 1..)?);
+    if name.is_empty() {
+        return None;
+    }
+    let target = final_path(folder)?;
+    let target = target.to_str()?;
+    let unc = target.get(..8).filter(|p| p.eq_ignore_ascii_case(r"\\?\UNC\")).and(target.get(8..))?.trim_end_matches('\\');
+    if unc.split('\\').filter(|c| !c.is_empty()).count() < 2 {
+        return None;
+    }
+    Some(format!(r"\\{unc}\{name}"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1063,20 +1359,26 @@ pub fn artboard_file_names(doc: &vectorcraft_doc::Document, boards: &[usize]) ->
 /// characters as `-`, the fallback when it is empty, and `-2`, `-3`… after a name already used
 /// (compared without case).
 pub(crate) fn unique_file_names<'a>(names: impl IntoIterator<Item = (&'a str, String)>) -> Vec<String> {
+    distinct_names(names.into_iter().map(|(name, fallback)| {
+        let base: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+        if base.is_empty() { fallback } else { base }
+    }))
+}
+
+/// `names` with `-2`, `-3`… after a name already used (compared without case).
+fn distinct_names(names: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut taken = std::collections::HashSet::new();
+    // The next number to try for each base: a name repeated many times doesn't search the numbers
+    // taken before it.
+    let mut next: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     names
         .into_iter()
-        .map(|(name, fallback)| {
-            let mut base: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
-            if base.is_empty() {
-                base = fallback;
-            }
+        .map(|base| {
             let mut name = base.clone();
-            for i in 2.. {
-                if taken.insert(name.to_lowercase()) {
-                    break;
-                }
-                name = format!("{base}-{i}");
+            while !taken.insert(name.to_lowercase()) {
+                let n = next.entry(base.to_lowercase()).or_insert(1);
+                *n += 1;
+                name = format!("{base}-{n}");
             }
             name
         })

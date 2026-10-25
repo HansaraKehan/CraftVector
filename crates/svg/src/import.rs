@@ -8,8 +8,8 @@ use std::sync::Arc;
 use usvg::roxmltree;
 use vectorcraft_color::{BlendMode, Color, Gradient, GradientGeom, GradientKind, GradientPaint, GradientStop, Paint};
 use vectorcraft_doc::{
-    Appearance, AppearanceItem, Dash, Document, FillLayer, ImageBlob, ImageObject, LayerColor, LineCap, LineJoin, Node, NodeId, NodeKind, PatternDef,
-    StrokeLayer, Unit,
+    Appearance, AppearanceItem, Dash, Document, FillLayer, ForeignAttribute, ImageBlob, ImageObject, LayerColor, LineCap, LineJoin, MAX_SVG_SCRIPTS,
+    Node, NodeId, NodeKind, PatternDef, SVG_EVENTS, StrokeLayer, Unit,
 };
 use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect, Vec2, shapes};
 
@@ -34,22 +34,27 @@ mod vector_effect;
 
 /// The XML of `svg`.
 fn parse(svg: &str) -> Result<roxmltree::Document<'_>, SvgError> {
+    if crate::entities::expansion_too_large(svg) {
+        return Err(SvgError::Parse("the entities the document declares expand to too much text".into()));
+    }
     roxmltree::Document::parse_with_options(svg, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() })
         .map_err(|e| SvgError::Parse(e.to_string()))
 }
 
+/// The document SVG text `svg` holds, read with `opts`, and the warnings about what it couldn't keep.
 pub(crate) fn import(svg: &str, opts: &ImportOptions) -> Result<(Document, Vec<String>), SvgError> {
     // Before anything reads the tree: the XML reader, usvg, and what is made of its tree, all by
     // recursion.
     let too_deep = || SvgError::TooDeep(depth::MAX_ELEMENT_DEPTH);
-    if depth::xml_too_deep(svg) {
+    let scan = depth::prescan(svg);
+    if scan.too_deep {
         return Err(too_deep());
     }
     let xml = parse(svg)?;
-    if depth::too_deep(&xml) {
+    let Some(height) = depth::height(&xml, depth::MAX_ELEMENT_DEPTH) else {
         return Err(too_deep());
-    }
-    let (svg, found) = prepass(svg, &xml, opts);
+    };
+    let (svg, found) = prepass(svg, &scan.markers, &xml, opts);
     // The prepass's edits are in the text: the XML is read again only when it made any.
     let xml = match &svg {
         Cow::Borrowed(_) => xml,
@@ -65,7 +70,7 @@ pub(crate) fn import(svg: &str, opts: &ImportOptions) -> Result<(Document, Vec<S
         let opt = usvg::Options {
             dpi: units.dpi as f32,
             font_size: DEFAULT_FONT_SIZE as f32,
-            image_href_resolver: files.resolver(),
+            image_href_resolver: files.resolver(height),
             ..usvg::Options::default()
         };
         usvg::Tree::from_str(&src, &opt).map_err(|e| SvgError::Parse(e.to_string()))?
@@ -86,16 +91,22 @@ pub(crate) fn import(svg: &str, opts: &ImportOptions) -> Result<(Document, Vec<S
         hidden: found.hidden,
         uses: found.uses,
         symbols: HashMap::new(),
-        blends: fx::blends(&xml),
+        blends: fx::blends(&xml, &scan.markers),
         files,
         non_scaling: found.non_scaling,
         data: found.data,
+        events: found.events,
+        foreign: found.foreign,
         sublayers: found.sublayers,
         sublayer_groups: HashSet::new(),
         screen: k,
     };
+    im.doc.svg_scripts = found.scripts;
     if im.files.nested_text() {
         im.warn("text inside an SVG image isn't imported".into());
+    }
+    for note in im.files.left_out() {
+        im.warn(note);
     }
 
     // usvg wraps everything in an id-less group carrying the viewBox transform when needed.
@@ -166,6 +177,8 @@ pub(crate) fn import(svg: &str, opts: &ImportOptions) -> Result<(Document, Vec<S
             im.add_unclipped(&mut l, 0, std::mem::take(&mut loose));
             l.visible = !im.hidden.contains(g.id());
             im.keep_data(g.id(), &mut l);
+            im.keep_events(g.id(), &mut l);
+            im.keep_foreign(g.id(), &mut l);
             im.doc.layers.push(Arc::new(l));
         }
     } else {
@@ -329,8 +342,12 @@ fn inkscape_pages(xml: &roxmltree::Document, user: Affine) -> Option<Vec<vectorc
             id: i as u32 + 1,
             name: p.attribute((INKSCAPE, "label")).filter(|l| !l.trim().is_empty()).map_or_else(|| format!("Artboard {}", i + 1), str::to_string),
             rect: r,
+            locked: false,
             show_center_mark: false,
             show_cross_hairs: false,
+            show_video_safe_areas: false,
+            video_ruler_pixel_aspect_ratio: 1.0,
+            color: None,
         })
         .collect();
     (!pages.is_empty()).then_some(pages)
@@ -372,6 +389,10 @@ struct Importer {
     non_scaling: HashSet<String>,
     /// The `data-*` attributes of elements, by id ([`user_data`]).
     data: HashMap<String, Vec<(String, String)>>,
+    /// The event attributes of elements, by id ([`user_events`]).
+    events: HashMap<String, Vec<(String, String)>>,
+    /// The attributes of elements in other applications' namespaces, by id ([`foreign`]).
+    foreign: HashMap<String, Vec<ForeignAttribute>>,
     /// Ids of the `<g>` elements marked as layers ([`marked_layer`]).
     sublayers: HashSet<String>,
     /// The groups made of them, made sublayers where they sit in a layer ([`promote_sublayers`]).
@@ -488,6 +509,12 @@ struct Found {
     non_scaling: HashSet<String>,
     /// The `data-*` attributes of elements, by id ([`user_data`]).
     data: HashMap<String, Vec<(String, String)>>,
+    /// The event attributes of elements, by id ([`user_events`]).
+    events: HashMap<String, Vec<(String, String)>>,
+    /// The attributes of elements in other applications' namespaces, by id ([`foreign`]).
+    foreign: HashMap<String, Vec<ForeignAttribute>>,
+    /// The JavaScript files `<script>` elements link to ([`linked_scripts`]).
+    scripts: Vec<String>,
     /// Ids of the `<g>` elements marked as layers ([`marked_layer`]).
     sublayers: HashSet<String>,
     warnings: Vec<String>,
@@ -574,17 +601,30 @@ impl Edits {
 /// * undisplayed objects (`display: none`, as Save writes hidden layers) are shown and recorded,
 ///   to come back hidden; one something links to (a `<use>` template) stays as it is;
 /// * shapes with a non-scaling stroke get an id when they have none, recorded ([`vector_effect`]);
+/// * objects with event attributes get an id when they have none, recorded with them
+///   ([`user_events`]), and the `<script>` links are recorded ([`linked_scripts`]);
+/// * so do objects with attributes in other applications' namespaces ([`foreign`]);
 /// * linked files are read ([`files`]);
 /// * percentage lengths in a `<symbol>` with a `viewBox` become numbers ([`symbol_units`]);
 /// * what style sheet rules with a `:not()` set goes in `style` attributes ([`not_rules`]).
-fn prepass<'s>(svg: &'s str, xml: &roxmltree::Document, opts: &ImportOptions) -> (Cow<'s, str>, Found) {
+///
+/// Whether each is there at all is read from `markers`: `svg` with its data URLs left out
+/// ([`depth::prescan`]), so an embedded picture isn't searched a dozen times. The edits are made
+/// in `svg` itself.
+fn prepass<'s>(svg: &'s str, markers: &str, xml: &roxmltree::Document, opts: &ImportOptions) -> (Cow<'s, str>, Found) {
     let mut found = Found::default();
     // (`:` for prefixed elements such as `<svg:image>`.)
-    let css_transform = has_css_transform(svg);
-    let not = svg.contains(":not(");
+    let css_transform = has_css_transform(markers);
+    let not = markers.contains(":not(");
+    let events = SVG_EVENTS.iter().any(|e| markers.contains(e));
+    let foreign_attrs = markers.contains("xmlns:") && has_foreign_attributes(xml);
     if !css_transform
         && !not
-        && !["<a", "display", "<use", ":use", "<image", ":image", vector_effect::NON_SCALING, "data-", "groupmode"].iter().any(|t| svg.contains(t))
+        && !events
+        && !foreign_attrs
+        && !["<a", "display", "<use", ":use", "<image", ":image", vector_effect::NON_SCALING, "data-", "groupmode", "script"]
+            .iter()
+            .any(|t| markers.contains(t))
     {
         return (svg.into(), found);
     }
@@ -595,13 +635,32 @@ fn prepass<'s>(svg: &'s str, xml: &roxmltree::Document, opts: &ImportOptions) ->
             found.links.insert(edits.id(svg, a), url.to_string());
         }
     }
-    if svg.contains("data-") {
+    if markers.contains("data-") {
         for e in elements().filter(|e| OBJECT_ELEMENTS.contains(&e.tag_name().name())) {
             let data = user_data(e);
             if !data.is_empty() {
                 found.data.insert(edits.id(svg, e), data);
             }
         }
+    }
+    if foreign_attrs {
+        for e in elements().filter(|e| OBJECT_ELEMENTS.contains(&e.tag_name().name())) {
+            let kept = foreign(e, &mut found.warnings);
+            if !kept.is_empty() {
+                found.foreign.insert(edits.id(svg, e), kept);
+            }
+        }
+    }
+    if events {
+        for e in elements().filter(|e| EVENT_ELEMENTS.contains(&e.tag_name().name())) {
+            let events = user_events(e);
+            if !events.is_empty() {
+                found.events.insert(edits.id(svg, e), events);
+            }
+        }
+    }
+    if markers.contains("script") {
+        found.scripts = linked_scripts(xml, &mut found.warnings);
     }
     found.sublayers = elements().filter(|g| marked_layer(*g)).filter_map(|g| g.attribute("id")).map(str::to_string).collect();
     let symbols: HashSet<&str> = elements().filter(|n| n.tag_name().name() == "symbol").filter_map(|n| n.attribute("id")).collect();
@@ -610,7 +669,7 @@ fn prepass<'s>(svg: &'s str, xml: &roxmltree::Document, opts: &ImportOptions) ->
             found.uses.insert(edits.id(svg, u), sym.to_string());
         }
     }
-    let (display, non_scaling) = (svg.contains("display"), svg.contains(vector_effect::NON_SCALING));
+    let (display, non_scaling) = (markers.contains("display"), markers.contains(vector_effect::NON_SCALING));
     if display || non_scaling || not {
         let css = css::Styles::new(xml);
         // First: an undisplayed object shown for usvg is shown after these.
@@ -625,7 +684,7 @@ fn prepass<'s>(svg: &'s str, xml: &roxmltree::Document, opts: &ImportOptions) ->
         }
     }
     found.files = files::Files::read(svg, xml, opts, &mut edits, &mut found.warnings);
-    if !symbols.is_empty() && svg.contains('%') {
+    if !symbols.is_empty() && markers.contains('%') {
         edits.list.extend(symbol_units::rewrites(xml));
     }
     if css_transform {
@@ -634,9 +693,9 @@ fn prepass<'s>(svg: &'s str, xml: &roxmltree::Document, opts: &ImportOptions) ->
     (edits.apply(svg), found)
 }
 
-/// Is there a `transform` CSS declaration in `svg` (`transform` followed by `:`)?
-fn has_css_transform(svg: &str) -> bool {
-    svg.match_indices("transform").any(|(i, t)| svg.get(i + t.len()..).is_some_and(|s| s.trim_start().starts_with(':')))
+/// Is there a `transform` CSS declaration in `markers` (`transform` followed by `:`)?
+fn has_css_transform(markers: &str) -> bool {
+    markers.match_indices("transform").any(|(i, t)| markers.get(i + t.len()..).is_some_and(|s| s.trim_start().starts_with(':')))
 }
 
 /// usvg's style sheets drop rules with a `:not()` selector (#1557). The properties such rules set
@@ -698,6 +757,102 @@ fn user_data(e: XNode) -> Vec<(String, String)> {
         .take(MAX_DATA)
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+/// The namespaces whose attributes VectorCraft reads, writes or makes again itself: their
+/// attributes aren't kept as another application's ([`foreign`]).
+const OWN_NAMESPACES: &[&str] = &[
+    "http://www.w3.org/2000/svg",
+    "http://www.w3.org/1999/xlink",
+    "http://www.w3.org/XML/1998/namespace",
+    "http://www.w3.org/2000/xmlns/",
+    INKSCAPE,
+    "http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd",
+    crate::EDITING_NS,
+];
+
+/// The most attributes in other applications' namespaces kept per element (the file is untrusted).
+pub const MAX_FOREIGN: usize = 64;
+
+/// The longest value of such an attribute kept, in bytes; a longer one is left out.
+pub const MAX_FOREIGN_VALUE: usize = 64 * 1024;
+
+/// The namespace of attribute `a` when it is another application's ([`OWN_NAMESPACES`] aside).
+fn foreign_ns<'a>(a: &roxmltree::Attribute<'a, '_>) -> Option<&'a str> {
+    a.namespace().filter(|ns| !OWN_NAMESPACES.contains(ns))
+}
+
+/// Does any element of `xml` have an attribute in another application's namespace? Most files
+/// declare only namespaces VectorCraft reads itself (XLink), and skip the scan for them.
+fn has_foreign_attributes(xml: &roxmltree::Document) -> bool {
+    xml.descendants().filter(XNode::is_element).any(|e| e.attributes().any(|a| foreign_ns(&a).is_some()))
+}
+
+/// The attributes of element `e` in other applications' namespaces, in order, with the prefix the
+/// file gives each namespace: `plotter:pen="2"`. Those past [`MAX_FOREIGN`], and values longer
+/// than [`MAX_FOREIGN_VALUE`], are left out with a warning.
+fn foreign(e: XNode, warnings: &mut Vec<String>) -> Vec<ForeignAttribute> {
+    let mut kept = vec![];
+    let mut left_out = false;
+    for a in e.attributes() {
+        let Some(ns) = foreign_ns(&a) else { continue };
+        if kept.len() == MAX_FOREIGN || a.value().len() > MAX_FOREIGN_VALUE {
+            left_out = true;
+            continue;
+        }
+        // A namespaced attribute always has a prefix in the file; `ns` stands in where the only
+        // one found is the default namespace's (export makes it unique).
+        let prefix = e.lookup_prefix(ns).filter(|p| !p.is_empty()).unwrap_or("ns");
+        kept.push(ForeignAttribute { ns: ns.to_string(), prefix: prefix.to_string(), name: a.name().to_string(), value: a.value().to_string() });
+    }
+    if left_out {
+        let w = format!(
+            "other applications' attributes past {MAX_FOREIGN} on an element, or longer than {} KiB, were left out",
+            MAX_FOREIGN_VALUE / 1024
+        );
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
+    kept
+}
+
+/// The elements whose event attributes are kept: the objects, and type.
+const EVENT_ELEMENTS: &[&str] = &["g", "a", "use", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "image", "text"];
+
+/// The event attributes of element `e` that the SVG Interactivity panel lists ([`SVG_EVENTS`]),
+/// in order: the JavaScript is kept as text and never run.
+fn user_events(e: XNode) -> Vec<(String, String)> {
+    e.attributes()
+        .filter(|a| a.namespace().is_none() && SVG_EVENTS.contains(&a.name()))
+        .map(|a| (a.name().to_string(), a.value().to_string()))
+        .collect()
+}
+
+/// The JavaScript files the `<script>` elements link to, in order and each once, at most
+/// [`MAX_SVG_SCRIPTS`] (the file is untrusted): the links are kept as text, and the files are never
+/// read or run. Inline scripts and the links past the limit are left out with a warning.
+fn linked_scripts(xml: &roxmltree::Document, warnings: &mut Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let mut over = false;
+    for s in xml.descendants().filter(|n| n.is_element() && n.tag_name().name() == "script") {
+        match href(s) {
+            Some(h) if out.iter().any(|o| o == h) => {}
+            Some(h) if out.len() < MAX_SVG_SCRIPTS => out.push(h.to_string()),
+            Some(_) => over = true,
+            None if s.text().is_some_and(|t| !t.trim().is_empty()) => {
+                let w = "inline scripts were left out: only linked JavaScript files are kept".to_string();
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+            None => {}
+        }
+    }
+    if over {
+        warnings.push(format!("more than {MAX_SVG_SCRIPTS} JavaScript files are linked: only the first {MAX_SVG_SCRIPTS} were kept"));
+    }
+    out
 }
 
 /// Make `n` link to `url`, unless it links somewhere already (an inner link wins).
@@ -833,6 +988,8 @@ impl Importer {
         g.children().iter().filter_map(|c| self.node(c, acc)).map(Arc::new).collect()
     }
 
+    /// The object usvg node `n` makes under transform `acc`, with what the file kept on its element
+    /// (data, event and other applications' attributes); `None` for what imports as nothing.
     fn node(&mut self, n: &usvg::Node, acc: Affine) -> Option<Node> {
         let mut out = match n {
             usvg::Node::Group(g) => self.group(g, acc),
@@ -845,6 +1002,8 @@ impl Importer {
             out.visible = false;
         }
         self.keep_data(n.id(), &mut out);
+        self.keep_events(n.id(), &mut out);
+        self.keep_foreign(n.id(), &mut out);
         Some(out)
     }
 
@@ -853,6 +1012,22 @@ impl Importer {
     fn keep_data(&self, id: &str, n: &mut Node) {
         if let Some(data) = self.data.get(id).filter(|_| n.extras().attrs.as_ref().is_none_or(|a| a.data.is_empty())) {
             n.edit_attrs(|a| a.data = data.clone());
+        }
+    }
+
+    /// Give `n` the event attributes of element `id`, unless it has events already (what an inner
+    /// element made of it keeps).
+    fn keep_events(&self, id: &str, n: &mut Node) {
+        if let Some(events) = self.events.get(id).filter(|_| n.extras().attrs.as_ref().is_none_or(|a| a.events.is_empty())) {
+            n.edit_attrs(|a| a.events = events.clone());
+        }
+    }
+
+    /// Give `n` the attributes of element `id` in other applications' namespaces, unless it has
+    /// some already (what an inner element made of it keeps).
+    fn keep_foreign(&self, id: &str, n: &mut Node) {
+        if let Some(kept) = self.foreign.get(id).filter(|_| n.extras().attrs.as_ref().is_none_or(|a| a.foreign.is_empty())) {
+            n.edit_attrs(|a| a.foreign = kept.clone());
         }
     }
 
@@ -1058,8 +1233,10 @@ impl Importer {
             }
             // An id-less wrapper around a single object (usvg adds these for opacity/transform on
             // shapes): fold its opacity, blend and effects into the object (unless the object
-            // blends or masks before the effects). A text takes its own mask too.
-            if (is_text || id.is_empty() && mask.is_none())
+            // blends or masks before the effects). A text takes its own mask too. A group with
+            // `data-*` or event attributes of its own stays a group, and keeps them.
+            let own = self.data.contains_key(g.id()) || self.events.contains_key(g.id());
+            if (is_text || id.is_empty() && mask.is_none() && !own)
                 && children.len() == 1
                 && (g.blend_mode() == usvg::BlendMode::Normal || children[0].blend == BlendMode::Normal)
                 && (effects.is_empty() || children[0].blend == BlendMode::Normal && children[0].extras().mask.is_none())
@@ -1245,7 +1422,7 @@ impl Importer {
             }
         }
         Paint::Gradient(Box::new(GradientPaint {
-            gradient: Gradient { kind, stops },
+            gradient: Gradient::new(kind, stops),
             geom: Some(geom),
             angle: geom.angle_deg(),
             swatch: None,
@@ -1338,6 +1515,8 @@ impl Importer {
             return None;
         }
         let (appearance, r) = self.appearance(p, acc, path.bounds());
+        // Shared, so a compound path's subpaths don't each copy a gradient's stops.
+        let appearance: vectorcraft_doc::Shared<Appearance> = appearance.into();
         let mut n = if path.subpaths.len() > 1 {
             // Multi-subpath SVG paths are compound paths (as in Illustrator).
             let children = path
@@ -1346,7 +1525,7 @@ impl Importer {
                 .map(|sp| {
                     let id = self.doc.alloc_id();
                     let mut c = Node::new(id, NodeKind::Path { path: PathData::single(sp), rule: r, live: None, clipping: false, guide: false });
-                    c.appearance = appearance.clone().into();
+                    c.appearance = appearance.clone();
                     Arc::new(c)
                 })
                 .collect();
@@ -1354,7 +1533,7 @@ impl Importer {
         } else {
             self.named(p.id(), NodeKind::Path { path, rule: r, live: None, clipping: false, guide: false })
         };
-        n.appearance = appearance.into();
+        n.appearance = appearance;
         Some(n)
     }
 
@@ -1385,7 +1564,10 @@ impl Importer {
             if link.is_some() && !missing { blob.with_proxy() } else { blob }
         });
         let xf = acc * Affine::scale_non_uniform(size.width() as f64 / pw as f64, size.height() as f64 / ph as f64);
-        Some(self.named(i.id(), NodeKind::Image(Box::new(ImageObject { key, width: pw, height: ph, xf, link, placement: Default::default() }))))
+        Some(self.named(
+            i.id(),
+            NodeKind::Image(Box::new(ImageObject { key, width: pw, height: ph, xf, link, placement: Default::default(), pixels: None })),
+        ))
     }
 
     /// An SVG shown as an image (a data URL or a linked file) → its art, `acc` mapping its size.
@@ -1398,9 +1580,10 @@ impl Importer {
             std::mem::take(&mut self.labels),
             std::mem::take(&mut self.non_scaling),
             std::mem::take(&mut self.data),
+            std::mem::take(&mut self.events),
         );
         let art = self.group_node(tree.root(), acc);
-        (self.links, self.hidden, self.uses, self.labels, self.non_scaling, self.data) = outer;
+        (self.links, self.hidden, self.uses, self.labels, self.non_scaling, self.data, self.events) = outer;
         art
     }
 }

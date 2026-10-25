@@ -213,6 +213,39 @@ fn a_new_selection_clears_the_pins() {
     assert_eq!(p2["pins"], p2["moved"]);
 }
 
+/// Selecting other art while a background save writes the file drops the pins and leaves the
+/// document saved once the file is written; an edit made meanwhile leaves it modified until it is
+/// undone.
+#[test]
+fn a_new_selection_during_a_save_leaves_the_document_saved() {
+    use crate::cmd::fileio::{SaveMode, save_job, save_plan};
+    let mut s = session();
+    let a = rect(&mut s, 100.0, 100.0, 300.0, 60.0);
+    let b = rect(&mut s, 100.0, 300.0, 50.0, 50.0);
+    s.select_tool("puppetWarp", ViewInfo::default()).unwrap();
+    let uid = s.doc().unwrap().uid;
+    for edit in [false, true] {
+        s.execute("select.set", &json!({"ids": [a.0]})).unwrap();
+        click(&mut s, 250.0, 150.0);
+        assert!(s.doc().unwrap().doc.puppet.is_some());
+        let plan = save_plan(&s, SaveMode::SaveAs, &json!({"path": "/x/pins.vectorcraft", "modified": 777})).unwrap();
+        let job = save_job(&mut s, plan).unwrap();
+        s.execute("select.set", &json!({"ids": [b.0]})).unwrap();
+        if edit {
+            s.execute("object.move", &json!({"dx": 10, "dy": 0})).unwrap();
+        }
+        job.write(|_, _| Ok(())).unwrap();
+        job.complete(&mut s, uid);
+        let st = s.doc().unwrap();
+        assert_eq!(st.doc.metadata.modified, Some(777));
+        assert!(st.doc.puppet.is_none(), "the pins stay dropped");
+        assert_eq!(st.is_dirty(), edit, "modified only by the edit");
+    }
+    // Undoing the edit is back at what the file holds.
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
+}
+
 #[test]
 fn puppet_warp_works_on_groups_compound_paths_and_open_strokes() {
     for kind in ["group", "compound", "open"] {

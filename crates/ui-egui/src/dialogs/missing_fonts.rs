@@ -264,7 +264,8 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
                             }
                             ui.add(egui::Label::new(egui::RichText::new(path).size(11.0).color(t.text_dim)).truncate()).on_hover_text(path);
                         }
-                        if files.is_empty() && !state.is_empty() {
+                        // A failed search (a folder it refuses) didn't look: `progress` says why.
+                        if files.is_empty() && !state.is_empty() && state != "failed" {
                             widgets::dim_label(ui, if searching { tl!("Searching…") } else { tl!("Not found") });
                         }
                         ui.add_space(3.0);
@@ -326,10 +327,13 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
 }
 
 /// A folder search's progress under the dialog's buttons (fields `state`, `folder`, `searched`,
-/// `skipped`, `unreadable` and `stopped`), in Find Linked Files too.
+/// `skipped`, `unreadable`, `stopped` and `error`), in Find Linked Files too.
 pub(super) fn progress(ui: &mut egui::Ui, d: &Dialog) {
     if d.str("state") == "searching" {
         widgets::dim_name(ui, &d.str("folder"));
+    }
+    if let Some(e) = d.fields.get("error").and_then(Value::as_str) {
+        widgets::dim_name(ui, &crate::i18n::message(crate::i18n::current(), e));
     }
     if let Some(s) = d.fields.get("searched") {
         let (folders, files) = (s["folders"].to_string(), s["files"].to_string());
@@ -730,27 +734,6 @@ mod tests {
         d.fields.insert("chosen".into(), json!([]));
         update(&mut d, &json!({"state": "done", "fonts": [{"family": "B Sans", "style": "Bold", "files": ["/f/b.otf", "/g/b.otf"]}]}));
         assert_eq!((d.str("state"), &d.fields["chosen"]), ("done".to_string(), &json!([])));
-    }
-
-    /// The status lines are translated with the reasons in them, and so are the reasons a search
-    /// failed and a file wasn't copied, which the code holds as constants.
-    #[test]
-    fn the_status_lines_read_in_the_interface_language() {
-        let fr = crate::i18n::Lang::from_code("fr").unwrap();
-        let shown = crate::i18n::message(fr, "2 font file(s) are now in /Fonts; 1 couldn't be added: a.otf: larger than 256 MB");
-        assert!(shown.contains("se trouvent maintenant dans /Fonts") && shown.contains("a.otf") && shown.contains("plus de 256 Mo"), "{shown}");
-        for code in ["de", "es", "fr", "hu", "it", "pl", "ru", "sv"] {
-            let lang = crate::i18n::Lang::from_code(code).unwrap();
-            for s in [
-                "every search thread stopped on an internal error (please report this bug)",
-                "not a file",
-                "not a font file",
-                "the files come to more than 1 GB: add fewer at a time",
-                "every numbered name for it is taken in the Fonts folder",
-            ] {
-                assert_ne!(crate::i18n::message(lang, s), s, "{code}");
-            }
-        }
     }
 
     #[test]

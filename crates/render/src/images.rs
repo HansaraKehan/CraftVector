@@ -66,11 +66,13 @@ pub(crate) struct ImageKey {
     pub mip: u8,
 }
 
-/// A blob's content key and whether it holds CMYK inks, worked out once per blob allocation.
+/// A blob's content key and whether it holds CMYK inks, worked out once per blob allocation, and
+/// the size of its pixels once they have been decoded ([`remember_size`]).
 #[derive(Clone)]
 pub(crate) struct BlobId {
     pub content: Arc<str>,
     pub cmyk: bool,
+    pub size: Option<(u16, u16)>,
 }
 
 struct Entry {
@@ -114,6 +116,14 @@ impl ImageStore {
         self.entries.get(key).map(|e| e.pm.clone())
     }
 
+    /// Drop `key`'s pixels, as the budget drops the least recently used.
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, key: &ImageKey) {
+        if let Some(e) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(pixmap_bytes(&e.pm));
+        }
+    }
+
     /// Keep `pm` as `key` (or, when another renderer made it meanwhile, return theirs), then drop
     /// entries over budget.
     pub(crate) fn insert(&mut self, key: ImageKey, pm: Arc<Pixmap>) -> Arc<Pixmap> {
@@ -147,6 +157,12 @@ impl ImageStore {
         }
     }
 
+    /// Bytes of the entries someone besides the store holds (images being painted): eviction can't
+    /// free them.
+    pub(crate) fn pinned_bytes(&self) -> usize {
+        self.entries.values().filter(|e| Arc::strong_count(&e.pm) > 1).map(|e| pixmap_bytes(&e.pm)).sum()
+    }
+
     pub(crate) fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
         self.evict();
@@ -166,6 +182,15 @@ impl ImageStore {
             self.ids.retain(|_, (w, _)| w.strong_count() > 0);
         }
         self.ids.insert(Arc::as_ptr(bytes) as usize, (Arc::downgrade(bytes), id));
+    }
+
+    fn remember_size(&mut self, bytes: &Arc<Vec<u8>>, size: (u16, u16)) {
+        let at = Arc::as_ptr(bytes);
+        if let Some((w, id)) = self.ids.get_mut(&(at as usize))
+            && std::ptr::eq(w.as_ptr(), at)
+        {
+            id.size = Some(size);
+        }
     }
 }
 
@@ -193,9 +218,15 @@ pub(crate) fn blob_id(blob: &ImageBlob) -> BlobId {
         return id;
     }
     // Outside the lock: hashing a large image takes a while.
-    let id = BlobId { content: format!("{}:{}", blob.content_key(), blob.bytes.len()).into(), cmyk: blob.is_cmyk() };
+    let id = BlobId { content: format!("{}:{}", blob.content_key(), blob.bytes.len()).into(), cmyk: blob.is_cmyk(), size: None };
     store().remember_id(&blob.bytes, id.clone());
     id
+}
+
+/// Note that `blob`'s pixels are `size`: [`blob_id`] tells it from then on, so that the mips made
+/// of them are found while the store holds the mips but not the pixels.
+pub(crate) fn remember_size(blob: &ImageBlob, size: (u16, u16)) {
+    store().remember_size(&blob.bytes, size);
 }
 
 /// `pm` at half the size (rounded up), each pixel the mean of the 2×2 it covers (the last row and

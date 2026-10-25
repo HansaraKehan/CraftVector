@@ -6,6 +6,7 @@
 
 use egui::{Sense, Ui, vec2};
 use serde_json::{Map, Value, json};
+use vectorcraft_engine::cmd::textstyles;
 
 use super::character::{end_typing, text_editing, text_style};
 use super::{pstate, selection_len, set_pstate};
@@ -54,21 +55,14 @@ fn styles(app: &mut VectorcraftApp, kind: Kind) -> Vec<(String, Map<String, Valu
         .unwrap_or_default()
 }
 
-/// The selection's style name (Normal when none) and its attributes, if text is selected.
+/// The selection's style name (Normal when none) and every one of its attributes, written as a
+/// style holds them, if text is selected.
 fn current(app: &VectorcraftApp, kind: Kind) -> Option<(Option<String>, Map<String, Value>)> {
     let (c, p) = text_style(app)?;
-    let v = match kind {
-        Kind::Char => serde_json::to_value(&c),
-        Kind::Para => serde_json::to_value(&p),
-    }
-    .ok()?;
-    let mut m = v.as_object()?.clone();
-    // A character style can explicitly set Auto, which the run's JSON leaves out.
-    if kind == Kind::Char {
-        m.entry("leading").or_insert(Value::Null);
-    }
-    let name = m.remove("style_name").and_then(|v| v.as_str().map(str::to_string));
-    Some((name, m))
+    Some(match kind {
+        Kind::Char => (c.style_name.clone(), textstyles::char_attrs(&c)),
+        Kind::Para => (p.style_name.clone(), textstyles::para_attrs(&p)),
+    })
 }
 
 /// Parameters targeting the selection: the Type tool's selected characters (paragraph styles: the
@@ -241,6 +235,29 @@ mod tests {
         app.run("charStyle.apply", json!({"name": "Automatic", "clearOverrides": true})).unwrap();
         let shown = crate::tests_labels::painted_text(&mut app, |app, ui| show(app, ui, Kind::Char));
         assert!(shown.lines().any(|line| line == "Automatic"), "no override after clearing: {shown}");
+    }
+
+    /// Styles made from new type hold its Auto alignment and its attributes at their defaults;
+    /// the type they were made from shows no override until one of those attributes changes.
+    #[test]
+    fn styles_made_from_type_mark_only_real_overrides() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        let id = app.run("text.create", json!({"x": 10, "y": 40, "text": "Hi"})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        for kind in [Kind::Char, Kind::Para] {
+            app.run(&format!("{}.new", kind.prefix()), json!({"name": "Plain"})).unwrap();
+            app.run(&format!("{}.apply", kind.prefix()), json!({"name": "Plain"})).unwrap();
+        }
+        for (change, label) in [(None, "Plain"), (Some(json!({"kerning": 40, "composer": "singleLine"})), "Plain+")] {
+            if let Some(p) = change {
+                app.run("text.setFormat", p).unwrap();
+            }
+            for kind in [Kind::Char, Kind::Para] {
+                let shown = crate::tests_labels::painted_text(&mut app, |app, ui| show(app, ui, kind));
+                assert!(shown.lines().any(|line| line == label), "expected {label} in the {} styles: {shown}", kind.what());
+            }
+        }
     }
 
     fn capture_app() -> (VectorcraftApp, NodeId, egui::Context) {

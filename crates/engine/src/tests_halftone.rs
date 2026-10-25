@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::*;
 use crate::tests_adjust::{fill_hex, node, red_rect, session};
+use crate::tests_menucmds::{place_undecodable_png, warns_undecoded};
 
 #[test]
 fn halftone_turns_art_into_dots_by_tone() {
@@ -24,6 +25,19 @@ fn halftone_turns_art_into_dots_by_tone() {
     assert!(pd.subpaths.len() as u64 >= dots / 2);
     // Clipped to the art.
     assert!(b.x0 >= 19.9 && b.y0 >= 19.9 && b.x1 <= 80.1 && b.y1 <= 80.1, "{b:?}");
+}
+
+#[test]
+fn halftone_says_when_an_image_could_not_be_decoded() {
+    for mode in ["mono", "cmyk"] {
+        let mut s = session();
+        let id = red_rect(&mut s);
+        s.execute("paint.setFill", &json!({"color": "#000000"})).unwrap();
+        let cut = place_undecodable_png(&mut s);
+        s.execute("select.set", &json!({"ids": [id.0, cut.0]})).unwrap();
+        let r = s.execute("object.vectorHalftone", &json!({"frequency": 18, "mode": mode})).unwrap();
+        assert!(warns_undecoded(&r), "{mode}: {r}");
+    }
 }
 
 #[test]

@@ -349,6 +349,8 @@ fn layer_options_validate_and_template_locks_and_dims() {
         p["id"] = json!(layer.0);
         assert!(s.execute("layer.setProps", &p).is_err(), "{bad}");
     }
+    // A 32-bit build read color 2^32 + 4 as preset 4.
+    assert!(s.execute("layer.setProps", &json!({"id": layer.0, "color": (1u64 << 32) + 4})).is_err());
     let color = |s: &Session| match node(s, layer).kind {
         NodeKind::Layer { color, .. } => color,
         _ => panic!("not a layer"),
@@ -578,7 +580,11 @@ fn collect_merge_flatten_and_reverse() {
     run(&mut s, "layer.merge", json!({"ids": [col.0, layer.0]}));
     assert!(s.doc().unwrap().doc.node(col).is_none());
     assert_eq!(children(&s, layer), vec![c, sub, a, g]);
-    assert!(s.execute("layer.merge", &json!({"ids": [layer.0, sub.0]})).is_err(), "not into its own sublayer");
+    // A layer and its sublayer: the sublayer merges into its layer, never the other way round.
+    run(&mut s, "layer.merge", json!({"ids": [layer.0, sub.0]}));
+    assert!(s.doc().unwrap().doc.node(sub).is_none());
+    assert_eq!(children(&s, layer), vec![c, a, g]);
+    run(&mut s, "edit.undo", json!({}));
     assert!(s.execute("layer.merge", &json!({"ids": [layer.0]})).is_err());
     // Flatten: other visible layers merge in, hidden ones go, templates stay.
     let l2 = id(&run(&mut s, "layer.new", json!({"top": true})));
@@ -593,6 +599,32 @@ fn collect_merge_flatten_and_reverse() {
     assert!(st.doc.node(l2).is_none() && st.doc.node(l3).is_none());
     assert_eq!(parent(&s, d), Some(layer));
     assert_eq!(undos(&s), before + 1);
+}
+
+/// Merge Selected with every row highlighted (a layer, its sublayer and another layer, in panel
+/// order) merges the layers into the last top-level one instead of refusing a sublayer target (#2383).
+#[test]
+fn merge_selected_with_all_layer_rows_highlighted_merges_into_the_last_top_level_layer() {
+    for reversed in [false, true] {
+        let mut s = session();
+        let (layer, sub, a, _, _, c) = tree(&mut s);
+        let l2 = id(&run(&mut s, "layer.new", json!({"top": true})));
+        let d = rect(&mut s, 500.0);
+        // Panel order, top first: Layer 2, Layer 1, its sublayer.
+        let mut rows = vec![l2.0, layer.0, sub.0];
+        if reversed {
+            rows.reverse();
+        }
+        run(&mut s, "layer.highlight", json!({"ids": rows}));
+        let into = id(&run(&mut s, "layer.merge", json!({})));
+        let st = s.doc().unwrap();
+        assert_eq!(st.doc.layers.len(), 1, "reversed: {reversed}");
+        assert_eq!(into, st.doc.layers[0].id);
+        for n in [a, c, d] {
+            assert!(st.doc.layer_of(n) == Some(into), "{n:?} reversed: {reversed}");
+        }
+        assert!(st.doc.node(sub).is_some() || st.doc.node(layer).is_some() || st.doc.node(l2).is_some());
+    }
 }
 
 /// Collect in New Layer puts the new layer beside the topmost row when that row is directly in a

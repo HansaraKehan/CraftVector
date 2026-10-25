@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use vectorcraft_engine::Session;
 
 use crate::panels::graphic_styles::GraphicStyleLibraries;
-use crate::panels::library_panel::library_menu;
+use crate::panels::library_panel::{self, library_menu};
 use crate::panels::swatches::SwatchLibraries;
 use crate::picks::{self, PickRequest};
 use crate::state::Dialog;
@@ -213,12 +213,42 @@ fn load_profile_asks_off_the_ui_thread() {
     let (mut app, shown, _) = app();
     app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
     click(&mut app, "Load Profile…", crate::panels::separations::show);
-    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(p)] if p.filters.iter().any(|(_, e)| e.contains(&"icc"))));
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(p)] if p.filters.iter().any(|(_, e)| e.iter().any(|e| e == "icc"))));
     poll(&mut app);
     assert!(app.ui.status.is_empty(), "{}", app.ui.status);
     shown.answer(&["/no/such/profile.icc"]);
     poll(&mut app);
     assert!(app.ui.status.contains("/no/such/profile.icc"), "color.loadProfile ran on the path: {}", app.ui.status);
+}
+
+/// The Variables panel menu's Import Data Sets… and Export Data Sets… ask off the UI thread: the
+/// data sets in the file picked are loaded, and the header and data set `B` are written to the
+/// path the dialog answers.
+#[test]
+fn variables_panel_data_sets_ask_off_the_ui_thread() {
+    let (mut app, shown, _) = app();
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    let dir = vectorcraft_testkit::temp_dir("picks-data-sets");
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "cannot empty {}: {e}", dir.display());
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let (csv, out) = (dir.join("sets.csv"), dir.join("out.csv"));
+    std::fs::write(&csv, "name,Name\nB,y\n").unwrap();
+    let sets = |app: &VectorcraftApp| app.session.doc().unwrap().doc.variables.datasets.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+
+    click(&mut app, "Import Data Sets…", crate::panels::variables::menu);
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
+    shown.answer(&[&csv.to_string_lossy()]);
+    poll(&mut app);
+    assert_eq!(sets(&app), ["B"], "{}", app.ui.status);
+
+    click(&mut app, "Export Data Sets…", crate::panels::variables::menu);
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Save(_)]));
+    shown.answer(&[&out.to_string_lossy()]);
+    poll(&mut app);
+    assert_eq!(std::fs::read_to_string(&out).ok().as_deref(), Some("name,Name\nB,y\n"), "{}", app.ui.status);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The Swatches libraries menu's Other Library… asks off the UI thread; the file picked (another
@@ -230,12 +260,15 @@ fn other_swatch_library_asks_off_the_ui_thread() {
     app.run("swatch.new", json!({"name": "Signal", "color": "#ff3300"})).unwrap();
     let (dir, file) = saved_document(&mut app, "swatches");
     click(&mut app, "Other Library…", library_menu::<SwatchLibraries>);
-    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
+    assert!(matches!(
+        shown.requests().as_slice(),
+        [PickRequest::Open(p)] if p.filters.first().is_some_and(|(label, exts)| label == "Swatch libraries" && exts.iter().any(|e| e == "ase"))
+    ));
     poll(&mut app);
-    assert!(app.ui.library_panel.is_none() && app.ui.status.is_empty(), "{}", app.ui.status);
+    assert!(library_panel::last_open(&app.ui).is_none() && app.ui.status.is_empty(), "{}", app.ui.status);
     shown.answer(&[&file]);
     poll(&mut app);
-    let open = app.ui.library_panel.clone().unwrap_or_else(|| panic!("no library open: {}", app.ui.status));
+    let open = library_panel::last_open(&app.ui).cloned().unwrap_or_else(|| panic!("no library open: {}", app.ui.status));
     assert_eq!(open.kind, "swatches");
     let (_, lib) = vectorcraft_engine::cmd::swatchlib::library(&app.session, &open.id).unwrap();
     assert!(lib.swatch("Signal").is_some(), "{}", open.id);
@@ -255,10 +288,33 @@ fn other_graphic_style_library_asks_off_the_ui_thread() {
     assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
     shown.answer(&[&file]);
     poll(&mut app);
-    let open = app.ui.library_panel.clone().unwrap_or_else(|| panic!("no library open: {}", app.ui.status));
+    let open = library_panel::last_open(&app.ui).cloned().unwrap_or_else(|| panic!("no library open: {}", app.ui.status));
     assert_eq!(open.kind, "graphicStyles");
     let (_, lib) = vectorcraft_engine::cmd::stylelib::library(&app.session, &open.id).unwrap();
     assert!(lib.style("Poster Look").is_some(), "{}", open.id);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The Variables panel menu's Load Variable Library… asks off the UI thread: the library picked
+/// loads when the dialog answers.
+#[test]
+fn load_variable_library_asks_off_the_ui_thread() {
+    let (mut app, shown, _) = app();
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    let dir = std::env::temp_dir().join(format!("vc-picks-variables-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let library = dir.join("library.xml");
+    let xml = r#"<variableSets><variableSet><variables><variable varName="Name" trait="textcontent"/></variables>
+        <sampleDataSets><sampleDataSet dataSetName="A"><Name><p>x</p></Name></sampleDataSet></sampleDataSets></variableSet></variableSets>"#;
+    std::fs::write(&library, xml).unwrap();
+    let sets = |app: &VectorcraftApp| app.session.doc().unwrap().doc.variables.datasets.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+
+    click(&mut app, "Load Variable Library…", crate::panels::variables::menu);
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
+    assert!(sets(&app).is_empty(), "nothing loads before the dialog answers");
+    shown.answer(&[&library.to_string_lossy()]);
+    poll(&mut app);
+    assert_eq!(sets(&app), ["A"], "{}", app.ui.status);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -268,7 +324,7 @@ fn other_graphic_style_library_asks_off_the_ui_thread() {
 #[test]
 fn keyboard_shortcuts_import_and_export_ask_off_the_ui_thread() {
     let (mut app, shown, written) = app();
-    let set = crate::shortcut_editor::export_json("Custom", &BTreeMap::from([("view.grid".to_string(), "Ctrl+Alt+G".to_string())]));
+    let set = crate::shortcut_editor::export_json("Custom", &crate::keymap::overrides_from(&[("view.grid", "Ctrl+Alt+G")]));
     let (_, want) = crate::shortcut_editor::import_json(&set).unwrap();
     let bytes = serde_json::to_vec(&set).unwrap();
     app.services.read = Some(Box::new(move |_: &str| Ok(bytes.clone())));
@@ -367,6 +423,58 @@ fn preset_dialogs_export_asks_off_the_ui_thread() {
         assert_eq!(*written.borrow(), [path], "{open}: {}", app.ui.status);
         assert_eq!(dialog_kind(&app), Some(kind.as_str()), "{open}");
     }
+}
+
+/// A sheet's answer that names a file that is there once given its extension asks before replacing
+/// it, with no "cancelled" in the status bar, and the question's OK writes it without another sheet.
+#[test]
+fn a_sheets_answer_given_its_extension_asks_before_replacing() {
+    let (mut app, shown, written) = app();
+    app.services.exists = Some(Box::new(|p: &str| p == "/art/card.vectorcraft"));
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    assert!(app.run("file.save", json!({})).is_err());
+    shown.answer(&["/art/card"]);
+    poll(&mut app);
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::confirm::REPLACE));
+    assert!(written.borrow().is_empty());
+    poll(&mut app);
+    assert_eq!(app.ui.status, "");
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(*written.borrow(), ["/art/card.vectorcraft"]);
+    assert!(shown.requests().is_empty(), "{:?}", shown.requests());
+}
+
+/// Export… in a presets dialog whose save dialog shows in line (Windows): a name that is there
+/// once given its extension asks over the presets dialog; Cancel shows it again and writes
+/// nothing, and OK writes the preset and shows it again.
+#[test]
+fn a_preset_dialogs_export_asks_before_replacing_over_it() {
+    let written = Written::default();
+    let w = written.clone();
+    let services = Services {
+        pick_save: Some(Box::new(|_: &FilePick| Some("/presets/mine".to_string()))),
+        write: Some(Box::new(move |path: &str, _: &[u8]| {
+            w.borrow_mut().push(path.to_string());
+            Ok(())
+        })),
+        exists: Some(Box::new(|_: &str| true)),
+        ..Default::default()
+    };
+    let mut app = VectorcraftApp::new(Session::new(), services);
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    app.run("pdf.preset.save", json!({"name": "Mine"})).unwrap();
+    app.run("ui.pdfPresetsDialog", json!({"selected": "Mine"})).unwrap();
+    let kind = dialog_kind(&app).unwrap().to_string();
+    click(&mut app, "Export…", dialogs);
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::confirm::REPLACE));
+    crate::dialogs::cancel(&mut app);
+    assert_eq!(dialog_kind(&app), Some(kind.as_str()));
+    assert!(written.borrow().is_empty());
+    click(&mut app, "Export…", dialogs);
+    crate::dialogs::confirm(&mut app).unwrap();
+    let path = format!("/presets/mine.{}", vectorcraft_engine::cmd::pdfcmds::PRESET_FORMAT);
+    assert_eq!(*written.borrow(), [path], "{}", app.ui.status);
+    assert_eq!(dialog_kind(&app), Some(kind.as_str()));
 }
 
 /// Save As answers on the document that asked for it: the one made active meanwhile isn't saved,
@@ -539,6 +647,33 @@ fn an_import_shortcut_set_answer_goes_on_after_the_active_document_closes() {
     shown.answer(&[&path]);
     poll(&mut app);
     assert_eq!(dialog_kind(&app), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    assert_ne!(app.ui.status, CLOSED);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Locate Library… acts on no document either: its answer shows the picked file's library in the
+/// missing library's panel even when the document active at the time closed meanwhile (Linux).
+#[test]
+fn a_locate_library_answer_goes_on_after_the_active_document_closes() {
+    let (mut app, shown, _) = with_dialogs(false);
+    let dir = std::env::temp_dir().join(format!("vc-picks-locate-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (gone, found) = (dir.join("Gone.gpl"), dir.join("Found.gpl"));
+    std::fs::write(&found, "GIMP Palette\nName: Found\n#\n255   0   0\tRed\n").unwrap();
+    let id = format!("loaded/{}", gone.to_string_lossy());
+    let path = Some(gone.to_string_lossy().into_owned());
+    let missing = library_panel::LibraryPanel { kind: "swatches".into(), id: id.clone(), path, view: None, hide_find: false, persistent: true };
+    app.ui.library_panels.push(missing);
+    let panel = library_panel::panel_id("swatches", &id);
+    app.run("window.panel", json!({"panel": panel})).unwrap();
+    app.run("file.new", json!({"width": 100, "height": 80})).unwrap();
+    assert!(app.run("ui.libraryPanel.locate", json!({"panel": panel})).is_err());
+    app.run("file.close", json!({})).unwrap();
+    assert!(app.session.documents().is_empty());
+    shown.answer(&[&found.to_string_lossy()]);
+    poll(&mut app);
+    let located = library_panel::panel_id("swatches", &format!("loaded/{}", found.to_string_lossy()));
+    assert!(library_panel::is_open(&app.ui, &located) && !library_panel::is_open(&app.ui, &panel), "{}", app.ui.status);
     assert_ne!(app.ui.status, CLOSED);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -818,7 +953,7 @@ fn only_picks_shows_the_hosts_dialogs() {
                 .services
                 .pick_open
                 .as_mut()
-                .and_then(|f| f(&crate::FilePick { filters: vec![("ICC Profiles", &["icc", "icm"])], ..Default::default() }))
+                .and_then(|f| f(&crate::FilePick { filters: vec![FilePick::filter("ICC Profiles", &["icc", "icm"])], ..Default::default() }))
         {"#;
     assert_eq!(in_line_dialogs(&code_only(before)).len(), 1);
     assert_eq!(in_line_dialogs(&code_only("let s = &mut app.services; let p = (s.pick_save.as_mut()?)(&pick);")).len(), 1);
@@ -861,4 +996,45 @@ fn only_picks_shows_the_hosts_dialogs() {
     }
     let found: Vec<String> = scanned.iter().flat_map(|(file, code)| in_line_dialogs(code).into_iter().map(move |c| format!("{file}: {c}"))).collect();
     assert!(found.is_empty(), "file dialogs shown in line, not through `picks`: {found:#?}");
+}
+
+/// #2200: Missing Fonts › Find in Folder… (a sheet on macOS) on a folder the search refuses, a
+/// home folder's Library where font tools leave fonts to test: the dialog says why. Without it
+/// the dialog reads as before the folder was picked, only with "Not found" under each font, and
+/// the reason is in the status bar alone.
+#[test]
+fn missing_fonts_says_why_the_folder_picked_wasnt_searched() {
+    let (mut app, shown, _) = app();
+    app.services.read = Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string())));
+    app.services.write = None;
+    let root = std::fs::canonicalize(vectorcraft_testkit::temp_dir("missing-fonts-refused")).unwrap();
+    app.run("file.new", json!({"width": 400, "height": 300})).unwrap();
+    app.run("text.create", json!({"x": 10, "y": 40, "text": "Type", "font": "Findme Sans 3"})).unwrap();
+    let doc = root.join("doc.vectorcraft");
+    app.run("document.save", json!({"path": doc.to_string_lossy()})).unwrap();
+    app.session.execute("file.close", &json!({})).unwrap();
+    crate::io::open_path(&mut app, &doc.to_string_lossy()).unwrap();
+    assert_eq!(dialog_kind(&app), Some("missingFonts"));
+    // The test's folder is the home folder: its Library holds other apps' folders.
+    app.session.search_rules = Some(vectorcraft_engine::cmd::findfiles::Rules { home: Some(root.clone()), ..Default::default() });
+    let fonts = root.join("Library").join("Application Support").join("Font Tool").join("Export");
+    std::fs::create_dir_all(&fonts).unwrap();
+    std::fs::write(fonts.join("Findme.otf"), vectorcraft_testkit::fonts::renamed("Findme Sans 3")).unwrap();
+    click(&mut app, "Find in Folder…", dialogs);
+    assert_eq!(shown.requests(), [PickRequest::Folder]);
+    shown.answer(&[&fonts.to_string_lossy()]);
+    let ctx = egui::Context::default();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app_frame(&ctx, &mut app, false);
+        let searching = app.ui.dialog.as_ref().is_some_and(|d| d.str("state") == "searching");
+        if !searching || std::time::Instant::now() > until {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.ui.dialog.as_ref().map(|d| d.str("state")).as_deref(), Some("failed"));
+    let text = crate::tests_labels::painted_text(&mut app, |app, ui| crate::dialogs::show(app, ui.ctx()));
+    assert!(text.contains("VectorCraft doesn't search other apps' or the system's folders"), "{text}");
+    assert!(!text.contains("Not found"), "the folder wasn't searched: {text}");
 }

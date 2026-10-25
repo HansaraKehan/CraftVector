@@ -75,7 +75,7 @@ proptest! {
         d.images.insert(key.clone(), ImageBlob::new("image/png", data.clone()));
         let layer = d.layers[0].id;
         let id = d.alloc_id();
-        let im = ImageObject { key: key.clone(), width: 1, height: 1, xf: Affine::IDENTITY, link: None, placement: Default::default() };
+        let im = ImageObject { key: key.clone(), width: 1, height: 1, xf: Affine::IDENTITY, link: None, placement: Default::default(), pixels: None };
         d.insert(Some(layer), 0, Node::new(id, NodeKind::Image(Box::new(im)))).unwrap();
         for pretty in [false, true] {
             let back = load(&save(&d, pretty)).unwrap();
@@ -225,7 +225,7 @@ fn approx_equal_documents_compare_equal() {
 fn bug_f64_bit_exact_roundtrip() {
     check_native_roundtrip_exact(&rich_doc()).unwrap();
     let mut d = Document::new(126.86291501015239, 214.69463130731182);
-    d.raster_effects_ppi = 0.1 + 0.2;
+    d.raster_effects_ppi = (0.1 + 0.2) * 1000.0;
     check_native_roundtrip_exact(&d).unwrap();
 }
 

@@ -154,6 +154,7 @@ pub const LANGUAGES: &[(&str, Quotes)] = &[
     ("Polish", Quotes { double: ['„', '”'], single: ['‚', '’'] }),
     ("Czech", Quotes { double: ['„', '“'], single: ['‚', '‘'] }),
     ("Russian", Quotes { double: ['«', '»'], single: ['„', '“'] }),
+    ("Turkish", Quotes { double: ['“', '”'], single: ['‘', '’'] }),
     ("Japanese", Quotes { double: ['「', '」'], single: ['『', '』'] }),
     ("Chinese", Quotes { double: ['“', '”'], single: ['‘', '’'] }),
 ];
@@ -192,6 +193,16 @@ impl Background {
 
 /// Largest bleed on any side, in points (1 inch).
 pub const MAX_BLEED: f64 = 72.0;
+/// Largest superscript or subscript size, and the farthest its baseline moves either way, in
+/// percent of the font size.
+pub const MAX_SCRIPT: f64 = 500.0;
+/// Largest synthesized small capitals size, in percent of the font size.
+pub const MAX_SMALL_CAPS: f64 = 200.0;
+
+/// Returns `bleed` with each side kept to 0–[`MAX_BLEED`] points; a side that isn't finite becomes 0.
+pub fn bleed_in_range(bleed: [f64; 4]) -> [f64; 4] {
+    bleed.map(|b| if b.is_finite() { b.clamp(0.0, MAX_BLEED) } else { 0.0 })
+}
 
 /// File → Document Setup.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -228,6 +239,11 @@ pub struct DocSetup {
     pub export_text: ExportText,
     /// Background Contents chosen in New Document.
     pub background: Background,
+    /// Character panel menu › System Layout: every text object advances by whole points. Off by
+    /// default and for documents from before it, and saved only when on.
+    /// <https://helpx.adobe.com/illustrator/desktop/design-with-text/edit-format-text/turn-fractional-character-widths-off-or-on.html>
+    #[serde(default, rename = "systemLayout", skip_serializing_if = "crate::skip::is_default")]
+    pub system_layout: bool,
 }
 
 impl Default for DocSetup {
@@ -250,6 +266,7 @@ impl Default for DocSetup {
             small_caps_size: 70.0,
             export_text: ExportText::Editable,
             background: Background::Transparent,
+            system_layout: false,
         }
     }
 }
@@ -273,6 +290,18 @@ impl DocSetup {
     /// The flattener preset in use.
     pub fn flattener(&self) -> &str {
         self.flattener_preset.as_deref().unwrap_or(DEFAULT_FLATTENER)
+    }
+    /// Moves the bleed and the type proportions into the ranges Document Setup takes, each to the
+    /// nearer end: the bleed by [`bleed_in_range`], superscript and subscript sizes to
+    /// 1–[`MAX_SCRIPT`] and positions to ±[`MAX_SCRIPT`], the small caps size to
+    /// 1–[`MAX_SMALL_CAPS`].
+    pub fn keep_in_range(&mut self) {
+        self.bleed = bleed_in_range(self.bleed);
+        for m in [&mut self.superscript, &mut self.subscript] {
+            m.size = m.size.clamp(1.0, MAX_SCRIPT);
+            m.position = m.position.clamp(-MAX_SCRIPT, MAX_SCRIPT);
+        }
+        self.small_caps_size = self.small_caps_size.clamp(1.0, MAX_SMALL_CAPS);
     }
 }
 

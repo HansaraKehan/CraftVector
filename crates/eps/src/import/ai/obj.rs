@@ -66,6 +66,8 @@ pub(super) struct Obj {
     pub entries: Vec<(Option<String>, Vec<V>)>,
     /// Values closed without a key.
     pub content: Vec<V>,
+    /// Vector art enclosed by `X=` … `X+` in an opacity-mask dictionary.
+    pub art: Option<std::sync::Arc<vectorcraft_doc::Node>>,
 }
 
 impl Obj {

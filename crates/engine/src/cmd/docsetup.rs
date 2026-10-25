@@ -121,7 +121,7 @@ fn apply(s: &mut DocSetup, units: &mut vectorcraft_doc::Unit, k: &str, v: &Value
         "typographersQuotes" => s.typographers_quotes = flag(k, v)?,
         "superscript" => s.superscript = script_param(k, v, s.superscript)?,
         "subscript" => s.subscript = script_param(k, v, s.subscript)?,
-        "smallCapsSize" => s.small_caps_size = percent(k, v, 1.0, 200.0)?,
+        "smallCapsSize" => s.small_caps_size = percent(k, v, 1.0, vectorcraft_doc::setup::MAX_SMALL_CAPS)?,
         "exportText" => s.export_text = v.as_str().and_then(ExportText::parse).ok_or_else(|| bad(C, "exportText must be editable or appearance"))?,
         "backgroundContents" => s.background = background_param(v, C)?,
         // Read-only values `document.setup` reports.
@@ -223,8 +223,8 @@ fn script_param(k: &str, v: &Value, mut m: ScriptMetrics) -> Result<ScriptMetric
     let o = v.as_object().ok_or_else(|| bad(C, format!("{k} must be {{size?, position?}}")))?;
     for (key, x) in o {
         match key.as_str() {
-            "size" => m.size = percent(&format!("{k}.size"), x, 1.0, 500.0)?,
-            "position" => m.position = percent(&format!("{k}.position"), x, -500.0, 500.0)?,
+            "size" => m.size = percent(&format!("{k}.size"), x, 1.0, vectorcraft_doc::setup::MAX_SCRIPT)?,
+            "position" => m.position = percent(&format!("{k}.position"), x, -vectorcraft_doc::setup::MAX_SCRIPT, vectorcraft_doc::setup::MAX_SCRIPT)?,
             _ => return Err(bad(C, format!("unknown {k} key `{key}` (size, position)"))),
         }
     }
@@ -251,7 +251,7 @@ pub(crate) fn script_params(p: &Value, setup: &DocSetup, cmd: &str) -> Result<(O
 }
 
 /// A superscript or subscript in `setup`'s proportions.
-fn position_in(setup: &DocSetup, p: CharPosition) -> CharPosition {
+pub(crate) fn position_in(setup: &DocSetup, p: CharPosition) -> CharPosition {
     match p {
         CharPosition::Normal => CharPosition::Normal,
         CharPosition::Superscript(_) => CharPosition::Superscript(setup.superscript),

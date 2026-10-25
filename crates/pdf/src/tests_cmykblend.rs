@@ -103,3 +103,30 @@ fn a_cmyk_page_without_blending_through_is_an_isolated_group() {
         assert!(!t.contains("/Itrue") && t.contains("/S/Alpha"), "grouped {grouped}: {t}");
     }
 }
+
+fn rgb_warning(d: &Document) -> Option<String> {
+    export_with_report(d, &PdfOptions::uncompressed()).unwrap().warnings.into_iter().find(|w| w.contains("RGB"))
+}
+
+#[test]
+fn rgb_colours_in_a_cmyk_document_are_reported_and_separated() {
+    let mut d = Document::new_with_mode(100.0, 100.0, ColorMode::Cmyk);
+    add(&mut d, rect(Rect::new(0.0, 0.0, 50.0, 50.0), Color::rgb(0.11, 0.1, 0.1)));
+    add(&mut d, rect(Rect::new(50.0, 0.0, 100.0, 50.0), Color::rgb(0.11, 0.1, 0.1)));
+    add(&mut d, rect(Rect::new(0.0, 50.0, 50.0, 100.0), Color::rgb(0.9, 0.2, 0.2)));
+    let w = rgb_warning(&d).expect("a warning");
+    assert!(w.contains("2 RGB colours"), "{w}");
+    // The colours are written as CMYK, not RGB.
+    let t = text(&d);
+    assert!(t.contains("k0") && !t.contains("rg\n"), "{t}");
+}
+
+#[test]
+fn cmyk_colours_and_rgb_documents_have_no_rgb_warning() {
+    let mut d = Document::new_with_mode(100.0, 100.0, ColorMode::Cmyk);
+    add(&mut d, rect(Rect::new(0.0, 0.0, 50.0, 50.0), Color::cmyk(0.0, 0.0, 0.0, 1.0)));
+    assert_eq!(rgb_warning(&d), None);
+    let mut d = Document::new_with_mode(100.0, 100.0, ColorMode::Rgb);
+    add(&mut d, rect(Rect::new(0.0, 0.0, 50.0, 50.0), Color::rgb(0.1, 0.1, 0.1)));
+    assert_eq!(rgb_warning(&d), None);
+}

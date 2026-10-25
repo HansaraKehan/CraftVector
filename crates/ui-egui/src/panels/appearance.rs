@@ -162,7 +162,7 @@ fn built_in_effect(id: &str) -> bool {
 
 /// [`effect_label`] as shown: a built-in effect's in the UI language (an `@id` row for the
 /// effect's id wins over the plain row of its English label), a plug-in's as it is.
-fn shown_effect_label(id: &str) -> String {
+pub(crate) fn shown_effect_label(id: &str) -> String {
     match catalog().iter().find(|c| c.0 == id) {
         Some(c) => crate::i18n::t_id(id, &c.1).to_string(),
         None => effect_label(id),
@@ -625,15 +625,20 @@ fn contents_row(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, label: &str, se
             chip(ui, cr, n.proxy_paint(stroke, None).map_or(&Paint::None, |(p, ..)| p));
         }
     }
-    let resp =
-        resp.on_hover_text(if characters { tl!("Double-click to edit the characters' paint") } else { tl!("Double-click to target the contents") });
+    // An image's row has no members to target.
+    let image = matches!(n.kind, vectorcraft_doc::NodeKind::Image(_));
+    let resp = if image {
+        resp
+    } else {
+        resp.on_hover_text(if characters { tl!("Double-click to edit the characters' paint") } else { tl!("Double-click to target the contents") })
+    };
     if resp.clicked() || resp.double_clicked() {
         select_row(app, ui.ctx(), Sel::Contents);
     }
     if resp.double_clicked() {
         if characters {
             app.ui.open_panel = Some("color".into());
-        } else {
+        } else if !image {
             app.run("appearance.targetContents", json!({})).ok();
         }
     }
@@ -724,31 +729,37 @@ fn has_options(id: &str) -> bool {
     vectorcraft_effects::default_params(id).is_some_and(|d| d.as_object().is_some_and(|o| !o.is_empty()))
 }
 
-/// Inline editor for an applied effect's parameters (numbers, booleans, strings, colors, and
-/// Drop Shadow's Color or Darkness as radio buttons); edits go through `effect.setParams`.
+/// Inline editor for an applied effect's parameters, labeled as the effect dialogs' generic fields
+/// are: numbers, booleans, strings, colors, the values a parameter picks from as a dropdown
+/// ([`crate::dialogs::shown_choices`]), and Drop Shadow's Color or Darkness as radio buttons;
+/// edits go through `effect.setParams`.
 fn effect_editor(app: &mut VectorcraftApp, ui: &mut Ui, item: Option<usize>, k: usize, e: &Effect) {
     let t = Tokens::get(ui.ctx());
     let params = editor_params(e);
     let mut change: Option<(String, Value)> = None;
     let mut edit = false;
     let built_in = built_in_effect(&e.id);
+    // A plug-in effect's parameters are labelled, measured and shown as its manifest says.
+    let plugin = vectorcraft_plugins::effect::installed(&e.id);
+    let manifest = plugin.as_ref().map(|p| p.manifest());
+    let visible = manifest.map(|m| m.visible(&params));
     let (unit, relative) = (app.session.general_unit(), params.get("relative").and_then(Value::as_bool).unwrap_or(false));
+    let cmyk = app.session.active().is_some_and(|s| s.doc.color_mode == vectorcraft_doc::ColorMode::Cmyk);
     egui::Frame::NONE.fill(t.panel_darker).inner_margin(egui::Margin { left: (EYE_W + 12.0) as i8, right: 6, top: 4, bottom: 4 }).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
         if params.is_empty() {
             widgets::dim_label(ui, tl!("No options"));
         }
         for (key, v) in &params {
+            if visible.as_ref().is_some_and(|v| !v.contains(key.as_str())) {
+                continue;
+            }
+            let ui_keys = manifest.and_then(|m| m.param(key)).map(|p| &p.ui);
             ui.horizontal(|ui| {
-                // A plug-in's parameter names are its own.
-                let label = humanize(key);
-                let label = super::label_or_name(&label, built_in);
-                ui.add_sized(vec2(84.0, 22.0), egui::Label::new(egui::RichText::new(label).size(11.5).color(t.text)).truncate());
-                if let Some(cur) = widgets::blend_param(key, v) {
-                    if let Some(m) = widgets::blend_param_dropdown(ui, ("fx-blend", item, k, key.as_str()), cur) {
-                        change = Some((key.clone(), m));
-                    }
-                    return;
+                let label = ui_keys.and_then(|u| u.label.clone()).unwrap_or_else(|| param_label(key, built_in));
+                let shown = ui.add_sized(vec2(84.0, 22.0), egui::Label::new(egui::RichText::new(label.as_str()).size(11.5).color(t.text)).truncate());
+                if let Some(help) = ui_keys.and_then(|u| u.help.as_deref()) {
+                    shown.on_hover_text(help);
                 }
                 if e.id == "stylize.dropShadow" && key == "shade" {
                     let cur = v.as_str().unwrap_or_default();
@@ -759,18 +770,51 @@ fn effect_editor(app: &mut VectorcraftApp, ui: &mut Ui, item: Option<usize>, k: 
                     }
                     return;
                 }
+                if let Some(options) = crate::dialogs::shown_choices(&e.id, key, &params, cmyk) {
+                    let cur = v.as_str().unwrap_or_default();
+                    let shown = options.iter().find(|(_, value)| value == cur).map_or(cur, |(label, _)| label.as_str());
+                    let labels: Vec<&str> = options.iter().map(|(label, _)| label.as_str()).collect();
+                    if let Some((_, value)) = widgets::dropdown_names(ui, ("fx-choice", item, k, key.as_str()), shown, &labels, 90.0)
+                        .and_then(|i| options.get(i))
+                        .filter(|(_, value)| value != cur)
+                    {
+                        change = Some((key.clone(), json!(value)));
+                    }
+                    return;
+                }
+                // A plug-in's number list is typed as its dialog's is: "45, 135".
+                if let Some(spec) = manifest.and_then(|m| m.param(key)).map(|p| &p.spec)
+                    && matches!(spec, vectorcraft_plugins::manifest::ParamSpec::NumberList { .. })
+                {
+                    let typed = widgets::exact_text_field(ui, ("fx", item, k, key.as_str()), &crate::dialogs::number_list_text(v), 90.0);
+                    if let Some(list) = typed.and_then(|text| crate::dialogs::read_number_list(&text, spec)) {
+                        change = Some((key.clone(), list));
+                    }
+                    if let Some(unit) = ui_keys.and_then(|u| u.unit.as_deref()) {
+                        widgets::dim_label(ui, unit);
+                    }
+                    return;
+                }
+                // Only our own effects show a `mode` parameter as the blend mode dropdown; a plug-in's `mode` stays a plain field.
+                if built_in && let Some(cur) = widgets::blend_param(key, v) {
+                    if let Some(m) = widgets::blend_param_dropdown(ui, ("fx-blend", item, k, key.as_str()), cur) {
+                        change = Some((key.clone(), m));
+                    }
+                    return;
+                }
                 match v {
                     Value::Bool(b) => {
-                        if widgets::check(ui, "", *b, true) {
+                        if widgets::check_box(ui, &label, *b, true) {
                             change = Some((key.clone(), json!(!b)));
                         }
                     }
                     Value::Number(n) => {
                         let (x, id) = (n.as_f64().unwrap_or(0.0), ("fx", item, k, key.as_str()));
+                        let suffix = ui_keys.and_then(|u| u.unit.as_deref()).map(crate::dialogs::unit_suffix).unwrap_or_default();
                         let nx = if vectorcraft_effects::is_length(&e.id, key, relative) {
                             widgets::num_field(ui, id, Some(x), unit, 70.0)
                         } else {
-                            widgets::plain_field(ui, id, x, "", 2, 70.0)
+                            widgets::plain_field(ui, id, x, &suffix, 2, 70.0)
                         };
                         if let Some(nx) = nx {
                             change = Some((key.clone(), json!(nx)));
@@ -782,10 +826,8 @@ fn effect_editor(app: &mut VectorcraftApp, ui: &mut Ui, item: Option<usize>, k: 
                         widgets::dim_label(ui, &size.map_or_else(String::new, |(w, h)| format!("{w} × {h} px")));
                     }
                     Value::String(s) => {
-                        let mut buf = s.clone();
-                        let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(90.0));
-                        if r.lost_focus() && buf != *s {
-                            change = Some((key.clone(), json!(buf)));
+                        if let Some(typed) = widgets::exact_text_field(ui, ("fx", item, k, key.as_str()), s, 90.0) {
+                            change = Some((key.clone(), json!(typed)));
                         }
                     }
                     // Free Distort's corners are dragged in its dialog.
@@ -816,20 +858,13 @@ fn editor_params(e: &Effect) -> serde_json::Map<String, Value> {
     }
 }
 
-/// "offsetX" → "Offset X".
-pub fn humanize(key: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in key.chars().enumerate() {
-        if i == 0 {
-            out.extend(ch.to_uppercase());
-        } else if ch.is_uppercase() {
-            out.push(' ');
-            out.push(ch);
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+/// The label of an effect's parameter `key` in [`effect_editor`]: the label the effect dialog's
+/// generic fields give it ([`crate::dialogs::humanize`]) without the ":" ("offsetX" → "Offset X",
+/// "maxRadius" → "Max. Radius"), in the UI language for one of our own effects (a plug-in's
+/// parameter names are shown as they are).
+fn param_label(key: &str, built_in: bool) -> String {
+    let label = crate::dialogs::humanize(key);
+    super::label_or_name(label.trim_end_matches(':'), built_in).to_string()
 }
 
 /// Small swatch grid inside the appearance chip popup.
@@ -996,8 +1031,8 @@ mod tests {
 
     #[test]
     fn labels() {
-        assert_eq!(humanize("offsetX"), "Offset X");
-        assert_eq!(humanize("blur"), "Blur");
+        assert_eq!(param_label("offsetX", true), "Offset X");
+        assert_eq!(param_label("blur", true), "Blur");
         assert!(!effect_label("stylize.dropShadow").contains('…'));
         assert_eq!(effect_label("path.outlineObject"), "Outline Object");
         assert_eq!(effect_label("x.unknownThing"), "unknownThing");
@@ -1046,6 +1081,226 @@ mod tests {
         assert_eq!(n.appearance.effects[0].params["shade"], json!("darkness"));
     }
 
+    /// A rectangle with `effect` applied, its inline editor open, after a first frame in `ctx`.
+    fn editing(effect: &str) -> (VectorcraftApp, egui::Context, NodeId) {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        let id = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
+        app.run("effect.apply", json!({"effect": effect})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        set_pstate(&ctx, "ap-fx-open-None-0", true);
+        panel_frame(&mut app, &ctx, vec![]);
+        (app, ctx, NodeId(id))
+    }
+
+    /// One frame of the panel in `ctx` with `events`: the texts drawn and where.
+    fn panel_frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn texts(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let time = ctx.input(|i| i.time) + 0.1;
+        let mut out = ctx.run_ui(egui::RawInput { events, time: Some(time), ..Default::default() }, |ui| show(app, ui));
+        out.textures_delta.clear();
+        let mut v = vec![];
+        out.shapes.iter().for_each(|c| texts(&c.shape, &mut v));
+        v
+    }
+
+    /// Clicks the text `label` drawn in the panel (the last one drawn when there are several).
+    fn click_text(app: &mut VectorcraftApp, ctx: &egui::Context, label: &str) {
+        let shown = panel_frame(app, ctx, vec![]);
+        let at = shown.iter().rev().find(|(s, _)| s == label).unwrap_or_else(|| panic!("no {label:?} in {shown:?}")).1.center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
+            panel_frame(app, ctx, events);
+        }
+    }
+
+    fn shown_texts(app: &mut VectorcraftApp, ctx: &egui::Context) -> Vec<String> {
+        panel_frame(app, ctx, vec![]).into_iter().map(|(s, _)| s).collect()
+    }
+
+    /// Roughen's Points and Offset Path's Joins are dropdowns with the effect dialog's labels, and
+    /// a pick sends the dialog's value as one undo step.
+    #[test]
+    fn the_effect_editor_picks_choices_from_the_dialogs_dropdowns() {
+        for (effect, key, shown, pick, value) in
+            [("distort.roughen", "points", "Smooth", "Corner", "corner"), ("path.offsetPath", "joins", "Miter", "Round", "round")]
+        {
+            let (mut app, ctx, id) = editing(effect);
+            let texts = shown_texts(&mut app, &ctx);
+            assert!(texts.iter().any(|s| s == shown), "{effect}: {texts:?}");
+            let undo = app.session.doc().unwrap().history.undo.len();
+            click_text(&mut app, &ctx, shown);
+            click_text(&mut app, &ctx, pick);
+            let st = app.session.doc().unwrap();
+            assert_eq!(st.doc.node(id).unwrap().appearance.effects[0].params[key], json!(value), "{effect}");
+            assert_eq!(st.history.undo.len(), undo + 1, "{effect}");
+            assert!(shown_texts(&mut app, &ctx).iter().any(|s| s == pick), "{effect}");
+        }
+    }
+
+    /// The editor labels a parameter as the effect dialog does, without the ":".
+    #[test]
+    fn the_effect_editor_labels_parameters_as_the_dialog_does() {
+        for (effect, labels) in [
+            ("pixelate.colorHalftone", &["Max. Radius", "Channel 1", "Channel 4"][..]),
+            ("video.deinterlace", &["Create New Fields by", "Duplication", "Eliminate", "Odd Fields"][..]),
+        ] {
+            let (mut app, ctx, _) = editing(effect);
+            let texts = shown_texts(&mut app, &ctx);
+            for label in labels {
+                assert!(texts.iter().any(|s| s == label), "{effect}: no {label:?} in {texts:?}");
+            }
+        }
+    }
+
+    /// A plug-in's choice is a dropdown of the plug-in's own values, also when the parameter is
+    /// called `mode` and its value names a blend mode.
+    #[test]
+    fn a_plug_in_choice_lists_the_plug_ins_values() {
+        use vectorcraft_plugins::wat as tpl;
+        let params = r#"{"mode":{"type":"choice","options":["normal","screen","dots"],"default":"screen"}}"#;
+        let src = tpl::module(&tpl::manifest("test.ui.inlinechoice", "effect", params), tpl::ECHO, "", 1);
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("plugin.install", json!({"dataBase64": vectorcraft_format::base64_encode(&wat::parse_str(src).unwrap())})).unwrap();
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        let id = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
+        app.run("effect.apply", json!({"effect": "plugin.test.ui.inlinechoice"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        set_pstate(&ctx, "ap-fx-open-None-0", true);
+        panel_frame(&mut app, &ctx, vec![]);
+        click_text(&mut app, &ctx, "screen");
+        click_text(&mut app, &ctx, "dots");
+        let mode = |app: &VectorcraftApp| app.session.doc().unwrap().doc.node(NodeId(id)).unwrap().appearance.effects[0].params["mode"].clone();
+        assert_eq!(mode(&app), json!("dots"));
+        click_text(&mut app, &ctx, "dots");
+        click_text(&mut app, &ctx, "screen");
+        assert_eq!(mode(&app), json!("screen"));
+        // Once the plug-in is removed, its value shows as it is, not as a blend mode.
+        app.run("plugin.remove", json!({"id": "test.ui.inlinechoice"})).unwrap();
+        let texts = shown_texts(&mut app, &ctx);
+        assert!(texts.iter().any(|s| s == "screen") && !texts.iter().any(|s| s == "Screen"), "{texts:?}");
+    }
+
+    /// A plug-in effect's editor labels its parameters, shows their units and leaves out those whose
+    /// `visibleWhen` isn't met, as the effect's dialog does, and reads a typed number list the same
+    /// way.
+    #[test]
+    fn a_plug_in_effect_s_editor_follows_its_manifest() {
+        use vectorcraft_plugins::wat as tpl;
+        let params = r#"{"outline":{"type":"bool","default":true,"label":"Outline"},
+            "spacing":{"type":"number","min":0.1,"max":10,"default":1.5,"label":"Spacing","unit":"mm","help":"Distance between the lines."},
+            "angles":{"type":"numberList","min":0,"max":360,"default":[45,135],"minItems":1,"maxItems":4,"unit":"°"},
+            "width":{"type":"number","min":0,"max":10,"default":0.5,"label":"Width","unit":"pt","visibleWhen":{"outline":[true]}}}"#;
+        let src = tpl::module(&tpl::manifest("test.ui.inlinekeys", "effect", params), tpl::ECHO, "", 1);
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("plugin.install", json!({"dataBase64": vectorcraft_format::base64_encode(&wat::parse_str(src).unwrap())})).unwrap();
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        let id = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
+        app.run("effect.apply", json!({"effect": "plugin.test.ui.inlinekeys"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        set_pstate(&ctx, "ap-fx-open-None-0", true);
+        let texts = shown_texts(&mut app, &ctx);
+        for shown in ["Spacing", "1.5 mm", "Angles", "45, 135", "°", "Width", "0.5 pt"] {
+            assert!(texts.iter().any(|s| s == shown), "no {shown:?} in {texts:?}");
+        }
+        assert!(!texts.iter().any(|s| s == "spacing" || s == "width"), "the labels replace the names: {texts:?}");
+        // Without the outline, its width isn't shown.
+        app.run("effect.setParams", json!({"item": null, "index": 0, "params": {"outline": false}})).unwrap();
+        let texts = shown_texts(&mut app, &ctx);
+        assert!(!texts.iter().any(|s| s == "Width") && texts.iter().any(|s| s == "Spacing"), "{texts:?}");
+        // A list typed in the field: separated by a semicolon and a space, and clamped.
+        click_text(&mut app, &ctx, "45, 135");
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        panel_frame(&mut app, &ctx, vec![key(egui::Key::A, egui::Modifiers::COMMAND)]);
+        panel_frame(&mut app, &ctx, vec![egui::Event::Text("10; 400 20".into())]);
+        panel_frame(&mut app, &ctx, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        panel_frame(&mut app, &ctx, vec![]);
+        let angles = app.session.doc().unwrap().doc.node(NodeId(id)).unwrap().appearance.effects[0].params["angles"].clone();
+        assert_eq!(angles, json!([10.0, 360.0, 20.0]));
+        app.run("plugin.remove", json!({"id": "test.ui.inlinekeys"})).unwrap();
+    }
+
+    /// Glass with a loaded texture lists Loaded Texture in its Texture menu, as its dialog does.
+    #[test]
+    fn the_effect_editor_lists_a_loaded_glass_texture() {
+        let mut png = vec![];
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([90, 120, 150, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let stored = vectorcraft_engine::cmd::fileio::texture_image(&png).unwrap();
+        let (mut app, ctx, id) = editing("distort.glass");
+        app.run("effect.setParams", json!({"item": null, "index": 0, "params": {"texture": "loaded", "textureImage": stored}})).unwrap();
+        let texts = shown_texts(&mut app, &ctx);
+        assert!(texts.iter().any(|s| s == "Loaded Texture") && !texts.iter().any(|s| s == "loaded"), "{texts:?}");
+        click_text(&mut app, &ctx, "Loaded Texture");
+        click_text(&mut app, &ctx, "Frosted");
+        let st = app.session.doc().unwrap();
+        assert_eq!(st.doc.node(id).unwrap().appearance.effects[0].params["texture"], json!("frosted"));
+    }
+
+    /// The choices that their dialogs list in their own bodies are dropdowns with those dialogs'
+    /// labels too: Revolve's edge, Extrude & Bevel's bevel, Warp's orientation, Rasterize's
+    /// options and the channel of Levels and Curves. A pick sends the dialog's value as one undo
+    /// step.
+    #[test]
+    fn the_effect_editor_picks_choices_their_own_dialogs_list() {
+        for (effect, key, shown, pick, value) in [
+            ("threeD.revolve", "edge", "Left", "Right", "right"),
+            ("threeD.extrude", "bevel", "None", "Rounded", "rounded"),
+            ("warp.arc", "orientation", "Horizontal", "Vertical", "vertical"),
+            ("rasterize", "colorModel", "RGB", "Grayscale", "grayscale"),
+            ("rasterize", "background", "Transparent", "White", "white"),
+            ("rasterize", "antiAlias", "Art Optimized", "Type Optimized", "type"),
+            ("adjust.levels", "channel", "RGB", "Red", "red"),
+            ("adjust.curves", "channel", "RGB", "Blue", "blue"),
+        ] {
+            let (mut app, ctx, id) = editing(effect);
+            let texts = shown_texts(&mut app, &ctx);
+            assert!(texts.iter().any(|s| s == shown), "{effect} {key}: {texts:?}");
+            let undo = app.session.doc().unwrap().history.undo.len();
+            click_text(&mut app, &ctx, shown);
+            click_text(&mut app, &ctx, pick);
+            let st = app.session.doc().unwrap();
+            assert_eq!(st.doc.node(id).unwrap().appearance.effects[0].params[key], json!(value), "{effect} {key}");
+            assert_eq!(st.history.undo.len(), undo + 1, "{effect} {key}");
+            assert!(shown_texts(&mut app, &ctx).iter().any(|s| s == pick), "{effect} {key}");
+        }
+    }
+
+    /// Those choices read as their dialogs show them in the UI language: in French, the channel's
+    /// RGB as the "effect" row translates it, and in Spanish, Extrude & Bevel's Rounded as the "3d"
+    /// row does, not the plain row. Rasterize names the document's color mode.
+    #[test]
+    fn the_effect_editor_shows_those_choices_as_their_dialogs_do() {
+        let fr = crate::i18n::Lang::from_code("fr").unwrap();
+        crate::i18n::set_current(fr);
+        let (mut app, ctx, _) = editing("adjust.levels");
+        let texts = shown_texts(&mut app, &ctx);
+        let rgb = crate::i18n::tr_ctx(fr, "effect", "RGB");
+        assert!(texts.iter().any(|s| s == rgb), "{rgb}: {texts:?}");
+        let es = crate::i18n::Lang::from_code("es").unwrap();
+        crate::i18n::set_current(es);
+        let (mut app, ctx, _) = editing("threeD.extrude");
+        app.run("effect.setParams", json!({"item": null, "index": 0, "params": {"bevel": "rounded"}})).unwrap();
+        let rounded = crate::i18n::tr_ctx(es, "3d", "Rounded");
+        assert_ne!(rounded, crate::i18n::tr(es, "Rounded"));
+        assert!(shown_texts(&mut app, &ctx).iter().any(|s| s == rounded), "{rounded}");
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        let (mut app, ctx, _) = editing("rasterize");
+        app.run("file.documentColorMode", json!({"mode": "cmyk"})).unwrap();
+        let texts = shown_texts(&mut app, &ctx);
+        assert!(texts.iter().any(|s| s == "CMYK") && !texts.iter().any(|s| s == "document"), "{texts:?}");
+    }
+
     #[test]
     fn the_effect_editor_lists_earlier_parameters_in_their_current_form() {
         // A Scribble saved with one `variation` lists it as its Path Overlap and Spacing variations.
@@ -1057,6 +1312,72 @@ mod tests {
         // Another effect lists its values over its defaults, as before.
         let e = Effect { id: "distort.twist".into(), params: json!({"angle": 270}), visible: true };
         assert_eq!(editor_params(&e).get("angle"), Some(&json!(270)));
+    }
+
+    /// A text field of the inline editor keeps what is typed from one frame to the next: a Drop
+    /// Shadow's color typed a character a frame and confirmed with Enter is set in one undo step.
+    /// Escape drops what is typed.
+    #[test]
+    fn the_effect_editor_keeps_text_typed_across_frames() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        let id = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
+        app.run("effect.apply", json!({"effect": "stylize.dropShadow"})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        set_pstate(&ctx, "ap-fx-open-None-0", true);
+        let mut time = 0.0;
+        let mut run = |app: &mut VectorcraftApp, events: Vec<egui::Event>| {
+            time += 0.1;
+            let mut out = ctx.run_ui(egui::RawInput { events, time: Some(time), ..Default::default() }, |ui| show(app, ui));
+            out.textures_delta.clear();
+            out
+        };
+        // Every text drawn, with its center.
+        fn texts(s: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect().center())),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let drawn = |out: &egui::FullOutput| {
+            let mut v = vec![];
+            out.shapes.iter().for_each(|c| texts(&c.shape, &mut v));
+            v
+        };
+        run(&mut app, vec![]);
+        let shown = drawn(&run(&mut app, vec![]));
+        let at = shown.iter().find(|(t, _)| t == "#000000").map(|(_, p)| *p);
+        let Some(at) = at else { panic!("no color field: {shown:?}") };
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)]] {
+            run(&mut app, events);
+        }
+        run(&mut app, vec![key(egui::Key::A, egui::Modifiers::COMMAND)]);
+        let undo = app.session.active().unwrap().history.undo.len();
+        for ch in "#ff0000".chars() {
+            run(&mut app, vec![egui::Event::Text(ch.to_string())]);
+        }
+        let shown = drawn(&run(&mut app, vec![]));
+        assert!(shown.iter().any(|(t, _)| t == "#ff0000"), "the field shows what was typed: {shown:?}");
+        run(&mut app, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+        run(&mut app, vec![]);
+        let color = |app: &VectorcraftApp| app.session.active().unwrap().doc.node(NodeId(id)).unwrap().appearance.effects[0].params["color"].clone();
+        assert_eq!(color(&app), json!("#ff0000"));
+        assert_eq!(app.session.active().unwrap().history.undo.len(), undo + 1, "one undo step");
+        // Escape drops what is typed.
+        for events in [vec![button(true)], vec![button(false)]] {
+            run(&mut app, events);
+        }
+        run(&mut app, vec![egui::Event::Text("0".into())]);
+        let shown = drawn(&run(&mut app, vec![]));
+        assert!(shown.iter().any(|(t, _)| t.len() == 8 && t.starts_with('#')), "a 0 typed into the color: {shown:?}");
+        run(&mut app, vec![key(egui::Key::Escape, egui::Modifiers::NONE)]);
+        run(&mut app, vec![]);
+        assert_eq!(color(&app), json!("#ff0000"));
+        assert_eq!(app.session.active().unwrap().history.undo.len(), undo + 1);
     }
 
     #[test]
@@ -1138,6 +1459,22 @@ mod tests {
         assert_eq!(rows(frame(&mut app)), ["Characters"]);
         run(&mut app, "appearance.addFill", json!({}));
         assert_eq!(rows(frame(&mut app)), ["Fill:", "Characters"]);
+    }
+
+    #[test]
+    fn images_show_a_contents_row_with_new_fills_and_strokes_below_it() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        let run = |app: &mut VectorcraftApp, id: &str, p: Value| app.session.execute(id, &p).unwrap();
+        run(&mut app, "file.new", json!({"width": 100, "height": 100}));
+        let rows = |t: Vec<String>| t.into_iter().filter(|t| ["Fill:", "Stroke:", "Contents"].contains(&t.as_str())).collect::<Vec<_>>();
+        let mut png = vec![];
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        run(&mut app, "file.place", json!({"name": "red.png", "dataBase64": vectorcraft_format::base64_encode(&png)}));
+        assert_eq!(rows(frame(&mut app)), ["Contents"]);
+        run(&mut app, "appearance.addStroke", json!({}));
+        assert_eq!(rows(frame(&mut app)), ["Contents", "Stroke:"]);
     }
 
     #[test]

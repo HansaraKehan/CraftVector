@@ -103,7 +103,7 @@ fn limit_menu(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
     }
     ui.separator();
-    chosen = library_panel::library_items(ui, &colour_libraries(app), Some(&cur)).or(chosen);
+    chosen = library_panel::library_items(ui, &colour_libraries(app), &|id| id == cur).or(chosen);
     if let Some(key) = chosen {
         set_limit(app, &json!({ "library": key })).ok();
         clear_selection(ui.ctx());
@@ -120,12 +120,12 @@ fn edit_or_apply(app: &mut VectorcraftApp, g: &Guide) {
     app.run("ui.recolorDialog", p).ok();
 }
 
-/// Save the selected cells' colours as swatches (one undo step).
+/// Save the selected cells' colors as swatches (one undo step), each in its own model.
 fn save_selected(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let g = guide(app, ctx);
     let colors: Vec<Value> = selected(ctx).into_iter().filter_map(|(r, c)| g.grid.get(r)?.get(c)).map(color_json).collect();
     if !colors.is_empty() {
-        app.run("swatch.new", json!({ "colors": colors })).ok();
+        app.run("swatch.new", json!({ "colors": colors, "keepModel": true })).ok();
     }
 }
 
@@ -216,7 +216,9 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             None => tl!("Limit colors to swatch library").into(),
         };
         // The tip is translated around the library's name, not looked up whole.
-        let lr = widgets::icon_button(ui, "library", "", limit.is_some(), 24.0).on_hover_text(tip);
+        let lr = widgets::icon_button(ui, "library", "", limit.is_some(), 24.0);
+        lr.widget_info(|| widgets::icon_button_info(ui.is_enabled(), limit.is_some(), &tip));
+        let lr = lr.on_hover_text(tip);
         egui::Popup::menu(&lr).show(|ui| limit_menu(app, ui));
         ui.add_space((ui.available_width() - 3.0 * 28.0).max(0.0));
         // Recolor Artwork with the harmony colours as the new colours: the selected art's, or
@@ -230,7 +232,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
         if widgets::icon_button(ui, "dc-folder", tl!("Save color group to Swatch panel"), false, 24.0).clicked() {
             let cs: Vec<_> = g.colors.iter().map(color_json).collect();
-            app.run("swatch.newGroup", json!({"name": h.label(), "colors": cs})).ok();
+            app.run("swatch.newGroup", json!({"name": h.label(), "colors": cs, "keepModel": true})).ok();
         }
     });
     if let Some(c) = chosen {
@@ -278,6 +280,20 @@ mod tests {
         out.textures_delta.clear();
     }
 
+    /// Screen readers name the library button by its tool tip, pressed while a library limits the
+    /// colors.
+    #[test]
+    fn screen_readers_name_the_limit_button() {
+        use crate::widgets::accessibility_tests::{role_and_state, tree};
+        use egui::accesskit::{Role, Toggled};
+        let mut app = app();
+        let shown = tree(|ui| show(&mut app, ui));
+        assert_eq!(role_and_state(&shown, "Limit colors to swatch library"), (Role::Button, None));
+        app.run("ui.colorGuideLimit", json!({"library": "Earth Tones"})).unwrap();
+        let shown = tree(|ui| show(&mut app, ui));
+        assert_eq!(role_and_state(&shown, "Limit colors to swatch library: Earth Tones"), (Role::Button, Some(Toggled::True)));
+    }
+
     #[test]
     fn base_stays_until_set_and_the_grid_follows_the_options() {
         let mut app = app();
@@ -310,6 +326,23 @@ mod tests {
         assert_eq!(st.history.undo.len(), undo + 1, "one undo step");
         let g = guide(&app, &ctx);
         assert_eq!(st.doc.swatches.last().unwrap().paint.color().map(|c| c.to_hex()), Some(g.grid[0][8].to_hex()));
+    }
+
+    /// In a CMYK document the cells of an RGB guide are saved in RGB, their own model.
+    #[test]
+    fn saved_cells_keep_their_model_in_a_cmyk_document() {
+        let mut app = app();
+        app.run("file.documentColorMode", json!({"mode": "cmyk"})).unwrap();
+        app.run("paint.setFill", json!({"color": "#3366cc", "keepModel": true})).unwrap();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        set_pstate(&ctx, "cg-sel", vec![(0usize, 0usize), (0, 6)]);
+        save_selected(&mut app, &ctx);
+        let g = guide(&app, &ctx);
+        assert!(matches!(g.grid[0][6], Color::Rgb { .. }), "{:?}", g.grid[0][6]);
+        let sw = &app.session.doc().unwrap().doc.swatches;
+        let saved: Vec<Color> = sw[sw.len() - 2..].iter().filter_map(|w| w.paint.color()).collect();
+        assert_eq!(saved, [g.grid[0][0], g.grid[0][6]]);
     }
 
     /// Every colour of the panel's guide.

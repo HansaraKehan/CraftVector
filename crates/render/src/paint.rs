@@ -52,31 +52,64 @@ pub(crate) fn set_paint(ctx: &mut RenderContext, p: &Paint, bounds: Rect, f: &Fr
     }
 }
 
+/// [`set_paint`] for a fill: a dithered gradient (dither applies to fills only) with stops is
+/// drawn as pixels with fine noise ([`crate::dither`]).
+pub(crate) fn set_fill_paint(ctx: &mut RenderContext, p: &Paint, bounds: Rect, f: &Frame) -> bool {
+    match p {
+        Paint::Gradient(g) if g.gradient.dither && g.gradient.kind != GradientKind::Freeform && !g.gradient.stops.is_empty() => {
+            crate::dither::set_dithered_paint(ctx, g, bounds, f.ink)
+        }
+        _ => set_paint(ctx, p, bounds, f),
+    }
+}
+
 /// The most memory decoding one image may take: print rasters run to gigabytes (a 300 ppi roll,
 /// 6614 x 59055 px, is 1.56 GB as RGBA), past the decoder's 512 MB default. The web keeps it.
 const MAX_DECODE_ALLOC: u64 = if cfg!(target_arch = "wasm32") { 512 << 20 } else { 2 << 30 };
 
-/// Images that couldn't be decoded (and so drew nothing), counted for exports to report.
-static DECODE_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How many images have failed to decode so far (process-wide): an export compares the count
-/// before and after to say it left images out.
-pub fn decode_failures() -> u64 {
-    DECODE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+thread_local! {
+    /// Images that couldn't be decoded (and so drew nothing) on this thread, counted for exports to
+    /// report.
+    static DECODE_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// `bytes` decoded within [`MAX_DECODE_ALLOC`]; a failure is counted in [`decode_failures`].
+/// How many images have failed to decode on this thread so far: an export compares the count
+/// before and after it draws to say it left images out. Images that other threads (another export,
+/// the canvas, thumbnails) fail to decode meanwhile are not counted.
+pub fn decode_failures() -> u64 {
+    DECODE_FAILURES.with(std::cell::Cell::get)
+}
+
+/// `bytes` decoded within [`MAX_DECODE_ALLOC`] ([`decode_within_allowance`]); a failure is counted
+/// in [`decode_failures`].
 fn decode(bytes: &[u8]) -> Option<image::DynamicImage> {
-    let img = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok().and_then(|mut r| {
+    let img = decode_within_allowance(bytes).ok();
+    if img.is_none() {
+        add_decode_failures(1);
+    }
+    img
+}
+
+/// `bytes` decoded within [`MAX_DECODE_ALLOC`], counted as RGBA: the image's size is read from its
+/// header first, and an image of more than that as RGBA gets a limit error before anything is
+/// decoded (#1717).
+pub(crate) fn decode_within_allowance(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
+    let reader = || -> image::ImageResult<_> {
+        let mut r = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
         let mut limits = image::Limits::default();
         limits.max_alloc = Some(MAX_DECODE_ALLOC);
         r.limits(limits);
-        r.decode().ok()
-    });
-    if img.is_none() {
-        DECODE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(r)
+    };
+    let (w, h) = reader()?.into_dimensions()?;
+    let bytes = (u64::from(w) * u64::from(h)).saturating_mul(4);
+    // The images paints hold can't be evicted from the cache, so a document of many images held
+    // them all at once: a new one is decoded only while those and it fit twice the allowance.
+    let pinned = crate::images::store().pinned_bytes() as u64;
+    if bytes > MAX_DECODE_ALLOC || bytes.saturating_add(pinned) > 2 * MAX_DECODE_ALLOC {
+        return Err(image::ImageError::Limits(image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory)));
     }
-    img
+    reader()?.decode()
 }
 
 /// `img` shrunk, keeping its proportions, to fit a pixmap's sides (at most `u16::MAX` pixels).
@@ -105,6 +138,13 @@ pub fn decode_pixmap_fit(bytes: &[u8], w: u16, h: u16) -> Option<vello_cpu::Pixm
         img
     };
     pixmap_of(img.to_rgba8())
+}
+
+/// Count `n` images that couldn't be decoded on this thread ([`decode_failures`]). [`decode`]
+/// counts each failure, and a raster kept in a cache counts the failures it was drawn with again
+/// each time it is drawn.
+pub(crate) fn add_decode_failures(n: u64) {
+    DECODE_FAILURES.with(|c| c.set(c.get() + n));
 }
 
 /// An RGBA image as a premultiplied pixmap.

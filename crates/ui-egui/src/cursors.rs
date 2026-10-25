@@ -95,6 +95,13 @@ fn pen(p: &mut Ink, o: Pos2, badge: &str) {
         }
         "-" => line(p, b + vec2(0.0, 3.0), b + vec2(6.0, 3.0)),
         "/" => line(p, b + vec2(0.0, 6.0), b + vec2(5.0, 0.0)),
+        "~" => {
+            // A quarter circle bulging up-left, from the badge's bottom-left to its top-right.
+            let c = b + vec2(7.0, 7.0);
+            let arc: Vec<Pos2> = (0..=8).map(|i| c + egui::Vec2::angled(std::f32::consts::PI * (1.0 + i as f32 / 16.0)) * 6.0).collect();
+            p.add(Shape::line(arc.clone(), Stroke::new(3.0, HALO)));
+            p.add(Shape::line(arc, Stroke::new(1.2, INK)));
+        }
         // Join: a segment running into a square end point.
         "j" => {
             line(p, b + vec2(0.0, 6.0), b + vec2(3.5, 2.5));
@@ -114,12 +121,98 @@ fn pen(p: &mut Ink, o: Pos2, badge: &str) {
     }
 }
 
+/// The Anchor Point tool's caret (as its toolbar icon): a small hollow square on the anchor at
+/// the hotspot, legs spreading down from its lower corners. Every halo goes under every stroke, so
+/// the legs join the square.
+fn anchor_point(p: &mut Ink, o: Pos2) {
+    let s = 2.5;
+    let square = vec![o + vec2(-s, -s), o + vec2(s, -s), o + vec2(s, s), o + vec2(-s, s)];
+    let legs = [[o + vec2(-s, s), o + vec2(-7.5, 13.0)], [o + vec2(s, s), o + vec2(7.5, 13.0)]];
+    for leg in legs {
+        p.line_segment(leg, Stroke::new(3.0, HALO));
+    }
+    p.add(Shape::closed_line(square.clone(), Stroke::new(3.0, HALO)));
+    p.add(Shape::convex_polygon(square.clone(), HALO, Stroke::NONE));
+    for leg in legs {
+        p.line_segment(leg, Stroke::new(1.2, INK));
+    }
+    p.add(Shape::closed_line(square, Stroke::new(1.0, INK)));
+}
+
+/// Halos under every stroke first, then the ink, so crossing strokes don't cut each other.
+fn strokes(p: &mut Ink, parts: &[Vec<Pos2>]) {
+    for s in parts {
+        p.add(Shape::line(s.clone(), Stroke::new(3.0, HALO)));
+    }
+    for s in parts {
+        p.add(Shape::line(s.clone(), Stroke::new(1.2, INK)));
+    }
+}
+
+/// A stemless arrowhead, tip at `o`.
+fn arrowhead(o: Pos2) -> Vec<Pos2> {
+    vec![o, o + vec2(0.0, 14.0), o + vec2(4.2, 10.4), o + vec2(10.0, 10.0)]
+}
+
+/// Direct Selection over an anchor: the white arrow with a small square at its lower right,
+/// filled when the anchor's path is selected.
+fn arrow_square(p: &mut Ink, o: Pos2, filled: bool) {
+    arrow(p, o, true);
+    let b = o + vec2(11.0, 13.0);
+    let square = [(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)].map(|(x, y)| b + vec2(x, y)).to_vec();
+    poly(p, square, if filled { INK } else { HALO }, INK);
+}
+
+/// The Reshape Segment cursor: a black arrowhead with a small curve between two anchor marks at
+/// its lower right.
+fn reshape_segment(p: &mut Ink, o: Pos2) {
+    poly(p, arrowhead(o), INK, INK);
+    let (a, c) = (o + vec2(10.0, 19.0), o + vec2(19.0, 19.0));
+    let curve: Vec<Pos2> = (0..=12)
+        .map(|i| {
+            let t = i as f32 / 12.0;
+            a + (c - a) * t - vec2(0.0, 4.5 * (std::f32::consts::PI * t).sin())
+        })
+        .collect();
+    strokes(p, &[curve]);
+    for m in [a, c] {
+        let mark = [(-1.5, -1.5), (1.5, -1.5), (1.5, 1.5), (-1.5, 1.5)].map(|(x, y)| m + vec2(x, y)).to_vec();
+        poly(p, mark, INK, INK);
+    }
+}
+
+/// Group Selection: the white arrow with a plus at its lower right.
+fn arrow_plus(p: &mut Ink, o: Pos2) {
+    arrow(p, o, true);
+    let c = o + vec2(14.0, 15.0);
+    strokes(p, &[vec![c - vec2(3.5, 0.0), c + vec2(3.5, 0.0)], vec![c - vec2(0.0, 3.5), c + vec2(0.0, 3.5)]]);
+}
+
+/// An Alt-drag copy: a black arrowhead in front of a white one set down and to the right.
+fn double_arrowhead(p: &mut Ink, o: Pos2) {
+    poly(p, arrowhead(o + vec2(4.0, 4.0)), HALO, INK);
+    poly(p, arrowhead(o), INK, INK);
+}
+
 fn double_arrow(p: &mut Ink, o: Pos2, dir: egui::Vec2) {
     let d = dir.normalized() * 8.0;
     let n = vec2(-d.y, d.x) * 0.45;
     line(p, o - d, o + d);
     for (tip, back) in [(o + d, o + d * 0.45), (o - d, o - d * 0.45)] {
         poly(p, vec![tip, back + n, back - n], INK, INK);
+    }
+}
+
+/// Two single arrows side by side across the hotspot, pointing opposite ways along `dir`: a side
+/// sliding past its opposite one, as a shear does.
+fn shear(p: &mut Ink, o: Pos2, dir: egui::Vec2) {
+    let d = dir.normalized() * 7.0;
+    let n = vec2(-d.y, d.x) / 7.0;
+    for (side, way) in [(-3.5, 1.0), (3.5, -1.0)] {
+        let (c, d) = (o + n * side, d * way);
+        line(p, c - d, c + d * 0.55);
+        let back = c + d * 0.4;
+        poly(p, vec![c + d, back + n * 2.6, back - n * 2.6], INK, INK);
     }
 }
 
@@ -314,23 +407,130 @@ fn magnifier(p: &mut Ink, o: Pos2, out: bool) {
     }
 }
 
+/// Every cursor with a glyph: its own, drawn here, or the one it borrows.
+#[cfg(test)]
+const GLYPHS: [Cursor; 79] = [
+    Cursor::Hand,
+    Cursor::HandGrab,
+    Cursor::ZoomIn,
+    Cursor::ZoomOut,
+    Cursor::Arrow,
+    Cursor::ArrowHollow,
+    Cursor::DirectAnchor,
+    Cursor::DirectAnchorSelected,
+    Cursor::ReshapeSegment,
+    Cursor::GroupSelection,
+    Cursor::SelectionCopy,
+    Cursor::Move,
+    Cursor::Crosshair,
+    Cursor::ResizeH,
+    Cursor::ResizeV,
+    Cursor::ResizeNwSe,
+    Cursor::ResizeNeSw,
+    Cursor::ShearH,
+    Cursor::ShearV,
+    Cursor::Rotate,
+    Cursor::RotateToward(1),
+    Cursor::CornerRadius,
+    Cursor::Pen,
+    Cursor::PenDrawing,
+    Cursor::PenAdd,
+    Cursor::PenDelete,
+    Cursor::PenClose,
+    Cursor::PenContinue,
+    Cursor::PenJoin,
+    Cursor::PenConvert,
+    Cursor::AnchorPoint,
+    Cursor::Curvature,
+    Cursor::Text,
+    Cursor::Eyedropper,
+    Cursor::AddStop,
+    Cursor::RemoveStop,
+    Cursor::Slice,
+    Cursor::SliceSelect,
+    Cursor::Width,
+    Cursor::WidthAdd,
+    Cursor::WidthPoint,
+    Cursor::Blend,
+    Cursor::BlendObject,
+    Cursor::BlendAnchor,
+    Cursor::ObjectsOnPath,
+    Cursor::PathBracket,
+    Cursor::TypeWidget,
+    Cursor::LoadedText,
+    Cursor::ShapeBuilder,
+    Cursor::ShapeBuilderErase,
+    Cursor::Lasso,
+    Cursor::MagicWand,
+    Cursor::Pencil,
+    Cursor::PencilClose,
+    Cursor::PencilStraight,
+    Cursor::Paintbrush,
+    Cursor::PaintbrushClose,
+    Cursor::BlobBrush,
+    Cursor::Eraser,
+    Cursor::Smooth,
+    Cursor::PathEraser,
+    Cursor::Join,
+    Cursor::Knife,
+    Cursor::Shaper,
+    Cursor::LivePaintBucket,
+    Cursor::Measure,
+    Cursor::PrintTiling,
+    Cursor::SymbolSprayer,
+    Cursor::SymbolShifter,
+    Cursor::SymbolScruncher,
+    Cursor::SymbolSizer,
+    Cursor::SymbolSpinner,
+    Cursor::SymbolStainer,
+    Cursor::SymbolScreener,
+    Cursor::SymbolStyler,
+    Cursor::TypeVertical,
+    Cursor::Scissors,
+    Cursor::MeshAdd,
+    Cursor::PuppetPin,
+];
+
 /// The shapes of cursor `c` with its hotspot at `p`; `None` for cursors that stay system cursors
-/// (the busy states).
+/// (the busy states): the one drawn here, else the glyph of the cursor it borrows
+/// ([`Cursor::stand_in`]).
 fn glyph(c: Cursor, p: Pos2) -> Option<Vec<Shape>> {
     let ink = &mut Ink::default();
+    // A cursor not drawn yet: the one it borrows.
+    if let Some(stand_in) = c.stand_in() {
+        return glyph(stand_in, p);
+    }
     match c {
         Cursor::Arrow => arrow(ink, p, false),
         Cursor::ArrowHollow => arrow(ink, p, true),
+        Cursor::DirectAnchor => arrow_square(ink, p, false),
+        Cursor::DirectAnchorSelected => arrow_square(ink, p, true),
+        Cursor::ReshapeSegment => reshape_segment(ink, p),
+        Cursor::GroupSelection => arrow_plus(ink, p),
+        Cursor::SelectionCopy => double_arrowhead(ink, p),
         Cursor::Move => {
             arrow(ink, p, false);
             double_arrow(ink, p + vec2(15.0, 18.0), vec2(1.0, 0.0));
         }
         Cursor::Crosshair => crosshair(ink, p),
+        // The crosshair the Pencil and the Paintbrush borrow, with the PenClose ring below right.
+        Cursor::PencilClose | Cursor::PaintbrushClose => {
+            crosshair(ink, p);
+            ink.circle_stroke(p + vec2(8.0, 8.0), 3.0, Stroke::new(3.0, HALO));
+            ink.circle_stroke(p + vec2(8.0, 8.0), 3.0, Stroke::new(1.2, INK));
+        }
+        // The Pencil's crosshair with a short straight line where the closing ring goes.
+        Cursor::PencilStraight => {
+            crosshair(ink, p);
+            line(ink, p + vec2(5.0, 12.0), p + vec2(12.0, 5.0));
+        }
         Cursor::Eyedropper => eyedropper(ink, p),
         Cursor::ResizeH => double_arrow(ink, p, vec2(1.0, 0.0)),
         Cursor::ResizeV => double_arrow(ink, p, vec2(0.0, 1.0)),
         Cursor::ResizeNwSe => double_arrow(ink, p, vec2(1.0, 1.0)),
         Cursor::ResizeNeSw => double_arrow(ink, p, vec2(1.0, -1.0)),
+        Cursor::ShearH => shear(ink, p, vec2(1.0, 0.0)),
+        Cursor::ShearV => shear(ink, p, vec2(0.0, -1.0)),
         Cursor::Rotate => rotate(ink, p, 0),
         Cursor::RotateToward(octant) => rotate(ink, p, octant),
         Cursor::CornerRadius => corner_radius(ink, p),
@@ -340,6 +540,8 @@ fn glyph(c: Cursor, p: Pos2) -> Option<Vec<Shape>> {
         Cursor::PenDelete => pen(ink, p, "-"),
         Cursor::PenClose => pen(ink, p, "o"),
         Cursor::PenContinue => pen(ink, p, "/"),
+        Cursor::AnchorPoint => anchor_point(ink, p),
+        Cursor::Curvature => pen(ink, p, "~"),
         Cursor::PenJoin => pen(ink, p, "j"),
         Cursor::PenConvert => pen(ink, p, "^"),
         Cursor::Text => ibeam(ink, p),
@@ -393,6 +595,13 @@ pub const OS_CURSORS: bool = !cfg!(any(target_os = "macos", target_arch = "wasm3
 /// and PdfCraft do.
 pub fn os_cursors(build: bool, wayland: bool) -> bool {
     build && !wayland
+}
+
+/// Does the canvas hide the system pointer to show a painted tool glyph alone? Not when there is no
+/// cursor theme on Wayland ([`crate::Services::no_cursor_theme`]): winit sets no pointer then, and a
+/// hidden one would not come back over the panels (#2450). The system pointer stays beside the glyph.
+pub fn hide_system_pointer(no_cursor_theme: bool) -> bool {
+    !no_cursor_theme
 }
 
 /// Does the window hide the pointer only while it is the key window? macOS does: winit hides it with
@@ -519,53 +728,66 @@ mod tests {
 
     use crate::VectorcraftApp;
 
-    /// Every cursor with a glyph.
-    const GLYPHS: [Cursor; 39] = [
-        Cursor::Hand,
-        Cursor::HandGrab,
-        Cursor::ZoomIn,
-        Cursor::ZoomOut,
-        Cursor::Arrow,
-        Cursor::ArrowHollow,
-        Cursor::Move,
-        Cursor::Crosshair,
-        Cursor::ResizeH,
-        Cursor::ResizeV,
-        Cursor::ResizeNwSe,
-        Cursor::ResizeNeSw,
-        Cursor::Rotate,
-        Cursor::RotateToward(1),
-        Cursor::CornerRadius,
-        Cursor::Pen,
-        Cursor::PenDrawing,
-        Cursor::PenAdd,
-        Cursor::PenDelete,
-        Cursor::PenClose,
-        Cursor::PenContinue,
-        Cursor::PenJoin,
-        Cursor::PenConvert,
-        Cursor::Text,
-        Cursor::Eyedropper,
-        Cursor::AddStop,
-        Cursor::RemoveStop,
-        Cursor::Slice,
-        Cursor::SliceSelect,
-        Cursor::Width,
-        Cursor::WidthAdd,
-        Cursor::WidthPoint,
-        Cursor::Blend,
-        Cursor::BlendObject,
-        Cursor::BlendAnchor,
-        Cursor::PathBracket,
-        Cursor::TypeWidget,
-        Cursor::ShapeBuilder,
-        Cursor::ShapeBuilderErase,
-    ];
-
     /// The straight RGBA of pixel (x, y).
     fn pixel(img: &CustomCursorImage, x: usize, y: usize) -> [u8; 4] {
         let i = (y * img.size[0] as usize + x) * 4;
         [img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3]]
+    }
+
+    /// The Anchor Point caret's hotspot is the middle of its hollow square: white there, with the
+    /// square's ink a few points above it.
+    #[test]
+    fn anchor_point_hotspot_is_inside_its_square() {
+        for ppp in [1.0f32, 2.0] {
+            let img = rasterize(Cursor::AnchorPoint, ppp).expect("anchor point has a bitmap");
+            let [hx, hy] = img.hotspot.map(usize::from);
+            assert_eq!(pixel(&img, hx, hy), [255, 255, 255, 255], "hollow at the hotspot at {ppp}x");
+            let reach = (4.0 * ppp).round() as usize;
+            let inked = (1..=reach.min(hy)).any(|d| {
+                let p = pixel(&img, hx, hy - d);
+                p[0] < 64 && p[3] > 200
+            });
+            assert!(inked, "ink on the square's top edge within 4 points above the hotspot at {ppp}x");
+        }
+    }
+
+    /// Direct Selection's anchor square is hollow over an unselected path and filled over a
+    /// selected one; the arrow stays white. The Reshape Segment and copy arrowheads are black and
+    /// Group Selection's arrow white, just inside their tips.
+    #[test]
+    fn selection_arrows_are_white_or_black() {
+        let at = |img: &CustomCursorImage, x: f32, y: f32, ppp: f32| {
+            let [hx, hy] = img.hotspot.map(usize::from);
+            pixel(img, hx + (x * ppp).round() as usize, hy + (y * ppp).round() as usize)
+        };
+        for ppp in [1.0f32, 2.0] {
+            for c in [Cursor::DirectAnchor, Cursor::DirectAnchorSelected] {
+                let img = rasterize(c, ppp).expect("a bitmap");
+                let tip = at(&img, 1.5, 6.0, ppp);
+                assert!(tip[0] > 192 && tip[3] > 200, "{c:?}'s arrow is white at {ppp}x: {tip:?}");
+            }
+            // Same arrow, so the filled square shows as more ink than the hollow one.
+            let ink = |c| {
+                let img = rasterize(c, ppp).expect("a bitmap");
+                img.rgba.as_chunks::<4>().0.iter().filter(|p| p[0] < 64 && p[3] > 200).count()
+            };
+            let (hollow, filled) = (ink(Cursor::DirectAnchor), ink(Cursor::DirectAnchorSelected));
+            assert!(filled > hollow, "the selected path's square is filled at {ppp}x: {filled} vs {hollow}");
+            for (c, white) in [(Cursor::ReshapeSegment, false), (Cursor::SelectionCopy, false), (Cursor::GroupSelection, true)] {
+                let img = rasterize(c, ppp).expect("a bitmap");
+                let tip = at(&img, 1.5, 6.0, ppp);
+                assert_eq!(tip[0] > 192, white, "{c:?} at {ppp}x: {tip:?}");
+                assert!(tip[3] > 200, "{c:?} at {ppp}x: {tip:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_not_drawn_yet_looks_like_the_one_it_borrows() {
+        for c in GLYPHS {
+            let Some(stand_in) = c.stand_in() else { continue };
+            assert_eq!(rasterize(c, 2.0), rasterize(stand_in, 2.0), "{c:?} borrows {stand_in:?}");
+        }
     }
 
     #[test]
@@ -590,6 +812,8 @@ mod tests {
             assert!(pixel(&dropper, hx, hy)[3] > 0, "the tip covers the hotspot at {ppp}");
         }
         assert!(rasterize(Cursor::NotAllowed, 1.0).is_none(), "the busy states stay system cursors");
+        assert!(rasterize(Cursor::Busy, 1.0).is_none());
+        assert!(rasterize(Cursor::ScissorsNotAllowed, 1.0).is_none(), "until it's drawn it borrows the system not-allowed cursor");
         for ppp in [0.0, -1.0, f32::NAN, f32::INFINITY, 1e9] {
             assert!(rasterize(Cursor::Arrow, ppp).is_none(), "{ppp}");
         }
@@ -635,6 +859,64 @@ mod tests {
             let [hx, hy] = drawing.hotspot.map(usize::from);
             let nib = (hx + (8.0 * ppp) as usize, hy + (8.0 * ppp) as usize);
             assert_eq!(pixel(&new, nib.0, nib.1), pixel(&drawing, nib.0, nib.1), "at {ppp}");
+        }
+    }
+
+    /// The Pencil's and the Paintbrush's closing cursors are the crosshair those tools show, with a
+    /// ring below right.
+    #[test]
+    fn the_closing_cursors_are_the_crosshair_with_a_ring() {
+        for ppp in [1.0, 2.0] {
+            let cross = rasterize(Cursor::Crosshair, ppp).unwrap();
+            for c in [Cursor::PencilClose, Cursor::PaintbrushClose] {
+                let img = rasterize(c, ppp).unwrap();
+                assert_eq!(img.hotspot, cross.hotspot, "{c:?} at {ppp}");
+                let [hx, hy] = img.hotspot.map(usize::from);
+                let at = |img: &CustomCursorImage, dx: f32, dy: f32| {
+                    let (x, y) = ((hx as f32 + dx * ppp) as usize, (hy as f32 + dy * ppp) as usize);
+                    if x < img.size[0] as usize && y < img.size[1] as usize { pixel(img, x, y) } else { [0; 4] }
+                };
+                // Black pixels in the square 4 to 12 points right of and below the hotspot, clear of the arms.
+                let ring_ink = |img: &CustomCursorImage| {
+                    let steps = (8.0 * ppp) as usize;
+                    (0..steps * steps)
+                        .filter(|i| {
+                            let p = at(img, 4.0 + (i % steps) as f32 / ppp, 4.0 + (i / steps) as f32 / ppp);
+                            p[3] > 200 && p[0] < 64
+                        })
+                        .count()
+                };
+                assert!(ring_ink(&img) > 0, "{c:?} has its ring at {ppp}");
+                assert_eq!(ring_ink(&cross), 0, "the crosshair has no ring at {ppp}");
+                assert_eq!(at(&img, 8.0, 8.0)[3], 0, "{c:?}'s ring is hollow at {ppp}");
+                // The arms are the crosshair's.
+                assert_eq!(at(&img, -6.0, 0.0), at(&cross, -6.0, 0.0), "{c:?} at {ppp}");
+            }
+        }
+    }
+
+    /// The Pencil's straight-line cursor is the crosshair with a short straight line below right,
+    /// through the point where the closing cursor's ring is hollow.
+    #[test]
+    fn the_pencil_straight_line_cursor_is_the_crosshair_with_a_line() {
+        for ppp in [1.0, 2.0] {
+            let cross = rasterize(Cursor::Crosshair, ppp).unwrap();
+            let img = rasterize(Cursor::PencilStraight, ppp).unwrap();
+            let ring = rasterize(Cursor::PencilClose, ppp).unwrap();
+            assert_eq!(img.hotspot, cross.hotspot, "at {ppp}");
+            let at = |img: &CustomCursorImage, dx: f32, dy: f32| {
+                let [hx, hy] = img.hotspot.map(usize::from);
+                let (x, y) = ((hx as f32 + dx * ppp) as usize, (hy as f32 + dy * ppp) as usize);
+                if x < img.size[0] as usize && y < img.size[1] as usize { pixel(img, x, y) } else { [0; 4] }
+            };
+            let inked = |p: [u8; 4]| p[3] > 200 && p[0] < 64;
+            assert!(inked(at(&img, 8.5, 8.5)), "the line crosses the badge's middle at {ppp}");
+            assert_eq!(at(&ring, 8.5, 8.5)[3], 0, "the closing ring is hollow there at {ppp}");
+            assert_eq!(at(&cross, 8.5, 8.5)[3], 0, "the crosshair has no badge at {ppp}");
+            // Along the line, not across it: no ink off its ends.
+            assert!(!inked(at(&img, 5.0, 5.0)) && !inked(at(&img, 12.0, 12.0)), "a line, not a cross, at {ppp}");
+            assert_ne!(img, ring, "at {ppp}");
+            assert_eq!(at(&img, -6.0, 0.0), at(&cross, -6.0, 0.0), "the arms are the crosshair's at {ppp}");
         }
     }
 
@@ -725,6 +1007,22 @@ mod tests {
         let out = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(over)]);
         assert!(out.platform_output.cursor_image.is_none());
         assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::None);
+    }
+
+    /// Without a cursor theme the canvas keeps the system pointer visible (#2450).
+    #[test]
+    fn no_cursor_theme_keeps_the_system_pointer() {
+        assert!(!hide_system_pointer(true));
+        assert!(hide_system_pointer(false));
+        let mut app = VectorcraftApp::new(Session::new(), crate::Services { wayland: true, no_cursor_theme: true, ..Default::default() });
+        app.run("file.new", json!({"width": 400, "height": 300})).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let over = app.canvas_rect.unwrap().center();
+        let out = frame(&mut app, &ctx, vec![egui::Event::PointerMoved(over)]);
+        assert_ne!(out.platform_output.cursor_icon, egui::CursorIcon::None);
     }
 
     /// On macOS a window without the focus shows the system pointer over the canvas, and the glyph

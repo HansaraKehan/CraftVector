@@ -5,7 +5,9 @@
 //! Save and Close, or Folder; Override Open / Save / Export. Cited:
 //! <https://helpx.adobe.com/illustrator/desktop/automate-visualize-data/automate-actions/batch-options.html>
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(not(target_arch = "wasm32"))]
+use serde_json::json;
 
 use super::super::*;
 
@@ -125,6 +127,9 @@ fn batch_folder(s: &mut Session, cmd: &str, p: &Value, override_open: bool, run:
 
 #[cfg(not(target_arch = "wasm32"))]
 fn batch_datasets(s: &mut Session, cmd: &str, run: &Run<'_>) -> Result<Value> {
+    use super::distinct_names;
+    use super::screens::file_part;
+
     let st = s.doc()?;
     let names: Vec<String> = st.doc.variables.datasets.iter().map(|d| d.name.clone()).collect();
     if names.is_empty() {
@@ -134,12 +139,17 @@ fn batch_datasets(s: &mut Session, cmd: &str, run: &Run<'_>) -> Result<Value> {
         return Err(bad(cmd, format!("more than {MAX_BATCH_FILES} data sets")));
     }
     let doc_stem = st.path.as_deref().and_then(|p| std::path::Path::new(p).file_stem().and_then(|s| s.to_str())).unwrap_or("Untitled").to_string();
+    // Data set files are named File + Data Set Name (helpx, for Override Save/Export; the folder
+    // destination uses the same name). `file_part` writes the characters Windows does not allow in a
+    // file name (`/`, `\`, `:`, `<`, `>`, `"`, `|`, `?`, `*` and control characters) in the data set's
+    // name as `-`, and `distinct_names` adds `-2`, `-3`… to a name an earlier data set used.
+    let stems = distinct_names(names.iter().map(|name| format!("{doc_stem}_{}", file_part(name))));
     let steps = filter_steps(run.steps, true, false);
     let run = Run { steps: &steps, ..*run };
     let mut processed = Vec::new();
     let mut failed = 0usize;
-    for name in &names {
-        match process_one_dataset(s, &run, name, &doc_stem) {
+    for (name, stem) in names.iter().zip(&stems) {
+        match process_one_dataset(s, &run, name, stem) {
             Ok(row) => processed.push(row),
             Err(e) => {
                 failed += 1;
@@ -182,14 +192,12 @@ fn process_one_file(s: &mut Session, run: &Run<'_>, path: &str, stem: &str, ext:
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn process_one_dataset(s: &mut Session, run: &Run<'_>, name: &str, doc_stem: &str) -> Result<Value> {
+fn process_one_dataset(s: &mut Session, run: &Run<'_>, name: &str, stem: &str) -> Result<Value> {
     s.execute("dataset.select", &json!({"name": name}))?;
-    // File + Data Set Name naming when overriding Save/Export (helpx).
-    let stem = format!("{doc_stem}_{name}");
-    let rewritten = rewrite_paths(run.steps, run.override_save, run.override_export, run.dest_folder, &stem, "vectorcraft");
+    let rewritten = rewrite_paths(run.steps, run.override_save, run.override_export, run.dest_folder, stem, "vectorcraft");
     let batch = s.execute("command.batch", &json!({"label": run.label, "commands": rewritten}))?;
     // Data sets share one open document: write each row out but leave it open for the next.
-    finish_destination(s, run, &stem, "vectorcraft", "", false)?;
+    finish_destination(s, run, stem, "vectorcraft", "", false)?;
     Ok(json!({"dataset": name, "result": batch}))
 }
 
@@ -239,7 +247,8 @@ fn write_result(s: &mut Session, path: &str, ext: &str, as_copy: bool) -> Result
     Ok(())
 }
 
-/// Point Save / Export steps at `dest_folder/{stem}.{ext}` when overrides are on.
+/// Point Save / Export steps at `dest_folder/{stem}.{ext}` when overrides are on: `ext` is the
+/// extension of the step's `format` ([`format_extension`]), else `default_ext`.
 #[cfg(not(target_arch = "wasm32"))]
 fn rewrite_paths(
     steps: &[Value],
@@ -264,8 +273,10 @@ fn rewrite_paths(
             }
             let params = c.get("params").cloned().unwrap_or(json!({}));
             let mut params = params.as_object().cloned().unwrap_or_default();
-            let ext = params.get("format").and_then(Value::as_str).unwrap_or(default_ext);
-            let ext = if ext.is_empty() { default_ext } else { ext };
+            let ext = match params.get("format").and_then(Value::as_str).filter(|f| !f.is_empty()) {
+                Some(f) => format_extension(f),
+                None => default_ext.to_string(),
+            };
             let file = std::path::Path::new(folder).join(format!("{stem}.{ext}"));
             params.insert("path".into(), json!(file.to_string_lossy()));
             if let Some(o) = c.as_object_mut() {
@@ -274,6 +285,21 @@ fn rewrite_paths(
             c
         })
         .collect()
+}
+
+/// The extension of the file a step writes in `format` (an id or extension, as [`super::format`]
+/// reads it: any case, a leading dot allowed): the extension as written, in lower case and without
+/// the dot, when it is one of the format's (`SVG` → `svg`, `.JPEG` → `jpeg`), else the format's
+/// first (`png8` → `png`, `template` → `vctemplate`). An unknown format (`xyz`) keeps its spelling,
+/// and the step fails with its command's error.
+#[cfg(not(target_arch = "wasm32"))]
+fn format_extension(format: &str) -> String {
+    let written = format.trim_start_matches('.').to_ascii_lowercase();
+    match super::format(format) {
+        Some(f) if f.extensions.contains(&written.as_str()) => written,
+        Some(f) => f.extensions.first().map_or(written, |e| (*e).to_string()),
+        None => format.to_string(),
+    }
 }
 
 /// Readable files under `folder` (and optionally its subfolders), capped.
@@ -403,6 +429,70 @@ mod tests {
         assert!(dest.join("only.svg").is_file());
     }
 
+    /// Override Export names each file with the extension of the format the step names, however
+    /// the step spells it; a format given by one of its extensions keeps that extension.
+    #[test]
+    fn batch_override_export_names_files_with_the_format_s_extension() {
+        let src = tmp("ext-src");
+        write_svg(&src, "a.svg", "#f00");
+        let cases = [(".svg", "a.svg"), ("SVG", "a.svg"), ("svg", "a.svg"), ("png8", "a.png"), ("template", "a.vctemplate"), (".JPEG", "a.jpeg")];
+        for (i, (format, want)) in cases.into_iter().enumerate() {
+            let dest = tmp(&format!("ext-out-{i}"));
+            let mut s = Session::new();
+            let r = s
+                .execute(
+                    "action.batch",
+                    &json!({
+                        "folder": src.to_string_lossy(),
+                        "destinationFolder": dest.to_string_lossy(),
+                        "commands": [{"command": "document.export", "params": {"format": format}}]
+                    }),
+                )
+                .unwrap();
+            assert_eq!(r["failed"], 0, "{format}: {r}");
+            assert_eq!(file_names(&dest), [want], "{format}: {r}");
+        }
+        // An unknown format keeps its spelling, and the step fails with the export's error.
+        let dest = tmp("ext-out-unknown");
+        let mut s = Session::new();
+        let r = s
+            .execute(
+                "action.batch",
+                &json!({
+                    "folder": src.to_string_lossy(),
+                    "destinationFolder": dest.to_string_lossy(),
+                    "commands": [{"command": "document.export", "params": {"format": "xyz"}}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["failed"], 1, "{r}");
+        assert!(r["processed"][0]["error"].as_str().is_some_and(|e| e.contains("unknown format `xyz`")), "{r}");
+        assert!(file_names(&dest).is_empty(), "{r}");
+    }
+
+    /// Override Save names each file with the extension of the format the step names, also over
+    /// data sets.
+    #[test]
+    fn batch_override_save_names_files_with_the_format_s_extension() {
+        for (i, format) in [".svg", "SVG", ".PDF"].into_iter().enumerate() {
+            let dest = tmp(&format!("ext-save-{i}"));
+            let mut s = with_data_sets(&["a"]);
+            let r = s
+                .execute(
+                    "action.batch",
+                    &json!({
+                        "source": "datasets",
+                        "destinationFolder": dest.to_string_lossy(),
+                        "commands": [{"command": "file.saveAs", "params": {"format": format}}]
+                    }),
+                )
+                .unwrap();
+            assert_eq!(r["failed"], 0, "{format}: {r}");
+            let want = format!("Untitled_a.{}", format.trim_start_matches('.').to_ascii_lowercase());
+            assert_eq!(file_names(&dest), [want], "{format}: {r}");
+        }
+    }
+
     #[test]
     fn batch_datasets_applies_each_row() {
         let dest = tmp("sets");
@@ -430,6 +520,128 @@ mod tests {
         assert_eq!(r["failed"], 0, "{r}");
         let written: Vec<_> = std::fs::read_dir(&dest).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         assert_eq!(written.len(), 2, "{written:?}");
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn file_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// A new document with an empty data set for each of `names`.
+    fn with_data_sets(names: &[&str]) -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"width": 100, "height": 80})).unwrap();
+        for name in names {
+            s.execute("dataset.new", &json!({"name": name})).unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn batch_keeps_data_set_files_inside_the_destination_folder() {
+        let root = tmp("set-names-root");
+        let dest = root.join("out");
+        // The folder that `a/../../x` would pass through on its way out of `out`.
+        std::fs::create_dir_all(dest.join("Untitled_a")).unwrap();
+        let mut s = with_data_sets(&["a/../../x", "../y"]);
+        let r = s
+            .execute(
+                "action.batch",
+                &json!({
+                    "source": "datasets",
+                    "destination": "folder",
+                    "destinationFolder": dest.to_string_lossy(),
+                    "stopOnError": false,
+                    "commands": [{"command": "object.unlockAll", "params": {}}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["failed"], 0, "{r}");
+        assert_eq!(file_names(&dest), ["Untitled_..-y.vectorcraft", "Untitled_a", "Untitled_a-..-..-x.vectorcraft"], "{r}");
+        assert_eq!(file_names(&root), ["out"], "nothing is written outside the destination folder");
+    }
+
+    #[test]
+    fn batch_saves_data_sets_named_with_separators() {
+        let dest = tmp("set-names-sep");
+        let exports = tmp("set-names-sep-export");
+        let mut s = with_data_sets(&["a/b", "c\\d", "e:f"]);
+        let r = s
+            .execute(
+                "action.batch",
+                &json!({
+                    "source": "datasets",
+                    "destination": "folder",
+                    "destinationFolder": dest.to_string_lossy(),
+                    "stopOnError": false,
+                    "commands": [{"command": "object.unlockAll", "params": {}}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["failed"], 0, "{r}");
+        assert_eq!(file_names(&dest), ["Untitled_a-b.vectorcraft", "Untitled_c-d.vectorcraft", "Untitled_e-f.vectorcraft"], "{r}");
+        // Override Export points each data set's export at the destination folder under the same name.
+        let r = s
+            .execute(
+                "action.batch",
+                &json!({
+                    "source": "datasets",
+                    "destinationFolder": exports.to_string_lossy(),
+                    "stopOnError": false,
+                    "commands": [{"command": "document.export", "params": {"format": "svg"}}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["failed"], 0, "{r}");
+        assert_eq!(file_names(&exports), ["Untitled_a-b.svg", "Untitled_c-d.svg", "Untitled_e-f.svg"], "{r}");
+    }
+
+    /// Windows does not allow `<`, `>`, `"`, `|`, `?`, `*` or control characters in a file name:
+    /// Batch writes them as `-` in a data set's name, on every platform.
+    #[test]
+    fn batch_saves_data_sets_named_with_characters_windows_does_not_allow() {
+        let dest = tmp("set-names-win");
+        let mut s = with_data_sets(&["a?b", "c*d<e>", "f\"g|h", "i\u{7}j"]);
+        let r = s
+            .execute(
+                "action.batch",
+                &json!({
+                    "source": "datasets",
+                    "destination": "folder",
+                    "destinationFolder": dest.to_string_lossy(),
+                    "stopOnError": false,
+                    "commands": [{"command": "object.unlockAll", "params": {}}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["failed"], 0, "{r}");
+        assert_eq!(
+            file_names(&dest),
+            ["Untitled_a-b.vectorcraft", "Untitled_c-d-e-.vectorcraft", "Untitled_f-g-h.vectorcraft", "Untitled_i-j.vectorcraft"],
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn batch_gives_each_data_set_a_file_of_its_own() {
+        let dest = tmp("set-names-same");
+        let mut s = with_data_sets(&["a:b", "a-b", "A-B"]);
+        let r = s
+            .execute(
+                "action.batch",
+                &json!({
+                    "source": "datasets",
+                    "destination": "folder",
+                    "destinationFolder": dest.to_string_lossy(),
+                    "commands": [{"command": "object.unlockAll", "params": {}}]
+                }),
+            )
+            .unwrap();
+        assert_eq!(r["failed"], 0, "{r}");
+        assert_eq!(file_names(&dest), ["Untitled_A-B-3.vectorcraft", "Untitled_a-b-2.vectorcraft", "Untitled_a-b.vectorcraft"], "{r}");
     }
 
     #[test]

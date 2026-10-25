@@ -1,6 +1,8 @@
 //! Symbol instances measured by their symbol's art: Align, the Transform panel and the bounding
-//! box, Use Preview Bounds, Fit to Artwork Bounds, EPS export of the art, an artboard's SVG, Export
-//! Selection and the raster effect images of exports.
+//! box, Use Preview Bounds, Fit to Artwork Bounds, Rearrange, Convert to Artboards, All on Active
+//! Artboard, Transform Each, Lock and Hide › All Artwork Above, EPS export of the art, an
+//! artboard's SVG, Export Selection, copy and paste, library graphics and the raster effect images
+//! of exports.
 
 use std::sync::Arc;
 
@@ -316,6 +318,90 @@ fn fit_to_artwork_bounds_fits_the_instances_art() {
     assert!(close(Some(board), Rect::new(80.0, 0.0, 90.0, 10.0)), "{board:?}");
 }
 
+/// Returns a session whose document has artboard 1 from (0, 0) to (800, 600), artboard 2 from
+/// (1000, 0) to (1400, 300), and an instance of a symbol whose art, a black rectangle from
+/// (1100, 50) to (1140, 70), lies far from the symbol's origin, and returns the instance's id. With
+/// the instance moved by (100, 100), the art, (1200, 150) to (1240, 170), is on artboard 2, and the
+/// 20 × 20 square around the origin, (90, 90) to (110, 110), is on artboard 1.
+fn far_on_artboard_2() -> (Session, NodeId) {
+    let mut d = Document::new(800.0, 600.0);
+    let rect = shapes::rectangle(Rect::new(1100.0, 50.0, 1140.0, 70.0));
+    let art = Node::path(d.alloc_id(), rect, Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0));
+    d.symbols.push(Symbol { name: "Far".into(), art: Arc::new(art) });
+    let (layer, id) = (d.layers[0].id, d.alloc_id());
+    d.insert(Some(layer), 0, Node::new(id, NodeKind::SymbolInstance { symbol: "Far".into(), xf: Affine::translate((100.0, 100.0)) })).unwrap();
+    let mut s = Session::new();
+    s.add_document(d, None);
+    run(&mut s, "artboard.new", json!({"x": 1000, "y": 0, "width": 400, "height": 300}));
+    (s, id)
+}
+
+/// Draws a 10 × 10 square at (`x`, `y`), on top, and returns its id.
+fn square(s: &mut Session, x: f64, y: f64) -> NodeId {
+    NodeId(run(s, "shape.rectangle", json!({"x": x, "y": y, "width": 10, "height": 10}))["id"].as_u64().expect("the square"))
+}
+
+fn bounds(s: &Session, ids: &[NodeId]) -> Option<Rect> {
+    s.doc().unwrap().doc.bounds_of(ids, false)
+}
+
+#[test]
+fn rearrange_moves_an_instance_with_the_artboard_its_art_is_on() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "artboard.rearrange", json!({"columns": 1, "spacing": 50}));
+    assert_eq!(s.doc().unwrap().doc.artboards[1].rect, Rect::new(0.0, 650.0, 400.0, 950.0));
+    assert!(close(bounds(&s, &[far]), Rect::new(200.0, 800.0, 240.0, 820.0)), "{:?}", bounds(&s, &[far]));
+}
+
+#[test]
+fn all_on_active_artboard_selects_an_instance_on_the_artboard_its_art_is_on() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.allOnArtboard", json!({"artboard": 1}));
+    assert_eq!(s.doc().unwrap().selection.objects, [far]);
+    run(&mut s, "select.allOnArtboard", json!({"artboard": 0}));
+    assert!(s.doc().unwrap().selection.objects.is_empty());
+}
+
+#[test]
+fn convert_to_artboards_makes_an_artboard_of_the_instances_art() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "artboard.convertToArtboards", json!({}));
+    let board = s.doc().unwrap().doc.artboards[2].rect;
+    assert!(close(Some(board), Rect::new(1200.0, 150.0, 1240.0, 170.0)), "{board:?}");
+}
+
+#[test]
+fn transform_each_scales_an_instance_about_the_center_of_its_art() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "object.transformEach", json!({"scaleH": 200, "scaleV": 200}));
+    assert!(close(bounds(&s, &[far]), Rect::new(1180.0, 140.0, 1260.0, 180.0)), "{:?}", bounds(&s, &[far]));
+}
+
+#[test]
+fn lock_and_hide_all_artwork_above_measure_the_instances_art() {
+    // Above the selected instance, the square on its art is locked and the square on the 20 × 20
+    // square is not.
+    let (mut s, far) = far_on_artboard_2();
+    let (on_art, on_square) = (square(&mut s, 1205.0, 155.0), square(&mut s, 95.0, 95.0));
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "object.lock.above", json!({}));
+    let node = |s: &Session, id: NodeId| s.doc().unwrap().doc.node(id).unwrap().clone();
+    assert!(node(&s, on_art).locked && !node(&s, on_square).locked);
+    // Brought in front of both squares, the instance is hidden above the square on its art only.
+    let (mut s, far) = far_on_artboard_2();
+    let (on_art, on_square) = (square(&mut s, 1205.0, 155.0), square(&mut s, 95.0, 95.0));
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "object.arrange.bringToFront", json!({}));
+    run(&mut s, "select.set", json!({"ids": [on_square.0]}));
+    run(&mut s, "object.hide.above", json!({}));
+    assert!(node(&s, far).visible, "the instance's art does not overlap the selected square");
+    run(&mut s, "select.set", json!({"ids": [on_art.0]}));
+    run(&mut s, "object.hide.above", json!({}));
+    assert!(!node(&s, far).visible);
+}
+
 #[test]
 fn eps_of_the_art_bounds_and_writes_an_instances_art() {
     let (mut s, _) = open(FAR);
@@ -395,6 +481,64 @@ fn export_selection_crops_to_the_instances_art() {
     let bounds: Vec<f64> = v["bounds"].as_array().unwrap().iter().filter_map(Value::as_f64).collect();
     // x, y, width and height: the art, not the 20 × 20 square from (-10, -10).
     assert_eq!(bounds, [100.0, 60.0, 40.0, 20.0], "{v}");
+}
+
+fn ids(v: &Value) -> Vec<NodeId> {
+    v["ids"].as_array().unwrap().iter().filter_map(Value::as_u64).map(NodeId).collect()
+}
+
+#[test]
+fn a_copied_instance_comes_from_the_artboard_its_art_is_on() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "edit.copy", json!({}));
+    assert_eq!(s.clipboard.source_artboard, Some(Rect::new(1000.0, 0.0, 1400.0, 300.0)));
+    // Pasted in place onto artboard 2, it lands where it was.
+    let pasted = ids(&run(&mut s, "edit.pasteInPlace", json!({"artboard": 1})));
+    assert!(close(bounds(&s, &pasted), Rect::new(1200.0, 150.0, 1240.0, 170.0)), "{:?}", bounds(&s, &pasted));
+}
+
+#[test]
+fn a_copied_instances_png_is_cropped_to_its_art() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "edit.copy", json!({}));
+    let r = run(&mut s, "clipboard.exportPng", json!({}));
+    assert_eq!((r["width"].as_u64(), r["height"].as_u64()), (Some(40), Some(20)));
+    let png = vectorcraft_format::base64_decode(r["dataBase64"].as_str().unwrap()).unwrap();
+    let img = image::load_from_memory(&png).unwrap().to_rgba8();
+    assert_eq!(img.get_pixel(20, 10).0, [0, 0, 0, 255], "the art fills the picture");
+}
+
+#[test]
+fn an_instance_pasted_at_a_point_has_its_art_centered_there() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    run(&mut s, "edit.copy", json!({}));
+    let pasted = ids(&run(&mut s, "edit.paste", json!({"center": [300, 200]})));
+    assert!(close(bounds(&s, &pasted), Rect::new(280.0, 190.0, 320.0, 210.0)), "{:?}", bounds(&s, &pasted));
+}
+
+#[test]
+fn svg_markup_on_the_clipboard_is_centered_by_the_instances_art() {
+    let mut s = Session::new();
+    run(&mut s, "file.new", json!({"width": 400, "height": 300}));
+    run(&mut s, "clipboard.importSvg", json!({"dataBase64": vectorcraft_format::base64_encode(FAR.as_bytes()), "center": [200, 150]}));
+    let pasted = ids(&run(&mut s, "edit.pasteInPlace", json!({})));
+    assert!(close(bounds(&s, &pasted), Rect::new(180.0, 140.0, 220.0, 160.0)), "{:?}", bounds(&s, &pasted));
+}
+
+#[test]
+fn a_library_graphic_of_an_instance_is_measured_by_its_art() {
+    let (mut s, far) = far_on_artboard_2();
+    run(&mut s, "select.set", json!({"ids": [far.0]}));
+    let added = run(&mut s, "library.add", json!({"kind": "graphic"}));
+    let (lib, item) = (added["library"].clone(), added["id"].clone());
+    let g = &run(&mut s, "library.get", json!({"library": lib}))["graphics"][0];
+    assert_eq!((g["width"].as_f64(), g["height"].as_f64()), (Some(40.0), Some(20.0)), "{g}");
+    run(&mut s, "file.new", json!({"width": 300, "height": 300}));
+    let placed = ids(&run(&mut s, "library.use", json!({"library": lib, "kind": "graphic", "item": item, "center": [150, 100]})));
+    assert!(close(bounds(&s, &placed), Rect::new(130.0, 90.0, 170.0, 110.0)), "{:?}", bounds(&s, &placed));
 }
 
 #[test]

@@ -1,9 +1,11 @@
 //! Links panel: every image in the document, linked files with their status (missing, modified)
 //! and embedded images, as rows with a thumbnail, name, page and status. Clicking a row selects
-//! its image; the buttons Relink, Go To, Update and Edit Original act on the selected rows; Link
-//! Info shows the details of the first. The flyout adds Relink to Folder, Find in Folder (Find
-//! Linked Files: `ui.findLinksInFolder`), Embed / Unembed, Placement Options, Show filters, Sort,
-//! thumbnail size and Show in Folder.
+//! its image, Ctrl/Cmd-click adds or removes it, and Shift-click selects the images of the rows
+//! from the last row clicked without Shift to it (with Ctrl/Cmd, adds them); the buttons Relink,
+//! Go To, Update and Edit Original act on the selected rows; Link Info shows the details of the
+//! first. The flyout adds Relink to Folder, Find in Folder (Find Linked Files:
+//! `ui.findLinksInFolder`), Embed / Unembed, Placement Options, Show filters, Sort, thumbnail size
+//! and Show in Folder.
 //!
 //! Everything runs through the `links.*` commands (`links.editOriginal` and `links.reveal` are UI
 //! commands: they hand the file to the system).
@@ -121,7 +123,7 @@ pub(crate) fn relink(app: &mut VectorcraftApp, ids: Vec<u64>) {
 }
 
 fn relink_picked(app: &mut VectorcraftApp, ids: Vec<u64>) {
-    let pick = crate::FilePick { filters: vectorcraft_engine::cmd::fileio::place_filters().collect(), ..Default::default() };
+    let pick = crate::FilePick { filters: crate::FilePick::filters(vectorcraft_engine::cmd::fileio::place_filters()), ..Default::default() };
     let Some(path) = crate::picks::open(app, &pick) else { return };
     let r = app.run("links.relink", json!({ "ids": ids, "path": path }));
     report(app, r, |v| format!("Relinked {} image(s)", v["relinked"].as_array().map_or(0, Vec::len)));
@@ -132,7 +134,7 @@ fn relink_picked(app: &mut VectorcraftApp, ids: Vec<u64>) {
 /// say.
 pub(crate) fn replace(app: &mut VectorcraftApp, ids: Vec<u64>) {
     crate::picks::button(app, move |app| {
-        let pick = crate::FilePick { filters: vectorcraft_engine::cmd::fileio::place_filters().collect(), ..Default::default() };
+        let pick = crate::FilePick { filters: crate::FilePick::filters(vectorcraft_engine::cmd::fileio::place_filters()), ..Default::default() };
         let Some(path) = crate::picks::open(app, &pick) else { return };
         let r = app.run("links.relink", json!({ "ids": ids.clone(), "path": path, "preserve": "fit" }));
         report(app, r, |v| format!("Replaced {} image(s)", v["relinked"].as_array().map_or(0, Vec::len)));
@@ -205,8 +207,33 @@ pub(crate) fn open_file(app: &mut VectorcraftApp, p: &Value, reveal: bool) -> Re
         crate::dialogs::settle(app);
         return Ok(json!({ "path": path }));
     }
-    if reveal { crate::io::reveal_path(app, &path) } else { crate::io::open_in_app(app, &path) }?;
+    if reveal {
+        crate::io::reveal_path(app, &path)?;
+    } else {
+        app.refuse_automation("links.editOriginal")?;
+        openable_original(&path)?;
+        crate::io::open_in_app(app, &path)?;
+    }
     Ok(json!({ "path": path }))
+}
+
+/// Whether Edit Original may hand `path` to the system's default app: a regular file (after
+/// following links) whose name, and the name it links to, have the extension of a format
+/// VectorCraft reads. Anything else (a folder or app bundle, a script, a shortcut) is refused.
+pub(crate) fn openable_original(path: &str) -> Result<(), String> {
+    let readable = |p: &std::path::Path| {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        !ext.is_empty() && vectorcraft_engine::cmd::fileio::FORMATS.iter().any(|f| f.read && f.extensions.contains(&ext.as_str()))
+    };
+    let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+    let real = std::fs::canonicalize(path).map_err(|e| format!("can't open “{name}”: {e}"))?;
+    if !real.is_file() {
+        return Err(format!("“{name}” is not a file"));
+    }
+    if !readable(std::path::Path::new(path)) || !readable(&real) {
+        return Err(format!("Edit Original opens image and document files only; “{name}” is not one"));
+    }
+    Ok(())
 }
 
 /// A status badge: missing (red, ?), modified (amber, !), embedded (the image icon).
@@ -245,6 +272,31 @@ fn status_tip(r: &Value) -> String {
     }
 }
 
+/// A click on the row of image `id` among the shown `rows`: plain selects the image alone,
+/// Ctrl/Cmd adds or removes it, and Shift selects the images of the rows from the last row clicked
+/// without Shift in this document to it, or with Ctrl/Cmd adds them to the selection. A
+/// Shift-click while that row is not shown, or after the last click was in another document, acts
+/// as a click without Shift.
+fn click(app: &mut VectorcraftApp, ctx: &egui::Context, rows: &[Value], id: u64, m: egui::Modifiers) {
+    let Some(uid) = app.session.active().map(|st| st.uid) else { return };
+    let anchor: Option<(u64, u64)> = pstate(ctx, "links-anchor");
+    let at = |id: u64| rows.iter().position(|r| r["id"].as_u64() == Some(id));
+    if m.shift
+        && let Some((_, a)) = anchor.filter(|(doc, _)| *doc == uid)
+        && let (Some(i), Some(j)) = (at(a), at(id))
+    {
+        let range: Vec<u64> = rows.get(i.min(j)..=i.max(j)).unwrap_or_default().iter().filter_map(|r| r["id"].as_u64()).collect();
+        app.run(if m.command { "select.add" } else { "select.set" }, json!({ "ids": range })).ok();
+        return;
+    }
+    set_pstate(ctx, "links-anchor", Some((uid, id)));
+    if m.command {
+        app.run("select.toggle", json!({ "id": id })).ok();
+    } else {
+        app.run("select.set", json!({ "ids": [id] })).ok();
+    }
+}
+
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let o = options(ui.ctx());
@@ -257,7 +309,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let thumbs = super::layers::ThumbSource::of(app, st, &doc);
     let selected = selected_images(app);
     let rows: &[Value] = cache.list["links"].as_array().map_or(&[], Vec::as_slice);
-    let mut clicked: Option<(u64, bool, bool)> = None;
+    let mut clicked: Option<(u64, egui::Modifiers, bool)> = None;
     widgets::list_box(ui, |ui| {
         ui.set_min_height(110.0);
         ui.set_width(ui.available_width());
@@ -317,21 +369,16 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                 );
                 let resp = resp.on_hover_text(status_tip(r));
                 if resp.double_clicked() {
-                    clicked = Some((id, false, true));
+                    clicked = Some((id, egui::Modifiers::NONE, true));
                 } else if resp.clicked() {
-                    clicked = Some((id, ui.input(|i| i.modifiers.shift || i.modifiers.command), false));
+                    clicked = Some((id, ui.input(|i| i.modifiers), false));
                 }
             }
         });
     });
     match clicked {
         Some((id, _, true)) => go_to(app, id),
-        Some((id, true, _)) => {
-            app.run("select.toggle", json!({ "id": id })).ok();
-        }
-        Some((id, false, _)) => {
-            app.run("select.set", json!({ "ids": [id] })).ok();
-        }
+        Some((id, m, false)) => click(app, ui.ctx(), rows, id, m),
         None => {}
     }
     if o.info {

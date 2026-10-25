@@ -84,6 +84,57 @@ fn new_stops_recolour_the_points() {
     assert_eq!((f.points[0].color.to_hex(), f.points.last().unwrap().color.to_hex()), ("#ff0000".into(), "#0000ff".into()));
 }
 
+/// A CMYK color's inks.
+fn inks(c: Color) -> [f32; 4] {
+    match c {
+        Color::Cmyk { c, m, y, k } => [c, m, y, k],
+        c => panic!("a CMYK color expected: {c:?}"),
+    }
+}
+
+/// Cyan and black inks only, adding up to one.
+fn cyan_and_black(c: Color) -> bool {
+    let [c, m, y, k] = inks(c);
+    m.abs() < 1e-5 && y.abs() < 1e-5 && (c + k - 1.0).abs() < 1e-5
+}
+
+#[test]
+fn cmyk_stops_recolor_the_points_with_inks() {
+    let cyan_to_black = json!([{"offset": 0, "color": {"c": 1, "m": 0, "y": 0, "k": 0}}, {"offset": 1, "color": {"c": 0, "m": 0, "y": 0, "k": 1}}]);
+    let (mut s, id) = freeform_rect();
+    run(&mut s, "paint.editGradient", json!({"stops": cyan_to_black}));
+    let f = points(&s, id);
+    let n = f.points.len();
+    for (i, p) in f.points.iter().enumerate() {
+        let k = i as f32 / (n - 1) as f32;
+        let [c, m, y, kk] = inks(p.color);
+        assert!((c - (1.0 - k)).abs() < 1e-5 && m.abs() < 1e-5 && y.abs() < 1e-5 && (kk - k).abs() < 1e-5, "point {i}: {:?}", p.color);
+    }
+    // A CMYK gradient switched to freeform places points with inks.
+    let mut s = session();
+    let id = shape(&mut s, "shape.rectangle", 100.0, 100.0, 100.0, 100.0);
+    run(&mut s, "paint.setFill", json!({"gradient": {"kind": "linear", "stops": cyan_to_black}}));
+    run(&mut s, "paint.editGradient", json!({"kind": "freeform"}));
+    assert!(points(&s, id).points.iter().all(|p| cyan_and_black(p.color)), "{:?}", points(&s, id).points);
+}
+
+#[test]
+fn points_added_between_cmyk_points_take_inks() {
+    let (mut s, id) = freeform_rect();
+    let n = points(&s, id).points.len();
+    for i in 0..n {
+        let c = if i % 2 == 0 { json!({"c": 1, "m": 0, "y": 0, "k": 0}) } else { json!({"c": 0, "m": 0, "y": 0, "k": 1}) };
+        run(&mut s, "paint.freeform.setPoint", json!({"index": i, "color": c}));
+    }
+    run(&mut s, "paint.freeform.addLine", json!({"points": [0, 1]}));
+    let i = run(&mut s, "paint.freeform.splitLine", json!({"line": 0, "segment": 0}))["index"].as_u64().unwrap() as usize;
+    let split = points(&s, id).points[i].color;
+    assert!(cyan_and_black(split), "the split point: {split:?}");
+    let i = run(&mut s, "paint.freeform.addPoint", json!({"at": [150, 150]}))["index"].as_u64().unwrap() as usize;
+    let added = points(&s, id).points[i].color;
+    assert!(cyan_and_black(added), "the added point: {added:?}");
+}
+
 #[test]
 fn transforms_and_warps_move_the_points() {
     let (mut s, id) = freeform_rect();
@@ -187,6 +238,27 @@ fn lines_join_split_and_follow_the_selection() {
     assert_eq!(g["points"][i]["at"], json!([190.0, 190.0]));
 }
 
+/// Split Line refuses a `t` that is not a number, and the point commands and the query a `stroke`
+/// that is not true or false, given as text or as another value of the wrong kind; the gradient and
+/// the undo history stay as they were. Numbers, false and null still work.
+#[test]
+fn freeform_commands_refuse_a_number_or_boolean_given_as_text() {
+    use super::tests::{not_a_number, not_a_switch, not_refused};
+    let (mut s, id) = freeform_rect();
+    run(&mut s, "paint.freeform.addLine", json!({"points": [0, 1]}));
+    let calls = [
+        not_a_number("paint.freeform.splitLine", json!({"line": 0, "segment": 0, "t": "0.25"}), "t"),
+        not_a_switch("paint.freeform.addPoint", json!({"at": [150, 150], "stroke": "false"}), "stroke"),
+        not_a_switch("paint.freeform.get", json!({"stroke": [false]}), "stroke"),
+    ];
+    let wrong = not_refused(&mut s, &calls);
+    assert!(wrong.is_empty(), "not refused: {wrong:#?}");
+    run(&mut s, "paint.freeform.splitLine", json!({"line": 0, "segment": 0, "t": null}));
+    let g = run(&mut s, "paint.freeform.get", json!({"stroke": false}));
+    assert_eq!(g["lines"][0].as_array().map(Vec::len), Some(3));
+    assert_eq!(points(&s, id).lines[0].len(), 3);
+}
+
 #[test]
 fn point_commands_need_a_freeform_gradient() {
     let mut s = session();
@@ -209,6 +281,27 @@ fn point_commands_need_a_freeform_gradient() {
     // Nothing selected: nothing to edit.
     run(&mut s, "select.none", json!({}));
     assert!(s.execute("paint.freeform.addPoint", &json!({"at": [1, 1]})).is_err());
+}
+
+/// The point and line commands refuse a point, line or segment of 2^32 + k, where k names one that
+/// exists, and the points and the selected point stay as they were. A 32-bit build read the number
+/// as k.
+#[test]
+fn point_commands_refuse_an_index_past_u32() {
+    let (mut s, id) = freeform_rect();
+    run(&mut s, "paint.freeform.addLine", json!({"points": [0, 1]}));
+    let (before, selected) = (points(&s, id), s.selected_freeform_point());
+    let past = |k: u64| (1u64 << 32) + k;
+    for (cmd, p) in [
+        ("paint.freeform.setPoint", json!({"index": past(1), "color": "#000000"})),
+        ("paint.freeform.deletePoint", json!({"index": past(1)})),
+        ("paint.freeform.selectPoint", json!({"index": past(1)})),
+        ("paint.freeform.splitLine", json!({"line": past(0), "segment": 0})),
+        ("paint.freeform.splitLine", json!({"line": 0, "segment": past(0)})),
+    ] {
+        assert!(s.execute(cmd, &p).is_err(), "{cmd} {p}");
+        assert_eq!((points(&s, id), s.selected_freeform_point()), (before.clone(), selected), "{cmd} {p}");
+    }
 }
 
 #[test]

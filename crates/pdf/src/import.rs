@@ -24,7 +24,9 @@ use vectorcraft_geom::{FillRule, PathData};
 use crate::import_color::{Colors, Native};
 use crate::import_mask::{MaskSpec, contains, is_rectangle, luminance, mask_spec, white_cover};
 use crate::import_scan::{FontNames, MAX_NESTING, Ocgs, Scan, TextOverprint, Walked, all_on, hides_forms, scan_page, tag_key};
-use crate::import_shading::{clipped, extend_clip, fold_stop_opacity, gradient_shape, mesh_shading, shading_gradient};
+use crate::import_shading::{
+    FunctionBudget, FunctionPaint, clipped, extend_clip, fold_stop_opacity, function_paint, gradient_shape, mesh_shading, shading_gradient,
+};
 use crate::import_text::{Families, LineFacts, Look, Placement, TextLine, Upright};
 use crate::{CropTo, ImportOptions, ImportReport, PdfError, TextAs};
 
@@ -146,6 +148,36 @@ pub const OFF_ARTBOARD_NOTE: &str =
 
 /// Warning: art reaching past the page box was clipped to it.
 pub const PAST_PAGE_NOTE: &str = "art reaching past the page was clipped to it, as PDF viewers show it";
+
+/// Warning: glyphs were kept as outlines rather than read as type.
+pub const OUTLINED_TEXT_NOTE: &str = "text was converted to outlines";
+/// Warning: text drawn invisibly (text rendering mode 3, as a scanned page's OCR layer is) that
+/// can't come in as type (text read as outlines, or a Type 3 font) was left out: as outlines it
+/// would draw nothing (#2675).
+pub const INVISIBLE_TEXT_NOTE: &str = "invisible text (such as a scanned page's searchable OCR layer) that couldn't be read as type was left out";
+/// Warning: glyphs that differ from the installed font of their name were kept as outlines.
+pub const UNMATCHED_GLYPHS_NOTE: &str = "text whose glyphs differ from the installed font of the same name was kept as outlines";
+/// The end of the warning that glyphs whose characters the file doesn't name were kept as
+/// outlines, after "text in" and the font's name.
+pub const UNNAMED_CHARACTERS_NOTE: &str = "whose characters the file doesn't name (U+FFFD) was kept as outlines";
+
+/// Is `note` one of the warnings that glyphs were kept as outlines ([`OUTLINED_TEXT_NOTE`],
+/// [`UNMATCHED_GLYPHS_NOTE`], [`UNNAMED_CHARACTERS_NOTE`])?
+pub fn is_outlines_note(note: &str) -> bool {
+    note == OUTLINED_TEXT_NOTE || note == UNMATCHED_GLYPHS_NOTE || note.starts_with("text in ") && note.ends_with(UNNAMED_CHARACTERS_NOTE)
+}
+
+/// Is `n` glyphs kept as outlines (a path the import names `<Text Outlines>`)?
+pub fn is_glyph_outlines(n: &Node) -> bool {
+    matches!(n.kind, NodeKind::Path { .. }) && n.name.as_deref() == Some(TEXT_OUTLINES)
+}
+
+/// Does `doc` hold glyphs kept as outlines ([`is_glyph_outlines`])?
+pub fn holds_outlines(doc: &Document) -> bool {
+    let mut any = false;
+    doc.walk(|n| any |= is_glyph_outlines(n));
+    any
+}
 
 /// Import a PDF, returning the document plus warnings about content that was approximated or skipped.
 pub fn import_with_report(bytes: &[u8], opts: &ImportOptions) -> Result<ImportReport, PdfError> {
@@ -359,8 +391,12 @@ fn read_with_reader_options(bytes: &[u8], opts: &ImportOptions, reader: &craft_p
             id: i as u32 + 1,
             name: format!("Artboard {}", i + 1),
             rect: ab,
+            locked: false,
             show_center_mark: false,
             show_cross_hairs: false,
+            show_video_safe_areas: false,
+            video_ruler_pixel_aspect_ratio: 1.0,
+            color: None,
         });
         let page_layer = |b: &mut Builder<'_>, art: Vec<Arc<Node>>, shown: bool| {
             let name = if shown { format!("Page {}", number + 1) } else { format!("Page {} (unsorted)", number + 1) };
@@ -449,6 +485,10 @@ fn read_with_reader_options(bytes: &[u8], opts: &ImportOptions, reader: &craft_p
         let list = b.missing_fonts.join(", ");
         b.warn(&format!("fonts that aren't available show in the fallback font until they are: {list}"));
     }
+    // Before anything walks the tree by recursion (`fix_next_id` does): nested clips can be deeper
+    // than the stack goes.
+    let mut depth_notes = vec![];
+    doc.limit_depth_noting(&mut depth_notes);
     doc.fix_next_id();
     doc.reserve_ids(b.next);
 
@@ -460,7 +500,7 @@ fn read_with_reader_options(bytes: &[u8], opts: &ImportOptions, reader: &craft_p
             }
         }
     }
-    doc.limit_depth_noting(&mut warnings);
+    warnings.extend(depth_notes);
     let user_unit = picked.first().and_then(|&n| pages.get(n)).map_or(1.0, |page| f64::from(page.user_unit()));
     Ok(ImportReport { document: doc, warnings, native: crate::editing::editing_in(&pdf), only_text, user_unit })
 }
@@ -840,6 +880,10 @@ struct Builder<'p> {
     /// Pattern swatches made, and per (pattern, stroke) the art signatures read and their names.
     patterns: Vec<PatternDef>,
     pattern_keys: HashMap<(u128, bool), PatternReadings>,
+    /// Per function-based shading (and the inks it paints with): what it comes in as, read once.
+    function_paints: HashMap<(u128, Option<Vec<String>>), Paint>,
+    /// What is left of the import's function evaluations for those shadings.
+    function_budget: FunctionBudget,
     /// Swatch names in use.
     taken: Vec<String>,
     /// The page as walked by [`scan_page`], and how far the interpreter is through it.
@@ -925,8 +969,17 @@ fn mean_scale(a: Affine) -> f64 {
     a.determinant().abs().sqrt()
 }
 
+/// Width a PDF line width of 0 imports as, points: a print hairline. In PDF `0 w` is the thinnest
+/// line the device can draw (ISO 32000-1, 8.4.3.2), not no line.
+const HAIRLINE: f64 = 0.25;
+
+/// Document width of the stroke `p` drawn at `scale`: `0 w` becomes a [`HAIRLINE`].
+fn line_width(p: &StrokeProps, scale: f64) -> f64 {
+    if p.line_width == 0.0 { HAIRLINE } else { p.line_width as f64 * scale }
+}
+
 fn stroke_layer(paint: Paint, opacity: f32, p: &StrokeProps, scale: f64) -> StrokeLayer {
-    let mut st = StrokeLayer::new(paint, p.line_width as f64 * scale);
+    let mut st = StrokeLayer::new(paint, line_width(p, scale));
     st.opacity = opacity;
     st.cap = match p.line_cap {
         kurbo::Cap::Butt => LineCap::Butt,
@@ -939,11 +992,19 @@ fn stroke_layer(paint: Paint, opacity: f32, p: &StrokeProps, scale: f64) -> Stro
         kurbo::Join::Bevel => LineJoin::Bevel,
     };
     st.miter_limit = p.miter_limit as f64;
-    let dash = Dash { pattern: p.dash_array.iter().map(|v| *v as f64 * scale).collect(), offset: p.dash_offset as f64 * scale, align_corners: false };
+    // (Every stroke keeps its own copy: a dash array has a few entries, and one with thousands is cut.)
+    let dash = Dash {
+        pattern: p.dash_array.iter().take(MAX_DASH_ENTRIES).map(|v| *v as f64 * scale).collect(),
+        offset: p.dash_offset as f64 * scale,
+        align_corners: false,
+    };
     // An invalid dash array (a negative value, or all zeros) strokes solid.
     st.dash = dash.is_dashed().then_some(dash);
     st
 }
+
+/// The most entries of a dash array kept (an even count keeps it a pattern of dashes and gaps).
+const MAX_DASH_ENTRIES: usize = 64;
 
 pub(crate) fn round3(v: f32) -> f32 {
     (v * 1000.0).round() / 1000.0
@@ -994,6 +1055,8 @@ impl<'p> Builder<'p> {
             masks: HashMap::new(),
             patterns: vec![],
             pattern_keys: HashMap::new(),
+            function_paints: HashMap::new(),
+            function_budget: FunctionBudget::new(),
             taken: vec![],
             scan: Scan::default(),
             tag_at: 0,
@@ -1378,13 +1441,20 @@ impl<'p> Builder<'p> {
                 (paint, a)
             }
             craft_pdf::interpret::Paint::Pattern(pat) => match pat.as_ref() {
-                Pattern::Shading(sp) => match shading_gradient(sp, &mut self.colors, inks) {
-                    Some((g, _)) => (Paint::Gradient(Box::new(g)), sp.opacity),
-                    None => {
-                        self.warn("function-based shadings (and very large meshes) are imported as a flat colour");
-                        (Paint::solid(Color::rgb(0.5, 0.5, 0.5)), sp.opacity)
+                Pattern::Shading(sp) => {
+                    // The ink names outlive the walk's borrow of `self`.
+                    let inks = inks.map(<[String]>::to_vec);
+                    match self.function_shading(sp, inks.as_deref()) {
+                        Some(paint) => (paint, sp.opacity),
+                        None => match shading_gradient(sp, &mut self.colors, inks.as_deref()) {
+                            Some((g, _)) => (Paint::Gradient(Box::new(g)), sp.opacity),
+                            None => {
+                                self.warn("shadings that can't be read as a gradient or gradient mesh (such as very large meshes) are imported as a flat grey");
+                                (Paint::solid(Color::rgb(0.5, 0.5, 0.5)), sp.opacity)
+                            }
+                        },
                     }
-                },
+                }
                 Pattern::Tiling(t) => match self.tiling(t, stroke) {
                     Some(paint) => (paint, 1.0),
                     None => {
@@ -1450,6 +1520,30 @@ impl<'p> Builder<'p> {
         let spec = Arc::new(spec);
         self.masks.insert(key, spec.clone());
         spec
+    }
+
+    /// Function-based shading `sp` (painting with `inks`) as a paint, read the first time it is
+    /// used and within the import's budget of function evaluations; `None` for other shadings.
+    fn function_shading(&mut self, sp: &craft_pdf::interpret::pattern::ShadingPattern, inks: Option<&[String]>) -> Option<Paint> {
+        let key = (sp.cache_key(), inks.map(<[String]>::to_vec));
+        if let Some(paint) = self.function_paints.get(&key) {
+            return Some(paint.clone());
+        }
+        let paint = match function_paint(sp, &mut self.colors, inks, &self.function_budget)? {
+            FunctionPaint::Gradient(g) => Paint::Gradient(g),
+            FunctionPaint::Average(c) => {
+                self.warn(
+                    "function-based shadings that aren't read as a gradient (their colour changes in two directions, they need too many stops, or the file has too many to read) are imported as their average colour",
+                );
+                Paint::solid(c)
+            }
+            FunctionPaint::Unread => {
+                self.warn("function-based shadings that can't be read (their function or domain is invalid, or the file has too many to read) are imported as a flat grey");
+                Paint::solid(Color::rgb(0.5, 0.5, 0.5))
+            }
+        };
+        self.function_paints.insert(key, paint.clone());
+        Some(paint)
     }
 
     /// Tiling pattern `t` as a pattern swatch's paint (the swatch made the first time).
@@ -1526,7 +1620,7 @@ impl<'p> Builder<'p> {
         let xf = transform * Affine::scale_non_uniform(f64::from(w) / f64::from(mw.max(1)), f64::from(h) / f64::from(mh.max(1)));
         let art = Node::new(
             self.id(),
-            NodeKind::Image(Box::new(ImageObject { key: k, width: mw, height: mh, xf, link: None, placement: Default::default() })),
+            NodeKind::Image(Box::new(ImageObject { key: k, width: mw, height: mh, xf, link: None, placement: Default::default(), pixels: None })),
         );
         Some(OpacityMask::new(art, true))
     }
@@ -1546,8 +1640,10 @@ impl<'p> Builder<'p> {
             (k, w, h)
         };
         let id = self.id();
-        let mut n =
-            Node::new(id, NodeKind::Image(Box::new(ImageObject { key: k, width: w, height: h, xf, link: None, placement: Default::default() })));
+        let mut n = Node::new(
+            id,
+            NodeKind::Image(Box::new(ImageObject { key: k, width: w, height: h, xf, link: None, placement: Default::default(), pixels: None })),
+        );
         n.extras_mut().mask = mask.map(Box::new);
         self.push_node(n);
     }
@@ -1587,7 +1683,7 @@ impl<'p> Builder<'p> {
             return n.clone();
         }
         let data = o.font_data();
-        let name = self.fonts.get(&key).map(|(n, _)| n.clone()).or_else(|| data.as_ref().and_then(|d| d.postscript_name.clone()));
+        let name = self.fonts.get(&key).map(|f| f.name.clone()).or_else(|| data.as_ref().and_then(|d| d.postscript_name.clone()));
         let (weight, italic) = data.as_ref().map_or((None, false), |d| (d.weight, d.is_italic));
         // A subset's six-letter tag.
         let ps = name.as_deref().map(|n| match n.split_once('+') {
@@ -1615,13 +1711,14 @@ impl<'p> Builder<'p> {
     }
 
     /// Glyph `o` as type: added to the line being gathered (or starting one). `false`: it keeps
-    /// its outline (no Unicode text, mirrored, or not type mode).
+    /// its outline (no Unicode text, mirrored, or not type mode). No `paint`: invisible text,
+    /// type with neither fill nor stroke.
     fn type_glyph(
         &mut self,
         o: &craft_pdf::interpret::font::OutlineGlyph,
         m: Affine,
         scale: f64,
-        paint: &craft_pdf::interpret::Paint<'_>,
+        paint: Option<&craft_pdf::interpret::Paint<'_>>,
         stroke: Option<&StrokeProps>,
         overprint: bool,
     ) -> bool {
@@ -1653,9 +1750,10 @@ impl<'p> Builder<'p> {
             Some(BfString::Char(c)) => c.to_string(),
             Some(BfString::String(s)) => s,
             None => {
-                if o.as_unicode().is_some_and(|u| replacement(&u)) {
+                // Invisible text isn't kept as outlines: the caller says it was left out.
+                if paint.is_some() && o.as_unicode().is_some_and(|u| replacement(&u)) {
                     let name = self.font_name(key, o).family;
-                    self.warn(&format!("text in {name} whose characters the file doesn't name (U+FFFD) was kept as outlines"));
+                    self.warn(&format!("text in {name} {UNNAMED_CHARACTERS_NOTE}"));
                 }
                 return false;
             }
@@ -1667,29 +1765,30 @@ impl<'p> Builder<'p> {
             return false;
         }
         let width = o.advance_width().filter(|w| w.is_finite());
-        // Set vertically (WMode 1): no horizontal advance; its em box is a full em wide.
+        // Set vertically (WMode 1): no horizontal advance.
         let upright = width.is_some_and(|w| w.abs() <= 1.0);
-        let top = m * kurbo::Point::new(f64::from(width.filter(|w| *w > 1.0).unwrap_or(1000.0)) * 0.5, 880.0);
         let mut info = self.font_name(key, o);
         // A font the file doesn't carry is drawn with a stand-in: its glyphs can't tell which
         // style of the installed family it is, so the name decides.
-        let embedded = self.fonts.get(&key).is_none_or(|(_, e)| *e);
+        let embedded = self.fonts.get(&key).is_none_or(|f| f.embedded);
         if let Some(face) = &info.face
             && embedded
         {
             let decided = match self.matched.get(&key) {
                 Some(m) => m.clone(),
-                // A glyph that can't be compared (several characters, a vertical form) decides
-                // nothing: it takes the face of its name until one that can be compared does.
-                None if comparable(&text, upright).is_none() => Some(face.clone()),
+                // A glyph that can't be compared (several characters, a vertical form) or that
+                // shows nothing (invisible text) decides nothing: it takes the face of its name
+                // until one that can be compared does.
+                None if paint.is_none() || comparable(&text, upright).is_none() => Some(face.clone()),
                 None => {
                     let m = matching_face(face, &text, o, upright);
                     self.matched.insert(key, m.clone());
                     m
                 }
             };
-            let Some(f) = decided else {
-                self.warn("text whose glyphs differ from the installed font of the same name was kept as outlines");
+            // Invisible text shows no glyphs that could differ: it keeps the face of its name.
+            let Some(f) = decided.or_else(|| paint.is_none().then(|| face.clone())) else {
+                self.warn(UNMATCHED_GLYPHS_NOTE);
                 return false;
             };
             info = FontInfo { family: f.family.clone(), style: f.style.clone(), face: Some(f) };
@@ -1706,8 +1805,14 @@ impl<'p> Builder<'p> {
             None if self.matched.contains_key(&key) => self.versions.entry(key).or_insert_with(|| named(&info.face)).clone(),
             None => named(&info.face),
         };
-        let (paint, opacity) = self.paint(paint, stroke.is_some(), self.walked(true));
-        let stroke = stroke.map(|p| (paint.clone(), p.line_width as f64 * scale));
+        let (paint, opacity) = match paint {
+            Some(p) => {
+                let (paint, opacity) = self.paint(p, stroke.is_some(), self.walked(true));
+                (Some(paint), opacity)
+            }
+            None => (None, 1.0),
+        };
+        let stroke = stroke.zip(paint.clone()).map(|(p, paint)| (paint, line_width(p, scale)));
         let look = Look {
             font: key,
             family: info.family,
@@ -1717,12 +1822,21 @@ impl<'p> Builder<'p> {
             h_scale: at.h_scale,
             overprint_fill: stroke.is_none() && overprint,
             overprint_stroke: stroke.is_some() && overprint,
-            fill: stroke.is_none().then_some(paint),
+            fill: if stroke.is_none() { paint } else { None },
             stroke,
         };
         let advance = width.map_or(at.size * 0.5, |w| w as f64 / 1000.0 * at.size * at.h_scale / 100.0);
-        let place = |line: &mut TextLine| {
-            if upright { line.push_upright(&look, at, opacity, Upright { top }, &text) } else { line.push(&look, at, opacity, advance, &text) }
+        // A glyph set vertically is drawn from its origin, which the file puts the position
+        // vector's vx (from the font's `W2`, else half its width from `W` or `DW`) to the left of
+        // the column's centre (ISO 32000-1 §9.7.4.3); vertical type centres each glyph on the
+        // column. Half an em only for a full-width glyph (#722).
+        let top = upright.then(|| {
+            let vx = self.fonts.get(&key).and_then(|f| f.vertical.as_ref()).map_or(500.0, |v| v.centre(glyph));
+            m * kurbo::Point::new(vx, 880.0)
+        });
+        let place = |line: &mut TextLine| match top {
+            Some(top) => line.push_upright(&look, at, opacity, Upright { top }, &text),
+            None => line.push(&look, at, opacity, advance, &text),
         };
         self.flush_glyphs();
         // A stroke over the glyph just filled (fill and stroke rendering).
@@ -1824,7 +1938,7 @@ impl<'a> Device<'a> for Builder<'_> {
         let (paint, opacity) = self.paint(paint, stroke, walked);
         // A gradient that doesn't extend past its ends paints only between them.
         let width = match draw_mode {
-            PathDrawMode::Stroke(p) => p.line_width as f64 * mean_scale(transform),
+            PathDrawMode::Stroke(p) => line_width(p, mean_scale(transform)),
             PathDrawMode::Fill(_) => 0.0,
         };
         let band = shading.and_then(|sp| extend_clip(sp, bp.bounding_box().inflate(width, width)));
@@ -1928,7 +2042,18 @@ impl<'a> Device<'a> for Builder<'_> {
     ) {
         self.pending = false;
         let stroke = match draw_mode {
-            GlyphDrawMode::Invisible => return,
+            // Invisible text (a scanned page's recognized text, over the scan) draws nothing but
+            // is still text: type with neither fill nor stroke, so it stays searchable.
+            GlyphDrawMode::Invisible => {
+                let typed = match glyph {
+                    Glyph::Outline(o) => self.type_glyph(o, transform * glyph_transform, mean_scale(transform), None, None, false),
+                    Glyph::Type3(_) => false,
+                };
+                if !typed {
+                    self.warn(INVISIBLE_TEXT_NOTE);
+                }
+                return;
+            }
             GlyphDrawMode::Fill => None,
             GlyphDrawMode::Stroke(p) => Some(p.clone()),
         };
@@ -1936,7 +2061,7 @@ impl<'a> Device<'a> for Builder<'_> {
             Glyph::Outline(o) => {
                 let scale = mean_scale(transform);
                 let overprint = self.glyph_overprint(stroke.is_some());
-                if self.type_glyph(o, transform * glyph_transform, scale, paint, stroke.as_ref(), overprint) {
+                if self.type_glyph(o, transform * glyph_transform, scale, Some(paint), stroke.as_ref(), overprint) {
                     return;
                 }
                 self.flush_text();
@@ -1957,7 +2082,7 @@ impl<'a> Device<'a> for Builder<'_> {
                 if let Some(r) = &mut self.glyphs {
                     r.path.extend(bp.iter());
                 }
-                self.warn("text was converted to outlines");
+                self.warn(OUTLINED_TEXT_NOTE);
             }
             Glyph::Type3(t3) => {
                 if self.nested >= MAX_NESTED {

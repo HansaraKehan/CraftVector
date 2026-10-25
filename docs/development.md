@@ -1,5 +1,8 @@
 # Development
 
+> **Last updated:** 2026-10-23 · **Change:** Tests: cargo xtask test, one integration-test binary per crate, the dev profile's debug info.
+> **Last updated:** 2026-10-21 · **Change:** the interface faces as vectorcraft-ui-egui's `interface-fonts` feature, and `theme::install_fonts` for an embedder that draws the panels itself.
+> **Last updated:** 2026-10-21 · **Change:** leaving out the bundled fonts with the egui panels (vectorcraft-ui-egui's and vectorcraft-mcp's `bundled-fonts` features).
 > **Last updated:** 2026-10-14 · **Change:** leaving out the bundled fonts (`bundled-fonts` feature).
 > **Last updated:** 2026-10-14 · **Change:** document-font registration for all explicitly supplied faces.
 
@@ -85,7 +88,8 @@ By default VectorCraft's own crates log at `info` and everything else at `warn`.
 |---|---|
 | `VECTORCRAFT_CONTROL_PORT` | Same as `--control <port>`, which overrides it; a value that isn't a port from 1 to 65535 stops the app |
 | `VECTORCRAFT_IN_WINDOW_MENUS` | Any value but empty or `0`: same as `--in-window-menus` (see [macOS: the menu bar](#macos-the-menu-bar)) |
-| `VECTORCRAFT_NO_PREFS` | No preferences read or written, no default Data Recovery folder and no log file (agents' test runs) |
+| `VECTORCRAFT_NO_PREFS` | No preferences read or written, no default Data Recovery folder and no log file, and no saved PDF presets or loaded ICC profiles kept (agents' test runs; also for `vectorcraft-cli`) |
+| `VECTORCRAFT_CONFIG_DIR` | The folder for the preferences and the folders next to them (`PDF Presets`, `Color Profiles`, …), for the app and `vectorcraft-cli` (see `docs/control-protocol.md`) |
 | `WGPU_POWER_PREF` | Graphics adapter: `low`, `high` or `none` (see [Desktop graphics processor](#desktop-graphics-processor)) |
 | `WGPU_ADAPTER_NAME` | Graphics adapter by (part of) its name, any case (see [Desktop graphics processor](#desktop-graphics-processor)) |
 | `WGPU_BACKEND` | Graphics backends: `vulkan`, `dx12`, `metal`, `gl` |
@@ -103,13 +107,16 @@ On macOS the menus live in the system menu bar, not in the window's app bar (whi
 
 ## Linux: Wayland and X11
 
+On GNOME/Wayland, enable **Preferences › User Interface › System Title Bar** and restart to use winit's font-free Adwaita window controls (`wayland-csd-adwaita-notitle`); the existing custom title bar remains the Linux default.
+
 The window runs natively on Wayland (eframe's `wayland` feature) and on X11. On machines with two GPUs it renders on the one the desktop runs on unless Preferences say otherwise; see [Desktop graphics processor](#desktop-graphics-processor) (#502). The system clipboard (`apps/vectorcraft/src/clipboard.rs`) is arboard with its `wayland-data-control` feature:
 
 - **Clipboard:** under Wayland arboard talks to the compositor through the data-control protocol (wlroots compositors such as Sway and Hyprland, KDE Plasma), so bitmaps (`image/png`), SVG markup and text copied in any app paste (#398). Where the compositor lacks the protocol (GNOME's Mutter, [arboard#223](https://github.com/1Password/arboard/issues/223)), arboard falls back to the X11 clipboard through XWayland, which only holds what X11 apps copied. egui's own text paste into fields goes through smithay-clipboard and works either way.
 - **Clipboard owners that never answer (#510):** reading the clipboard waits on the app that owns it: arboard gives up on an X11 owner after 4 s, and a Wayland read waits for the owner to send its data. So on Linux the check that enables the Paste menu items runs on a background thread with a second clipboard handle (`crates/ui-egui/src/clipboard_probe.rs`, installed as `Services::clipboard_probe`), only while nothing is copied in the app and a document is open, and the window keeps drawing. A paste itself still reads on the UI thread, so pasting from such an owner waits for it once. Windows and macOS keep the check on the UI thread: Windows only asks which formats the clipboard holds, macOS asks the pasteboard server.
-- **Copied files:** files copied in a file manager (`text/uri-list`; `CF_HDROP` on Windows, file URLs on macOS) paste as the first one that is art (SVG, PDF, EPS, EMF/WMF or a bitmap; a `.ai` or `.ait` file as the PDF or PostScript it holds), before the clipboard's other formats (which include the files' paths as text).
+- **Copied files:** files copied in a file manager (`text/uri-list`; `CF_HDROP` on Windows, file URLs on macOS) paste as the first one that is art (SVG, PDF, EPS, EMF/WMF or a bitmap; a `.ai` or `.ait` file from the editing data it holds, else as the PDF or PostScript it holds), before the clipboard's other formats (which include the files' paths as text).
 - **Dropping files on the window does not work under Wayland:** winit 0.30, which eframe 0.36 runs on, has no Wayland drag and drop ([winit#1881](https://github.com/rust-windowing/winit/issues/1881), added in winit 0.31; [egui#1563](https://github.com/emilk/egui/issues/1563)), so no `dropped_files` arrive. Until eframe moves to winit 0.31: copy the files in the file manager and paste them, use File › Place or Open, or open the window through XWayland, where drops work: set **Preferences › Performance › Linux Display Server** to **X11 (XWayland)** and restart (#1151), or start the app with `WAYLAND_DISPLAY= vectorcraft`. The preference (`linuxDisplayServer`, read at startup in `apps/vectorcraft/src/main.rs`, shown on Linux only) has winit open the window on X11 (`EventLoopBuilderExtX11::with_x11`) when the session is Wayland, `DISPLAY` is set and the X11 libraries winit loads are installed (`apps/vectorcraft/src/xwayland.rs` reads `ldconfig -p` and the usual library directories); otherwise the window opens on Wayland and the log says why. Unlike clearing `WAYLAND_DISPLAY`, it leaves the clipboard on the compositor's own.
-- **Pens and pen displays under Wayland (#491):** winit 0.30 doesn't bind the Wayland tablet protocol (`zwp_tablet_v2`; tablet input arrives in winit 0.31, [winit#4318](https://github.com/rust-windowing/winit/pull/4318), [egui#7731](https://github.com/emilk/egui/pull/7731)). Since Plasma 6.3, KWin no longer turns tablet input into pointer input for such apps ([kwin!6336](https://invent.kde.org/plasma/kwin/-/merge_requests/6336)): the pen moves the compositor's cursor over the window, but the app gets no motion or presses and shows none of its own cursors. Until eframe moves to winit 0.31, either run the app under XWayland, which supports the tablet protocol and hands the pen to X11 apps as a pointer (Preferences › Performance › Linux Display Server › X11 (XWayland), `WAYLAND_DISPLAY= vectorcraft`, or `env -u WAYLAND_DISPLAY vectorcraft`; for a desktop launcher, put `env WAYLAND_DISPLAY=` before the command in its `Exec=` line), or turn KWin's deprecated emulation back on for the whole session by setting `KWIN_WAYLAND_EMULATE_TABLET=1` in KWin's environment (for example in a file under `~/.config/environment.d/` or in `/etc/environment`) and logging in again. The pen then works as a mouse, without pressure: winit 0.30 reads pen pressure on Windows only (Windows Ink, which reaches the Liquify tools' Use Pressure Pen). Other compositors that don't emulate a pointer for tablets behave the same way.
+- **Pens and pen displays under Wayland (#491, #2028):** winit 0.30 doesn't bind the Wayland tablet protocol (`zwp_tablet_v2`; tablet input arrives in winit 0.31, [winit#4318](https://github.com/rust-windowing/winit/pull/4318), [egui#7731](https://github.com/emilk/egui/pull/7731)). Since Plasma 6.3, KWin no longer turns tablet input into pointer input for such apps ([kwin!6336](https://invent.kde.org/plasma/kwin/-/merge_requests/6336), commit [25c65abd](https://invent.kde.org/plasma/kwin/-/commit/25c65abddd95eb87fb892a8594faccbf509ff62f)), and GNOME's Mutter does not turn it into pointer input either (that commit's message): on KWin the pen moves the compositor's cursor over the window, but the app gets no motion or presses and shows none of its own cursors. Until eframe moves to winit 0.31, either run the app under XWayland, which supports the tablet protocol and hands the pen to X11 apps as a pointer (Preferences › Performance › Linux Display Server › X11 (XWayland); X11 (XWayland) When a Pen Is Attached (`x11WithPen`), which opens the window through XWayland only when `/proc/bus/input/devices` lists a pen as the app starts, a device with the `BTN_TOOL_PEN` key and the `ABS_X` and `ABS_Y` axes, and logs `pen found: opening the window through XWayland`; `WAYLAND_DISPLAY= vectorcraft`, or `env -u WAYLAND_DISPLAY vectorcraft`; for a desktop launcher, put `env WAYLAND_DISPLAY=` before the command in its `Exec=` line), or turn KWin's deprecated emulation back on for the whole session by setting `KWIN_WAYLAND_EMULATE_TABLET=1` in KWin's environment (for example in a file under `~/.config/environment.d/` or in `/etc/environment`) and logging in again. The pen then works as a mouse. Under XWayland the app also reads the pen's pressure (next item); with KWin's emulation on native Wayland the pen has no pressure. Other compositors that don't emulate a pointer for tablets behave the same way.
+- **Pen pressure under X11 and XWayland (#764):** winit 0.30 hands a pen to an X11 window as a mouse, without its pressure. When the window is on X11, XWayland included, the desktop app opens a second X connection (x11rb's `RustConnection`) and reads XInput2 raw events for every device (`apps/vectorcraft/src/tablet.rs`, from PhotoCraft's `crates/tablet`). A device with an `Abs Pressure` valuator is a pen, unless its XInput type is `TOUCHPAD` or `TOUCHSCREEN`. While a pen is the pointer that moved last, its pressure, scaled from the valuator's range to 0..1, reaches the tools that use pressure: the Paintbrush's pressure-sensitive brushes and the Liquify tools' Use Pressure Pen. A pen device whose name or XInput type contains `eraser` (in any case) is the pen's eraser end: while the pointer is over the window, the canvas selects the Eraser tool when the eraser end moves, and it selects the tool used before when the tip moves again (`crates/ui-egui/src/stylus.rs`). The X server needs XInput 2.1 or later; otherwise the log has a `tablet pressure:` warning with the reason, and the pen draws at full pressure.
 
 ## Fonts: craft-fonts (optional build input)
 
@@ -141,12 +148,15 @@ CRAFT_FONTS_DIR="$PWD/../craft-fonts" cargo xtask ci   # also runs the Japanese-
   so they are the fallback for Japanese after the requested font; installed system fonts come after.
   Noto Sans Thai (when the checkout has it) is the fallback for Thai where no Thai font is
   installed, and the web build fetches it before the app starts (`crates/text/web-fonts.txt`).
+  Noto Sans Georgian (when the checkout has it) is the same for Georgian.
   All other supplied faces follow those existing document fallbacks in manifest order, so they
   can also be selected by family name. This does not change which faces the web build embeds
   or fetches, and no craft-fonts faces are registered when the optional input is absent.
-- UI: `theme::install_fonts` adds them at the end of every egui family (BIZ UDPGothic first), after
-  the UI fonts and before the installed fonts `ui_fonts.rs` discovers for other scripts.
-- Tests that need Japanese glyphs skip with a message when built without craft-fonts. The FreeBSD
+- UI: `theme::install_fonts` adds them at the end of every egui family (BIZ UDPGothic first, then
+  Noto Sans Georgian for the Georgian interface), after the UI fonts and before the installed fonts
+  `ui_fonts.rs` discovers for other scripts. On the web, Noto Sans Georgian is fetched at startup
+  and reaches the UI through `ui_fonts.rs`.
+- Tests that need Japanese or Georgian glyphs skip with a message when built without craft-fonts. The FreeBSD
   CI job and every release job (`release.yml`) check craft-fonts out at a pinned commit; release
   packages carry each embedded font's `OFL-<family>.txt`.
 
@@ -154,17 +164,42 @@ CRAFT_FONTS_DIR="$PWD/../craft-fonts" cargo xtask ci   # also runs the Japanese-
 
 The Latin fonts in `assets/fonts/` are compiled into `vectorcraft-text` by its `bundled-fonts`
 feature (3.4 MB of the binary). It is on by default, and `vectorcraft-engine`'s default
-`bundled-fonts` feature turns it on, so the apps and anything built on the engine have them. An
+`bundled-fonts` feature turns it on, so the apps and anything built on the engine with its default
+features have them. An
 embedder that brings every font itself at run time (`FontDb::add_font`, say a web app serving its
 own font catalogue) depends on the engine with `default-features = false` and doesn't ship them
 twice. Its font database starts without them: on the web and without craft-fonts it starts empty,
 and text has no glyphs until a font is added.
 
-- The workspace declares `vectorcraft-text` without default features, so no library crate turns the
-  fonts back on; a crate whose tests lay type out asks for `bundled-fonts` in its
-  dev-dependencies (or gets it through `vectorcraft-testkit`, which uses the engine).
+An embedder that also hosts the egui panels depends on `vectorcraft-ui-egui` with
+`default-features = false` as well: its own `bundled-fonts` feature, on by default, turns the
+engine's on; `vectorcraft-mcp` has the same feature. The panels' interface faces (Source Sans 3
+Regular and Semibold, Inter Regular and SemiBold, JetBrains Mono, about 2 MB: `theme.rs`) are
+`vectorcraft-ui-egui`'s `interface-fonts` feature, also on by default; without it the panels draw in
+egui's built-in fonts, which lack some symbols they show (→ ▾ ● ✓), so such an embedder adds a
+font that has them to each of the families below (`ctx.add_font` with an `InsertFontFamily` per
+family).
+
+The panels and dialogs draw in their own egui families (`theme::FONT_UI`, `FONT_UI_SEMIBOLD`,
+`FONT_MONO`), and egui panics drawing text in a family no font is bound to. `VectorcraftApp::logic`
+binds them on its first frame; an embedder that draws the panels or dialogs without it calls
+`theme::install_fonts` once on its context, with or without `interface-fonts`. It replaces the
+context's font definitions, so the embedder's own fonts are added after it.
+
+- The workspace declares `vectorcraft-text` and `vectorcraft-engine` without default features, so
+  each crate that wants the fonts asks for them (the apps, and `vectorcraft-testkit` for tests);
+  a crate whose tests lay type out asks for `bundled-fonts` in its dev-dependencies (or gets it
+  through `vectorcraft-testkit`).
+- `cargo xtask ci`'s `no-bundled-fonts` step also checks that `vectorcraft-ui-egui` and
+  `vectorcraft-mcp` without their default features turn them on nowhere, for any target
+  (`cargo tree -p vectorcraft-ui-egui --no-default-features --target all -e features,normal -i
+  vectorcraft-text`, and the same for `vectorcraft-mcp`), and with them do; a test of either can't
+  see that configuration, since their dev-dependencies turn the fonts on.
 - `cargo test -p vectorcraft-text --no-default-features --test without_bundled_fonts` checks the
-  configuration without them.
+  configuration without them, and `cargo test -p vectorcraft-ui-egui --no-default-features --test
+  install_fonts` that the panels without their interface faces still bind every family; the same
+  step lints `vectorcraft-ui-egui` without its default features. Of the crate's other tests, those
+  about the interface faces need them.
 
 ### Arabic fonts and the web build
 
@@ -204,7 +239,7 @@ locale such as `ru-RU`, `ru-BY` or `ru-KZ` resolves to it), Ukrainian (`uk`, com
 `uk_UA.UTF-8` and every other `uk-*` locale resolve to it; integer plurals use one/few/many), Hungarian (`hu`, complete;
 `hu-HU` and every other `hu-*` locale resolve to it; a count takes the singular, so plurals have one form), Polish (`pl`, complete; `pl-PL` and every other `pl-*`
 locale resolve to it; plurals use one/few/many, with 21, 31 … taking many), Swedish (`sv`, complete; `sv-SE`, `sv-FI` and every
-other `sv-*` locale resolve to it), Czech (`cs`, every menu label) and Brazilian Portuguese
+other `sv-*` locale resolve to it), Georgian (`ka`, complete; `ka-GE` and `ka_GE.UTF-8` resolve to it; one count-neutral plural form), Czech (`cs`, every menu label) and Brazilian Portuguese
 (`pt-br`, complete; `pt-BR`, `pt_BR.UTF-8` and other tags that resolve to `pt-br` through `candidates`). Untranslated text falls back to English until its rows are added.
 
 - `tl!("…")` translates a literal into the language the UI is drawn in; `i18n::t(s)` is the same for a
@@ -224,19 +259,30 @@ other `sv-*` locale resolve to it), Czech (`cs`, every menu label) and Brazilian
   rule). The Language menu, the dropdown, locale matching and the catalog tests (well-formed, no duplicates,
   placeholders and ellipses agree, command ids exist, every row of a partial catalog is a string the UI
   shows, the UI fonts have every glyph, no Simplified characters in `zh-hant`) pick it up. Set `complete_menus`
-  once every menu string and `tl!` literal is translated; `i18n::tests` then enforce it
-  (`VECTORCRAFT_I18N_DUMP=strings.txt cargo test -p vectorcraft-ui-egui dump_source_strings` lists them).
+  once the menus and `tl!` literals are translated; the untranslated report then lists what the catalog lacks
+  (`VECTORCRAFT_I18N_DUMP=strings.txt cargo test -p vectorcraft-ui-egui dump_source_strings` lists every
+  English string).
+- A missing translation never fails a test or a build: the interface shows the English text until a translator
+  adds the row. `cargo xtask i18n-report` prints, per language, the strings its catalog lacks (menu strings,
+  `tl!` literals, undo step names, menu labels, render-site labels, status and error messages, PostScript
+  error meanings, default swatch names), and `cargo xtask ci` prints the same list in its `i18n-report` step.
+  The report is the test `i18n::tests::untranslated_report`, run with `--nocapture`; it fails only when a
+  scan finds too few strings to be working. Tests don't check one language's exact wording: a test that needs a
+  translation compares with the catalog lookup (`tr(lang, "English")`).
 - Translations are clean-room: written from the meaning of the English text in ordinary vocabulary, never
   from another product's localisation resources. Product and technology names stay in Latin letters.
 - Status-bar messages and errors stay English where they are made (`app.ui.status`, `EngineError`: the
   control channel, MCP and tests read them) and are translated only where the status bar draws them
   (`i18n::msg`). `@msg` catalog rows hold a whole message or a template such as
   `Couldn't open {name}: {e}`; `{_1}`, `{_2}` … stand for the format string's `{}`, and the values in the
-  placeholders are translated in turn (the reason after `: {e}` is often a message too). Czech, German, Spanish, French, Hungarian, Italian, Japanese, Korean, Polish, Brazilian Portuguese, Russian, Swedish, Ukrainian, Vietnamese and Finnish cover every
-  message literal the test scan finds (`complete_languages_translate_every_message`, languages listed in
-  `COMPLETE_MESSAGES`): a new `Err("…")`, `Other(…)`, `#[error(…)]` or `status(…)` message needs a row in each of those catalogs (`VECTORCRAFT_I18N_DUMP_MESSAGES=messages.txt cargo test -p vectorcraft-ui-egui
-  complete_languages_translate_every_message` lists them all). Other languages show messages in English
-  until they add `@msg` rows.
+  placeholders are translated in turn (the reason after `: {e}` is often a message too). Czech, German, Greek, Spanish, French, Georgian, Hungarian, Italian, Japanese, Korean, Polish, Brazilian Portuguese, Russian, Simplified Chinese, Traditional Chinese, Swedish, Ukrainian, Vietnamese, Finnish and Turkish
+  translate status and error messages (`COMPLETE_MESSAGES` in `i18n::tests`); the untranslated report lists the
+  message literals the scan finds that one of them has no row for. The scan reads `Err("…")`, `Other(…)`,
+  `#[error(…)]` and `status(…)` messages, messages given to an error enum's variant (`PsError::Limit(…)`), to the
+  engine's `bad(cmd, …)`, `err(…)` or `error(…)`, and to the PDF writer's `bad(…)` or `failed(…)`
+  (`VECTORCRAFT_I18N_DUMP_MESSAGES=messages.txt cargo test -p vectorcraft-ui-egui dump_source_strings` lists them
+  all). A missing row shows the English message. Other languages show messages in English until they add `@msg`
+  rows.
 - Not translated on purpose: names that are user data (layers, swatches, fonts, documents), the tab
   title's colour mode, command ids and parameter names inside messages. Not done yet: locale-aware number
   and date formats, right-to-left layout. Chinese and Japanese UI text
@@ -244,9 +290,38 @@ other `sv-*` locale resolve to it), Czech (`cs`, every menu label) and Brazilian
   system font; the glyph test checks Latin and Cyrillic catalogs always and the CJK ones only with craft-fonts.
   A Traditional Chinese UI font is still to be added to craft-fonts for the web build.
 
+## Cursors
+
+`crates/tools/src/cursors.toml` lists every `Cursor` value: when it shows, in plain behaviour terms, and where its hotspot is, so whoever draws the cursors knows what each one is for without reading the tools (CLAUDE.md › Adding a cursor). `cargo xtask cursors` (part of `cargo xtask ci`) warns about a `Cursor` value with no entry, an entry with no `Cursor` value, a repeated id or a missing field; it never fails the build. A cursor not drawn yet borrows another's look (`Cursor::stand_in`).
+
 ## Vendor names gate
 
-`cargo xtask brands` (part of `cargo xtask ci`) fails when user-visible text names another vendor's products or company: string literals in Rust sources (command labels and params docs, menus, panels, MCP tool definitions), `Cargo.toml` descriptions and packaging files. Comments and test code are not checked. Say "the reference app" or name the feature itself. A line that must keep an old name, such as an alias that files or preferences from earlier versions still use, carries a `brand-ok` comment.
+`cargo xtask brands` (part of `cargo xtask ci`) fails when user-visible text names another vendor's products or company: string literals in Rust sources (command labels and params docs, menus, panels, MCP tool definitions), `Cargo.toml` descriptions and packaging files. Comments, test files and `#[cfg(test)]` modules are not checked. Say "the reference app" or name the feature itself. A line that must keep an old name, such as an alias that files or preferences from earlier versions still use, or a name another project defines, such as a shared MIME type, carries a `brand-ok` comment. In the Linux desktop entry, whose comments take whole lines, the comment goes on the `#` line just above it; `MARK_ABOVE` in `xtask/src/brands.rs` lists the files that accept a mark there.
+
+## Tests
+
+- `cargo xtask test` runs the workspace's unit and integration tests with
+  [cargo-nextest](https://nexte.st) when it is installed (`cargo install cargo-nextest --locked`),
+  otherwise with `cargo test`, and then the doctests (`cargo test --workspace --doc`), which nextest
+  doesn't run. `cargo xtask ci` runs the same two as its `test` and `doctests` steps.
+- The test build leaves out the examples (`--lib --bins --tests`); clippy (`--all-targets`) still
+  checks them.
+- Each crate has one integration-test binary: its test files are modules of `tests/it/main.rs`. Run
+  one file's tests with `cargo nextest run -p vectorcraft-svg --test it roundtrip::` (or `cargo test`
+  with the same arguments). A new test file gets a `mod` line in `main.rs`.
+- A test file stays a binary of its own (`tests/<name>.rs`) when it changes process-wide state that
+  other tests would see, because `cargo test` runs a binary's tests as threads of one process (nextest
+  runs each test in its own process). In `crates/engine/tests`: the Color Settings
+  (`color_settings.rs`), the font database and Fonts folder (`removed_font.rs`, `font_folder.rs`,
+  `text_import_fuzz.rs`), installed plug-ins (`plugin_export.rs`, `plugin_fuzz.rs`), the working
+  directory (`open_relative_path.rs`) and every command run with junk parameters
+  (`command_sweep.rs`); the `system_fonts` tests of `vectorcraft-text` and `vectorcraft-pdf` too. The
+  fuzz files under Robustness › Fuzzing keep their own binaries, so a deeper search runs alone, and so
+  do `affinity_artboards`, `affinity_text` and `affinity_corpus`, which the Affinity corpus workflow
+  names.
+- The dev profile builds the workspace crates with line tables only (`debug = "line-tables-only"`),
+  so panics and backtraces still name file and line, and dependencies without debug info. For a
+  debugger session, `CARGO_PROFILE_DEV_DEBUG=true cargo build` gives full debug info.
 
 ## Robustness: VectorCraft never crashes
 
@@ -270,7 +345,8 @@ in the code:
 | `todo!`, `unimplemented!` | don't merge unfinished paths; return an error that says what isn't supported |
 
 `clippy.toml` allows `unwrap`, `expect` and `panic` inside `#[test]` and `#[cfg(test)]` code.
-Integration-test files under `tests/` and `examples/`, and the `testkit` crate, opt out with
+Integration tests (`tests/it/main.rs` and the test files that are binaries of their own), examples
+and the `testkit` crate opt out with
 `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]`. Tests use `panic!("…")`
 instead of `unreachable!()`.
 
@@ -361,10 +437,71 @@ The original site's plain HTTP archive is no longer fetched or extracted. To ref
 review the mirror commit, original-file list, redistribution license, sizes and hashes together;
 do not replace expected hashes automatically in response to a download mismatch.
 
+## Highlighted-text Eyedropper (2026-10-21)
+
+Switching from Type to Eyedropper preserves the highlighted character range and its overlay.
+Sampling applies enabled font and paint attributes to that range; Shift samples color only.
+Returning to Type retains the range; deselection and document changes clear stale ranges.
+Character styles cannot represent object opacity or blend modes. With Transparency enabled,
+sampling refuses a non-neutral source or target object before changing art, paint defaults,
+selection or history. Disable Transparency in Eyedropper Options to sample supported attributes
+while preserving the target object's transparency. Whole-object sampling remains unchanged.
+Regression evidence: `tests_eyedropper.rs` covers Unicode, font/paint, Undo/Redo, tool switches,
+and atomic rejection of source and target opacity/blend modes; `text_range_and_brush_sampling_options_coexist`
+covers upstream brush-key sampling. Scores and estimates unchanged.
+
+## Drag artwork between document tabs (2026-10-22)
+
+Hold a Selection-tool move over another visible document tab for 400 ms to activate it,
+then release over its canvas to copy the selected artwork. The original grab point is kept
+across different zoom levels and view rotations. The source preview is rolled back before
+the switch; source artwork, source history and the internal clipboard are preserved. Returning
+to the source tab resumes a move (Alt copies). Escape or release outside the canvas cancels.
+Changing the source revision or unexpectedly changing/closing the destination cancels a stale
+transfer; focus loss, touch cancellation and multitouch cancel too. Moving tabs under a stationary
+pointer does not activate further tabs until the pointer moves. The close icon does not activate a tab during a drag. Overflow-menu hover activation and
+cross-window dragging remain outside this change.
+The cited regressions assert the internal clipboard; they do not exercise the native
+system-clipboard adapter. Tab activation resets the Selection tool through
+`Session::set_active`; gesture regressions verify it is idle after switching, dropping
+and cancelling a transfer.
+
+`edit.dropSelection {sourceDocument, ids, grab, at}` uses document-scoped ids
+(`sourceDocument` is `document.inspect`’s session-unique `uid`), validates 1–10000 ids
+before editing, targets the current editable insertion context (Paste Remembers Layers does
+not reroute a drag into a matching source layer), and uses the existing
+lossless paste resource pipeline: groups, editable paths/type, images, symbols and patterns
+travel together. Same-name conflicting swatches are added under unique names to preserve
+source colours; pattern fills/strokes translate with the dropped artwork to preserve their alignment. The target receives one Undo/Redo step. Invalid or closed sources fail before
+editing. Existing artwork-to-panel drags retain their original behavior.
+
+Evidence: `tests_document_drag` drives actual tab-strip/canvas pointer frames; `tests_clipboard`
+covers resource rendering, id collisions, swatch conflicts, grab-point placement, locked-target
+refusal, excessive ids, malformed numeric parameters and atomic invalid-input refusal. A private Linux/Xvfb native build also placed an original logo group
+onto a flyer through the command API; its screenshot was inspected, source preservation and
+Undo/Redo checked. Physical mouse hover on the desktop is not covered by that native smoke test.
+Public behavior reference: [Illustrator public duplication documentation](https://helpx.adobe.com/illustrator/desktop/manage-objects/edit-objects/duplicate-objects.html).
+The tab-hover workflow follows the contributor’s requested behavior. All test artwork is original geometry/text generated locally.
+The new command and validation messages are translated in all 24 language catalogs, including Turkish.
+Scores and hour estimates are unchanged.
+
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-23 | minor | Tests: `cargo xtask test` (nextest, then doctests), one integration-test binary per crate and the files that keep their own, the dev profile's debug info. |
+| 2026-10-21 | minor | Fonts › Leaving out the bundled fonts: vectorcraft-ui-egui's `interface-fonts` feature, and `theme::install_fonts` for an embedder that draws the panels without `VectorcraftApp::logic`. |
+| 2026-10-21 | minor | M3: highlighted-text Eyedropper sampling preserves ranges and rejects unsupported source/target transparency atomically; regression-tested; scores and estimates unchanged. |
+| 2026-10-21 | minor | Fonts › Leaving out the bundled fonts: vectorcraft-ui-egui's and vectorcraft-mcp's `bundled-fonts` features, and the engine declared without default features. |
 | 2026-10-14 | minor | Document the `bundled-fonts` feature of vectorcraft-text and vectorcraft-engine (Fonts › Leaving out the bundled fonts). |
 | 2026-10-14 | minor | Document registration of every explicitly supplied craft-fonts face after the existing script-specific prefix; empty input and web selection remain unchanged. |
 | 2026-10-13 | minor | Document pinned PngSuite files, integrity checks and download budgets (#1729). |
+
+> **Tab-drag status (2026-10-22):** updated from upstream, including the Turkish catalog and all three tab-drag translations requested in #3479; Selection-tool reset regression-checked and clipboard evidence scoped to internal state; drag lifecycle, insertion and regression contracts documented; behavior, scores and estimates unchanged.
+
+| Date | Change | Tab-drag history |
+|---|---|---|
+| 2026-10-22 | minor | Verify Selection-tool reset after tab activation, drop and cancellation; narrow clipboard evidence to the tested internal clipboard and correct documentation grammar; behavior, scores and estimates unchanged. |
+| 2026-10-22 | minor | Merge current main and complete the Turkish tab-drag labels and validation messages requested by the maintainer; all 24 catalogs covered; scores and estimates unchanged. |
+| 2026-10-22 | minor | Tab-drag follow-up: reconcile upstream progress updates and document drag lifecycle, insertion behavior and regression contracts; behavior, scores and estimates unchanged. |
+| 2026-10-22 | minor | Artwork dragged with Selection switches visible document tabs after a 400 ms hover, then copies editable artwork on canvas release; source and clipboard stay intact; scores and hours unchanged |

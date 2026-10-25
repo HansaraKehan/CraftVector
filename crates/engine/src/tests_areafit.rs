@@ -483,3 +483,71 @@ fn making_and_restyling_type_reports_its_overflow() {
     let inside = s.execute("text.createInPath", &json!({"path": frame["id"], "mode": "area", "text": STORY, "size": 12, "fit": "none"})).unwrap();
     assert_eq!(inside["overflow"], json!([inside["id"]]), "{inside}");
 }
+
+/// The formats whose exports draw type.
+const DRAWING_FORMATS: [&str; 8] = ["pdf", "eps", "svg", "png", "jpg", "tiff", "emf", "wmf"];
+
+/// The warnings of `document.export {format, …options}` about type that doesn't fit its frame.
+fn export_overflow(s: &mut Session, format: &str, options: Value) -> Vec<String> {
+    let mut p = json!({ "format": format });
+    if let (Some(p), Some(o)) = (p.as_object_mut(), options.as_object()) {
+        p.extend(o.clone());
+    }
+    let v = s.execute("document.export", &p).unwrap();
+    let over = |w: &&str| w.contains("fit its frame") || w.contains("fit their frames");
+    v["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).filter(over).map(str::to_string).collect()
+}
+
+#[test]
+fn exports_that_draw_type_name_the_type_that_does_not_fit() {
+    let mut s = session();
+    let id = area(&mut s, 100.0, 20.0, "Ab\nCd\nEf\nGh", json!({}));
+    assert!(overflows(&s, id));
+    let one = format!("1 text object doesn't fit its frame: the text past the end of the frame isn't drawn in the export (id {})", id.0);
+    for format in DRAWING_FORMATS {
+        assert_eq!(export_overflow(&mut s, format, json!({})), [one.as_str()], "{format}");
+    }
+    // A .ai file carries the whole text in its editing data.
+    assert_eq!(export_overflow(&mut s, "ai", json!({})), Vec::<String>::new());
+    // A frame that holds its text, or a hidden object, leaves nothing out.
+    s.execute("text.areaOptions", &json!({"ids": [id.0], "height": 150})).unwrap();
+    for format in DRAWING_FORMATS {
+        assert_eq!(export_overflow(&mut s, format, json!({})), Vec::<String>::new(), "{format}");
+    }
+    s.execute("text.areaOptions", &json!({"ids": [id.0], "height": 20})).unwrap();
+    s.execute("object.setProps", &json!({"ids": [id.0], "visible": false})).unwrap();
+    // The type is hidden, so a rectangle gives the EPS of the visible art something to export.
+    s.execute("shape.rectangle", &json!({"x": 300, "y": 300, "width": 50, "height": 50})).unwrap();
+    for format in DRAWING_FORMATS {
+        assert_eq!(export_overflow(&mut s, format, json!({})), Vec::<String>::new(), "{format}");
+    }
+}
+
+#[test]
+fn exports_name_only_the_type_on_the_artboards_and_layers_they_draw() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 200, "artboards": 2})).unwrap();
+    let r = s.doc().unwrap().doc.artboards[1].rect;
+    let at = json!({"x": r.x0 + 10.0, "y": r.y0 + 10.0, "text": "Ab\nCd\nEf\nGh", "size": 12, "area": {"width": 100, "height": 20}});
+    let v = s.execute("text.create", &at).unwrap();
+    assert_eq!(v["overflow"], json!([v["id"]]), "{v}");
+    for (format, first, second) in [
+        ("pdf", json!({"range": "1"}), json!({"range": "2"})),
+        ("eps", json!({"useArtboards": true, "range": "1"}), json!({"useArtboards": true, "range": "2"})),
+        ("svg", json!({"range": "1"}), json!({"range": "2"})),
+        ("png", json!({"artboard": 0}), json!({"artboard": 1})),
+        ("emf", json!({"artboard": 0}), json!({"artboard": 1})),
+    ] {
+        assert_eq!(export_overflow(&mut s, format, first), Vec::<String>::new(), "{format}");
+        assert_eq!(export_overflow(&mut s, format, second).len(), 1, "{format}");
+    }
+    // An EPS of the visible art and an SVG of the whole document hold it too.
+    assert_eq!(export_overflow(&mut s, "eps", json!({})).len(), 1);
+    assert_eq!(export_overflow(&mut s, "svg", json!({})).len(), 1);
+    // On a layer that doesn't print: a PDF leaves it out unless asked to keep it; a PNG draws it.
+    let layer = s.doc().unwrap().doc.layers[0].id;
+    s.execute("layer.setProps", &json!({"id": layer.0, "printable": false})).unwrap();
+    assert_eq!(export_overflow(&mut s, "pdf", json!({"range": "2"})), Vec::<String>::new());
+    assert_eq!(export_overflow(&mut s, "pdf", json!({"range": "2", "includeNonPrinting": true})).len(), 1);
+    assert_eq!(export_overflow(&mut s, "png", json!({"artboard": 1})).len(), 1);
+}

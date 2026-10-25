@@ -1,12 +1,12 @@
 //! The SVG writer.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use vectorcraft_color::{BlendMode, GradientKind, GradientPaint, Paint};
+use vectorcraft_color::{BlendMode, Color, GradientKind, GradientPaint, Paint};
 use vectorcraft_doc::{
-    AppearanceItem, Document, FillLayer, LineCap, LineJoin, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextKind, TextObject,
+    AppearanceItem, Document, FillLayer, LineCap, LineJoin, Node, NodeId, NodeKind, SVG_EVENTS, StrokeAlign, StrokeLayer, TextKind, TextObject,
 };
 use vectorcraft_doc::{CharStyle, ImageBlob, Justify};
 use vectorcraft_effects::stroke::{self, Written, WrittenShape};
@@ -35,6 +35,8 @@ pub(crate) fn export(doc: &Document, opts: &ExportOptions, native: Option<&[u8]>
     write(doc, opts, native, &prefix)
 }
 
+/// `doc` as SVG with `opts`, the native file `native` embedded for Preserve Editing, its generated
+/// ids starting with `id_prefix`.
 fn write(doc: &Document, opts: &ExportOptions, native: Option<&[u8]>, id_prefix: &str) -> Output {
     let rect = opts
         .artboard
@@ -52,6 +54,8 @@ fn write(doc: &Document, opts: &ExportOptions, native: Option<&[u8]>, id_prefix:
         classes: Vec::new(),
         class_ids: HashMap::new(),
         used_ids: HashSet::new(),
+        next_suffix: HashMap::new(),
+        linked_names: HashSet::new(),
         names: HashMap::new(),
         depth: 1,
         patterns: HashMap::new(),
@@ -71,6 +75,7 @@ fn write(doc: &Document, opts: &ExportOptions, native: Option<&[u8]>, id_prefix:
         shared_images: HashMap::new(),
         layer_nest: 0,
         non_latin1_names: false,
+        foreign_ns: BTreeMap::new(),
     };
     w.assign_name_ids();
     // Page Isolated Blending / Page Knockout Group: the page content is one isolated group.
@@ -108,6 +113,9 @@ fn write(doc: &Document, opts: &ExportOptions, native: Option<&[u8]>, id_prefix:
     }
     let (ww, hh) = (w.num(rect.width()), w.num(rect.height()));
     out.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+    for (ns, prefix) in &w.foreign_ns {
+        out.push_str(&format!(" xmlns:{prefix}=\"{}\"", xml_attr_escape(ns)));
+    }
     if w.tiny() {
         out.push_str(" version=\"1.2\" baseProfile=\"tiny\"");
     }
@@ -133,14 +141,27 @@ fn write(doc: &Document, opts: &ExportOptions, native: Option<&[u8]>, id_prefix:
         out.push_str(&w.indent(1));
         out.push_str(&format!("</defs>{nl}"));
     }
-    if !doc.title.is_empty() {
+    // An artboard exported on its own is named after it (#3544), else after the document.
+    // A name that is blank once the characters XML can't hold are dropped falls back too.
+    let board = opts.artboard.filter(|_| opts.artboard_title).and_then(|i| doc.artboards.get(i)).map(|a| xml_text(&a.name));
+    let title = board.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| xml_text(&doc.title));
+    if !title.is_empty() {
         out.push_str(&w.indent(1));
-        out.push_str(&format!("<title>{}</title>{nl}", xml_escape(&doc.title)));
+        out.push_str(&format!("<title>{title}</title>{nl}"));
     }
     // File Info's description.
     if !doc.metadata.description.trim().is_empty() {
         out.push_str(&w.indent(1));
-        out.push_str(&format!("<desc>{}</desc>{nl}", xml_escape(&doc.metadata.description)));
+        out.push_str(&format!("<desc>{}</desc>{nl}", xml_text(&doc.metadata.description)));
+    }
+    // Window › SVG Interactivity › Link JavaScript Files.
+    for file in &doc.svg_scripts {
+        if file.is_empty() || !valid_xml_value(file) {
+            w.warn("JavaScript files with empty names or invalid XML characters were left out of SVG");
+            continue;
+        }
+        out.push_str(&w.indent(1));
+        out.push_str(&format!("<script xlink:href=\"{}\"/>{nl}", xml_attr_escape(file)));
     }
     let latin1 = encoding == Encoding::Latin1;
     if latin1 {
@@ -182,6 +203,12 @@ fn xml_text(s: &str) -> String {
 
 fn valid_xml_value(s: &str) -> bool {
     s.chars().all(|c| matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}'))
+}
+
+/// An XML name without a colon (an NCName): a letter or `_`, then [`xml_name_char`]s.
+fn xml_ncname(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_') && chars.all(xml_name_char)
 }
 
 /// Namespace-free XML 1.0 NameChar. The fixed `data-` prefix supplies NameStartChar.
@@ -279,6 +306,10 @@ struct Writer<'a> {
     /// 1-based class/entity number by declaration; avoids a linear scan for each style.
     class_ids: HashMap<String, usize>,
     used_ids: HashSet<String>,
+    /// The next suffix to try for a base name, so a repeated name doesn't probe the ones taken again.
+    next_suffix: HashMap<String, usize>,
+    /// The names in `linked`.
+    linked_names: HashSet<String>,
     names: HashMap<NodeId, String>,
     depth: usize,
     /// `<pattern>` def ids by pattern name + placement.
@@ -317,14 +348,19 @@ struct Writer<'a> {
     layer_nest: usize,
     /// An emitted attribute name requires an encoding wider than Latin-1.
     non_latin1_names: bool,
+    /// The prefix written for each namespace of other applications' attributes, by its URI
+    /// ([`Writer::foreign_attrs`]): declared on the root.
+    foreign_ns: BTreeMap<String, String>,
 }
 
 /// The characters type uses from one face, under one `@font-face` description: the family the
-/// type names and the weight and italic its style asks for.
+/// type names and the weight, italic and width its style asks for.
 struct FontUse {
     family: String,
     weight: u16,
     italic: bool,
+    /// The `font-stretch` percentage ([`css::font_stretch`]), as bits; `None` for the normal width.
+    stretch: Option<u64>,
     face: Arc<FontFace>,
     chars: BTreeSet<char>,
 }
@@ -510,7 +546,7 @@ impl Writer<'_> {
     /// missing), else its bytes. `None` when it has neither.
     fn image_href(&mut self, im: &vectorcraft_doc::ImageObject) -> Option<String> {
         let (doc, link) = (self.doc, self.opts.images == ImageMode::Link);
-        match (im.link.as_ref().filter(|_| link), doc.images.get(&im.key)) {
+        match (im.link.as_ref().filter(|_| link), doc.image_blob(im)) {
             (Some(l), _) => Some(l.path.clone()),
             (None, Some(b)) if !b.bytes.is_empty() => Some(self.blob_href(&web_image(b))),
             _ => im.link.as_ref().map(|l| l.path.clone()),
@@ -520,17 +556,16 @@ impl Writer<'_> {
     /// Images drawn more than once in `art` (the pieces of a distorted image) go into the defs
     /// once; each piece then draws them with `<use>`.
     fn share_images(&mut self, art: &Node) {
-        let mut seen: HashMap<(String, u32, u32), usize> = HashMap::new();
+        // Each image's count and its first piece, which shows what they all show.
+        let mut seen: HashMap<(String, u32, u32), (usize, vectorcraft_doc::ImageObject)> = HashMap::new();
         art.walk(&mut |c| {
             if let NodeKind::Image(im) = &c.kind {
-                *seen.entry((im.key.clone(), im.width, im.height)).or_default() += 1;
+                seen.entry((im.key.clone(), im.width, im.height)).or_insert_with(|| (0, (**im).clone())).0 += 1;
             }
         });
-        let mut repeated: Vec<_> = seen.into_iter().filter(|(k, n)| *n > 1 && !self.shared_images.contains_key(k)).map(|(k, _)| k).collect();
-        repeated.sort();
-        for (key, width, height) in repeated {
-            let link = self.linked_of(art, &key);
-            let im = vectorcraft_doc::ImageObject { key: key.clone(), width, height, xf: Affine::IDENTITY, link, placement: Default::default() };
+        let mut repeated: Vec<_> = seen.into_iter().filter(|(k, (n, _))| *n > 1 && !self.shared_images.contains_key(k)).collect();
+        repeated.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((key, width, height), (_, im)) in repeated {
             let Some(href) = self.image_href(&im) else { continue };
             let id = self.fresh_id("image");
             self.def(
@@ -542,20 +577,6 @@ impl Writer<'_> {
             );
             self.shared_images.insert((key, width, height), id);
         }
-    }
-
-    /// The link of the first image with blob `key` in `art`.
-    fn linked_of(&self, art: &Node, key: &str) -> Option<vectorcraft_doc::LinkInfo> {
-        let mut link = None;
-        art.walk(&mut |c| {
-            if let NodeKind::Image(im) = &c.kind
-                && im.key == key
-                && link.is_none()
-            {
-                link = im.link.clone();
-            }
-        });
-        link
     }
 
     fn fresh_id(&mut self, prefix: &str) -> String {
@@ -571,14 +592,17 @@ impl Writer<'_> {
     /// `base` (with the unique prefix) if free, else `base-2`, `base-3`…
     fn unique_id(&mut self, base: &str) -> String {
         let base = format!("{}{base}", self.id_prefix);
-        let mut cand = base.clone();
-        for i in 2.. {
-            if self.used_ids.insert(cand.clone()) {
-                break;
-            }
-            cand = format!("{base}-{i}");
+        if self.used_ids.insert(base.clone()) {
+            return base;
         }
-        cand
+        let next = self.next_suffix.entry(base.clone()).or_insert(2);
+        loop {
+            let cand = format!("{base}-{next}");
+            *next += 1;
+            if self.used_ids.insert(cand.clone()) {
+                return cand;
+            }
+        }
     }
 
     /// Reserve ids for every named object up front so generated def ids never collide with them.
@@ -637,7 +661,74 @@ impl Writer<'_> {
             self.non_latin1_names |= k.chars().any(|c| u32::from(c) > 0xff);
             out.push_str(&format!(" data-{k}=\"{}\"", xml_attr_escape(v)));
         }
+        self.foreign_attrs(n, &mut out);
+        self.event_attrs(n, &mut out);
         out
+    }
+    /// `n`'s attributes in other applications' namespaces (`plotter:pen="2"`), added to `out`.
+    /// Each namespace is declared once, on the root, under the prefix the file gave it unless the
+    /// export uses that prefix itself or for another namespace ([`Writer::foreign_prefix`]).
+    fn foreign_attrs(&mut self, n: &Node, out: &mut String) {
+        let attrs = n.extras().attrs.as_deref().map_or(&[][..], |a| a.foreign.as_slice());
+        let mut seen = HashSet::new();
+        for a in attrs {
+            if !xml_ncname(&a.prefix) || !xml_ncname(&a.name) || a.ns.is_empty() || !valid_xml_value(&a.ns) || !valid_xml_value(&a.value) {
+                self.warn("Attributes of other applications with invalid XML names or characters were left out of SVG");
+                continue;
+            }
+            // Native data is a list: one attribute per namespace and name.
+            if !seen.insert((a.ns.as_str(), a.name.as_str())) {
+                self.warn("Repeated attributes of other applications were written only once in SVG");
+                continue;
+            }
+            let prefix = self.foreign_prefix(&a.ns, &a.prefix);
+            self.non_latin1_names |= prefix.chars().chain(a.name.chars()).any(|c| u32::from(c) > 0xff);
+            out.push_str(&format!(" {prefix}:{}=\"{}\"", a.name, xml_attr_escape(&a.value)));
+        }
+    }
+    /// The prefix namespace `ns` is written under: `wanted` (the file's), else `wanted2`,
+    /// `wanted3`… when the export's own prefixes or another namespace already have it. XML keeps
+    /// prefixes starting with `xml` for itself: those become `ns`, `ns2`…
+    fn foreign_prefix(&mut self, ns: &str, wanted: &str) -> String {
+        if let Some(p) = self.foreign_ns.get(ns) {
+            return p.clone();
+        }
+        const OURS: [&str; 5] = ["svg", "xlink", "rdf", "dc", "vectorcraft"];
+        let base = if wanted.to_ascii_lowercase().starts_with("xml") { "ns" } else { wanted };
+        let taken = |p: &str| OURS.contains(&p) || self.foreign_ns.values().any(|q| q == p);
+        let mut prefix = base.to_string();
+        let mut k = 2;
+        while taken(&prefix) {
+            prefix = format!("{base}{k}");
+            k += 1;
+        }
+        self.foreign_ns.insert(ns.to_string(), prefix.clone());
+        prefix
+    }
+    /// Window › SVG Interactivity: `n`'s events as event attributes (`onclick="…"`), added to
+    /// `out`. The SVG Tiny 1.2 profile leaves them out with a warning.
+    fn event_attrs(&mut self, n: &Node, out: &mut String) {
+        let events = n.extras().attrs.as_deref().map_or(&[][..], |a| a.events.as_slice());
+        if events.is_empty() {
+            return;
+        }
+        if self.tiny() {
+            self.warn("SVG Tiny 1.2 has no event attributes: SVG Interactivity events were left out");
+            return;
+        }
+        let mut seen = HashSet::new();
+        for (event, script) in events {
+            // Native data can name anything: only the panel's events are written, once each.
+            if !SVG_EVENTS.contains(&event.as_str()) || !valid_xml_value(script) {
+                self.warn("SVG Interactivity events with unknown names or invalid XML characters were left out of SVG");
+                continue;
+            }
+            if !seen.insert(event.as_str()) {
+                self.warn("Repeated SVG Interactivity events were written only once in SVG");
+                continue;
+            }
+            out.push_str(&format!(" {event}=\"{}\"", xml_attr_escape(script)));
+        }
     }
     fn matrix(&self, m: Affine) -> String {
         let c = m.as_coeffs();
@@ -654,12 +745,13 @@ impl Writer<'_> {
         match styling {
             Styling::PresentationAttributes => {
                 // CSS-only properties go in a style attribute (SVG Tiny has none: left out).
-                let (style, attrs): (Vec<_>, Vec<_>) =
-                    props.iter().partition(|(k, _)| matches!(*k, "mix-blend-mode" | "isolation" | "font-feature-settings" | "font-kerning"));
+                let (style, attrs): (Vec<_>, Vec<_>) = props.iter().partition(|(k, _)| {
+                    matches!(*k, "mix-blend-mode" | "isolation" | "font-feature-settings" | "font-variation-settings" | "font-kerning")
+                });
                 let mut s: String = attrs.iter().map(|(k, v)| format!(" {k}=\"{}\"", xml_escape(v))).collect();
                 if !style.is_empty() {
                     if self.tiny() {
-                        self.warn("SVG Tiny 1.2 has no style sheets: blend modes, isolation and font features are left out");
+                        self.warn("SVG Tiny 1.2 has no style sheets: blend modes, isolation, font features and font variation settings are left out");
                     } else {
                         s.push_str(&format!(" style=\"{}\"", xml_escape(&css::declarations(style))));
                     }
@@ -1005,7 +1097,7 @@ impl Writer<'_> {
             && strokes <= 1
             && !items.iter().any(|i| has_raster(i.effects()))
             && items.iter().all(|i| i.blend() == BlendMode::Normal)
-            && !items.iter().any(|i| freeform(i.paint()).is_some())
+            && !items.iter().any(|i| pixel_gradient(i.paint(), matches!(i, AppearanceItem::Fill(_))).is_some())
             && plans.iter().flatten().all(|p| matches!(p, StrokePlan::Written(Written { shape: WrittenShape::Stroke { .. }, side: None })));
         if simple {
             let mut p = Props::new();
@@ -1039,10 +1131,10 @@ impl Writer<'_> {
             match (it, plan) {
                 (AppearanceItem::Fill(f), _) => {
                     let blend = (f.blend != BlendMode::Normal).then(|| ("mix-blend-mode", blend_css(f.blend).to_string()));
-                    if let (Some(g), Some(b)) = (freeform(&f.paint), bounds) {
+                    if let (Some(g), Some(b)) = (pixel_gradient(&f.paint, true), bounds) {
                         p.extend((f.opacity < 1.0).then(|| ("opacity", fmt_num(f.opacity as f64, 3))));
                         p.extend(blend);
-                        self.raster_paint(g, b, &[d.to_string()], rule, &p, "");
+                        self.raster_paint(g, b, &[d.to_string()], rule, &p, "", true);
                     } else {
                         self.fill_props(f, rule, bounds, &mut p);
                         p.extend(blend);
@@ -1071,7 +1163,7 @@ impl Writer<'_> {
                     let side = self.side_attr(w.side, d, rule, w.reach(s, bounds.unwrap_or_default()));
                     let blend = (s.blend != BlendMode::Normal).then(|| ("mix-blend-mode", blend_css(s.blend).to_string()));
                     let opacity = (s.opacity < 1.0).then(|| ("opacity", fmt_num(s.opacity as f64, 3)));
-                    match (&w.shape, freeform(&s.paint).zip(paint_bounds(s))) {
+                    match (&w.shape, pixel_gradient(&s.paint, false).zip(paint_bounds(s))) {
                         (WrittenShape::Stroke { width }, Some((g, b))) => {
                             // The stroke's outline clips the gradient's image.
                             let bp = bp.get_or_insert_with(|| doc_path(paths));
@@ -1079,13 +1171,13 @@ impl Writer<'_> {
                             let clip = self.path_d(&PathData::from_bezpath(&outline), self.xf);
                             p.extend(opacity);
                             p.extend(blend);
-                            self.raster_paint(g, b, &[clip], FillRule::NonZero, &p, &side);
+                            self.raster_paint(g, b, &[clip], FillRule::NonZero, &p, &side, false);
                         }
                         (WrittenShape::Fill(outlines), Some((g, b))) if s.path_gradient().is_none() => {
                             let clip: Vec<String> = outlines.iter().map(|o| self.path_d(&PathData::from_bezpath(o), self.xf)).collect();
                             p.extend(opacity);
                             p.extend(blend);
-                            self.raster_paint(g, b, &clip, FillRule::NonZero, &p, &side);
+                            self.raster_paint(g, b, &clip, FillRule::NonZero, &p, &side, false);
                         }
                         (WrittenShape::Stroke { width }, _) => {
                             p.push(("fill", "none".into()));
@@ -1486,30 +1578,46 @@ impl Writer<'_> {
             return format!("data:{};base64,{}", b.mime, base64_encode(&b.bytes));
         }
         let name = format!("{}.{}", b.content_key(), image_ext(&b.mime));
-        if !self.linked.iter().any(|l| l.name == name) {
+        if self.linked_names.insert(name.clone()) {
             self.linked.push(LinkedImage { name: name.clone(), bytes: b.bytes.clone() });
         }
         name
     }
 
-    /// A freeform gradient `g` painted over `bounds` (the space [`Self::xf`] maps into user
-    /// space), which SVG can't express: an `<image>` of the colour field over its painted box,
-    /// sampled as the canvas samples it (at twice the box's size in points) and clipped to
-    /// `clip` (outlines in user space filled by `rule`), in a group with `props` and the `side`
-    /// attribute. Nothing is written for an empty box.
-    fn raster_paint(&mut self, g: &GradientPaint, bounds: Rect, clip: &[String], rule: FillRule, props: &Props, side: &str) {
+    /// A gradient `g` painted over `bounds` (the space [`Self::xf`] maps into user space) that is
+    /// drawn as pixels ([`GradientPaint::draws_as_pixels`]) when it paints a fill (`fill`) or a
+    /// stroke: an `<image>` over its painted box, clipped to `clip` (outlines in user space filled
+    /// by `rule`), in a group with `props` and the `side` attribute. A freeform gradient's colour
+    /// field, which SVG can't express, is sampled as the canvas samples it (at twice the box's size
+    /// in points); a linear or radial gradient at the document's raster effects resolution (at most
+    /// [`MAX_GRADIENT_PX`] a side), with dither's noise on a fill. Nothing is written for an empty
+    /// box.
+    #[allow(clippy::too_many_arguments)]
+    fn raster_paint(&mut self, g: &GradientPaint, bounds: Rect, clip: &[String], rule: FillRule, props: &Props, side: &str, fill: bool) {
         use vectorcraft_color::freeform::{grid_size, painted_box, spread_scale};
         let Some(b) = painted_box(bounds) else { return };
-        let (cols, rows) = grid_size(b, 2.0 * b.width().max(b.height()));
-        let field = g.freeform_on(b).field(spread_scale(b));
-        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let rgba: Vec<u8> = field.grid(b, cols, rows).flat_map(|([r, g, bl], a)| [q(r), q(g), q(bl), q(a)]).collect();
+        let freeform = g.gradient.kind == GradientKind::Freeform;
+        let (rgba, cols, rows): (Vec<u8>, u16, u16) = if freeform {
+            let (cols, rows) = grid_size(b, 2.0 * b.width().max(b.height()));
+            let field = g.freeform_on(b).field(spread_scale(b));
+            let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            (field.grid(b, cols, rows).flat_map(|([r, g, bl], a)| [q(r), q(g), q(bl), q(a)]).collect(), cols, rows)
+        } else {
+            let k = self.doc.raster_effects_ppi / 72.0;
+            let along = |len: f64| (len * k).ceil().clamp(1.0, MAX_GRADIENT_PX) as u16;
+            let (cols, rows) = (along(b.width()), along(b.height()));
+            (g.pixels(b, b, cols, rows, fill, &Color::to_rgb).flatten().collect(), cols, rows)
+        };
         let mut png = Vec::new();
         let Some(img) = image::RgbaImage::from_raw(u32::from(cols), u32::from(rows), rgba) else { return };
         if img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).is_err() {
             return;
         }
-        self.warn("freeform gradients are written as images clipped to their shapes");
+        self.warn(if freeform {
+            "freeform gradients are written as images clipped to their shapes"
+        } else {
+            "linear and radial gradients drawn as pixels are written as images clipped to their shapes"
+        });
         let href = self.blob_href(&ImageBlob::new("image/png", png));
         let cid = self.fresh_id("clip-path");
         let r = if rule == FillRule::EvenOdd { " clip-rule=\"evenodd\"" } else { "" };
@@ -1613,11 +1721,15 @@ impl Writer<'_> {
             return 0;
         }
         let bounds = n.visual_bounds_with(&self.doc.symbol_boxes());
-        let reach: f64 = fx.iter().map(|f| f.outset(bounds.unwrap_or_default())).sum::<f64>() + 2.0;
+        // An Outer Glow's silhouette grows by a quarter of a pixel of the document's raster grid first.
+        let grow = 18.0 / self.doc.raster_ppi();
+        let reach: f64 =
+            fx.iter().map(|f| f.outset(bounds.unwrap_or_default()) + if matches!(f, RasterFx::OuterGlow { .. }) { grow } else { 0.0 }).sum::<f64>()
+                + 2.0;
         let region = bounds.map(|b| self.xf.transform_rect_bbox(b).inflate(reach, reach));
         let mut opened = 0;
         for f in fx.iter().rev() {
-            if matches!(f, RasterFx::Pixel(_)) {
+            if matches!(f, RasterFx::Pixel(_) | RasterFx::Rasterize(_)) {
                 self.warn("SVG has no pixel effects such as Radial Blur, Smart Blur or Unsharp Mask: they are left out");
                 continue;
             }
@@ -1653,8 +1765,10 @@ impl Writer<'_> {
                     self.num(*dy),
                     flood(color, *opacity)
                 ),
+                // The glow blurs a solid silhouette (alpha × 255 makes any alpha full) grown by a quarter raster pixel.
                 RasterFx::OuterGlow { opacity, blur, color, .. } => format!(
-                    "<feGaussianBlur in=\"SourceAlpha\" stdDeviation=\"{}\" result=\"glow\"/>{}<feComposite in2=\"glow\" operator=\"in\" result=\"paint\"/><feMerge><feMergeNode in=\"paint\"/><feMergeNode in=\"SourceGraphic\"/></feMerge>",
+                    "<feComponentTransfer in=\"SourceAlpha\"><feFuncA type=\"linear\" slope=\"255\"/></feComponentTransfer><feMorphology operator=\"dilate\" radius=\"{}\"/><feGaussianBlur stdDeviation=\"{}\" result=\"glow\"/>{}<feComposite in2=\"glow\" operator=\"in\" result=\"paint\"/><feMerge><feMergeNode in=\"paint\"/><feMergeNode in=\"SourceGraphic\"/></feMerge>",
+                    fmt_num(grow, 3),
                     sd(*blur),
                     flood(color, *opacity)
                 ),
@@ -1678,7 +1792,7 @@ impl Writer<'_> {
                     sd(*radius)
                 ),
                 RasterFx::GaussianBlur { radius } => format!("<feGaussianBlur in=\"SourceGraphic\" stdDeviation=\"{}\"/>", sd(*radius)),
-                RasterFx::Pixel(_) => continue,
+                RasterFx::Pixel(_) | RasterFx::Rasterize(_) => continue,
             };
             // Filters composite normally: a shadow's or glow's other blend mode is recorded for import.
             let mode = match f {
@@ -1714,6 +1828,12 @@ impl Writer<'_> {
         // Character paints resolve in the text's space (`to_user` maps it into user space).
         let (bounds, to_user) = space;
         let saved = std::mem::replace(&mut self.xf, to_user);
+        if let Paint::Gradient(g) = &st.fill
+            && g.gradient.dither
+            && g.gradient.kind != GradientKind::Freeform
+        {
+            self.warn("dithered gradients on characters are written without dither");
+        }
         let fill = self.paint(&st.fill, Some(bounds));
         p.push(("fill", fill));
         // An inside or outside stroke is drawn on the glyph outlines instead
@@ -1743,7 +1863,12 @@ impl Writer<'_> {
         let resolved = doc.inline_resolved(t);
         let t = &*resolved;
         let inline = t.runs.iter().any(|r| r.inline.is_some());
-        let outlined = self.opts.outline_text || t.vertical || (inline && matches!(t.kind, TextKind::OnPath { .. }));
+        // Ruby is written as outlines with its base text: a reader's <text> can't place it. So are
+        // small capitals, superscript and subscript and tab leaders, which SVG text doesn't draw (#3869).
+        let unwritable = t.runs.iter().any(|r| r.style.small_caps.is_some() || r.style.position != vectorcraft_doc::CharPosition::Normal)
+            || std::iter::once(&t.para).chain(&t.paras).any(|p| p.tabs.iter().any(|tab| !tab.leader.is_empty()));
+        let outlined =
+            self.opts.outline_text || t.vertical || !t.ruby.is_empty() || (inline && matches!(t.kind, TextKind::OnPath { .. })) || unwritable;
         let chars = |w: &mut Self, n: &Node| if outlined { w.text_outlines(n, t) } else { w.text(n, t) };
         let painted = n.appearance.items.iter().any(|i| i.visible() && !i.paint().is_none());
         // Live type with an inside or outside character stroke writes that stroke apart from the
@@ -1793,17 +1918,23 @@ impl Writer<'_> {
     }
 
     /// Text as glyph outlines: one compound path per run, painted like the run (gradients span
-    /// the whole text, as on the canvas).
+    /// the whole text), over its colour glyphs, as on the canvas.
     fn text_outlines(&mut self, n: &Node, t: &TextObject) {
         let db = vectorcraft_text::FontDb::global();
         let lay = vectorcraft_text::layout(db, t);
-        let mut runs: Vec<(usize, kurbo::BezPath)> = vec![];
-        // Underline and strikethrough bars join their run's outlines.
+        let mut runs = vec![kurbo::BezPath::new(); t.runs.len()];
+        // Underline and strikethrough bars join their run's outlines; ruby glyphs are painted
+        // with the run of the text they annotate.
         let bars = vectorcraft_text::decorations(&lay, db, t);
-        for (run, outline) in lay.glyphs.iter().map(|g| (g.run, &g.outline)).chain(bars.iter().map(|(r, b)| (*r, b))) {
-            match runs.iter_mut().find(|(r, _)| *r == run) {
-                Some((_, bp)) => bp.extend(outline.iter()),
-                None => runs.push((run, outline.clone())),
+        for (run, outline) in lay
+            .glyphs
+            .iter()
+            .map(|g| (g.run, &g.outline))
+            .chain(lay.ruby.iter().map(|g| (g.run, &g.outline)))
+            .chain(bars.iter().map(|(r, b)| (*r, b)))
+        {
+            if let Some(bp) = runs.get_mut(run) {
+                bp.extend(outline.iter());
             }
         }
         let id = self.id_attr(n);
@@ -1813,9 +1944,28 @@ impl Writer<'_> {
         // The glyphs stay in text space; the text's transform joins the document's meanwhile.
         let saved = self.xf;
         self.xf = saved * t.xf;
-        for (r, bp) in runs {
-            let Some(run) = t.runs.get(r) else { continue };
-            let pd = PathData::from_bezpath(&bp);
+        for (i, (bp, run)) in runs.iter().zip(&t.runs).enumerate() {
+            // Colour glyphs paint themselves, under their run's paint: bitmap glyphs (emoji) as
+            // their images, COLR and SVG glyphs as their art.
+            for g in lay.glyphs.iter().filter(|g| g.run == i) {
+                if let Some((image, to_text)) = g.placed_image() {
+                    let m = self.matrix(self.xf * to_text);
+                    let href = self.blob_href(&image.blob);
+                    self.line(&format!(
+                        "<image width=\"{}\" height=\"{}\" transform=\"{m}\" preserveAspectRatio=\"none\" xlink:href=\"{}\"/>",
+                        image.width,
+                        image.height,
+                        xml_escape(&href)
+                    ));
+                }
+                if let Some(art) = g.placed_colour(Affine::IDENTITY) {
+                    self.node(&art);
+                }
+            }
+            if bp.elements().is_empty() {
+                continue;
+            }
+            let pd = PathData::from_bezpath(bp);
             // An unnamed id: the pieces carry no id attribute (the group has it).
             let glyphs = Node::path(NodeId(u64::MAX), pd.clone(), run.style.appearance());
             let d = self.path_d(&pd, self.xf);
@@ -1833,9 +1983,11 @@ impl Writer<'_> {
     fn text(&mut self, n: &Node, t: &TextObject) {
         // Live SVG text is written in logical order from left-aligned pieces: bidirectional text
         // (and right-to-left paragraphs) keep their look as outlines until it is written with
-        // `direction`/`unicode-bidi`.
+        // `direction`/`unicode-bidi`. So do runs set Right to Left (Character Direction), whose
+        // `direction="rtl"` would anchor their pieces at the right end.
         let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), t);
-        if lay.glyphs.iter().any(|g| g.rtl) || lay.lines.iter().any(|l| l.rtl) {
+        let rtl_runs = t.runs.iter().any(|r| r.style.char_direction == Some(vectorcraft_doc::ParaDirection::RightToLeft));
+        if lay.glyphs.iter().any(|g| g.rtl) || lay.lines.iter().any(|l| l.rtl) || rtl_runs {
             self.warn("bidirectional text is outlined to preserve shaping and visual order");
             return self.text_outlines(n, t);
         }
@@ -1846,10 +1998,24 @@ impl Writer<'_> {
                 self.warn("type on a path with an end bracket, Align to Path or Spacing is outlined to keep its look");
                 return self.text_outlines(n, t);
             }
+            // It cannot hang glyphs outside the start bracket either.
+            if hangs_on_path(t, &lay) {
+                self.warn("type on a path with glyphs hanging outside its brackets is outlined to keep its look");
+                return self.text_outlines(n, t);
+            }
+            // A `<textPath>` holds the characters of the text, not the bullets or numbers drawn
+            // before them.
+            if !lay.markers.is_empty() {
+                self.warn("type on a path with bullets or numbers is outlined to keep its look");
+                return self.text_outlines(n, t);
+            }
             return self.text_on_path(n, t, path, *start);
         }
         self.note_fonts(t, &lay);
         let lines = text_lines(t, &lay, self.opts.fewer_tspans);
+        // `drawn` holds the styles the layout draws the text in: Shrink Text to Fit scales its sizes, explicit leading and baseline shifts.
+        let fitted = (lay.fit_scale != 1.0).then(|| vectorcraft_text::scaled(t, lay.fit_scale));
+        let drawn = fitted.as_ref().unwrap_or(t);
         // Each line is anchored as its paragraph is aligned. A tab starts a new chunk at its
         // stop, and so does the text after an inline graphic: lines with tabs, and text with
         // inline graphics, are never anchored.
@@ -1870,7 +2036,13 @@ impl Writer<'_> {
         let uniform = anchors.first().copied().filter(|a| a.is_some() && anchors.iter().all(|b| b == a)).flatten();
         // The <text> element's user space is text space.
         let space = (lay.bounds, Affine::IDENTITY);
-        let base = TextBase { props: self.char_props(&t.first_style(), space), space, anchored: uniform.is_some() };
+        let mut base_props = self.char_props(&drawn.first_style(), space);
+        // A `<tspan>` cannot undo the decoration of the `<text>` around it: with bullets, which
+        // have none, each run's `<tspan>` carries its own.
+        if !lay.markers.is_empty() {
+            base_props.retain(|(k, _)| *k != "text-decoration");
+        }
+        let base = TextBase { props: base_props, space, anchored: uniform.is_some() };
         let mut props = base.props.clone();
         if let Some((a, _)) = uniform {
             props.push(("text-anchor", a.into()));
@@ -1895,10 +2067,10 @@ impl Writer<'_> {
                 Some((a, _)) => {
                     s.push_str(&format!("<tspan x=\"{}\" y=\"{}\" text-anchor=\"{a}\">", self.num(start.0), self.num(start.1)));
                     let inner = TextBase { anchored: true, ..base.clone() };
-                    self.text_line(&mut s, t, &line.segs, start, &inner, false);
+                    self.text_line(&mut s, drawn, &line.segs, start, &inner, false);
                     s.push_str("</tspan>");
                 }
-                None => self.text_line(&mut s, t, &line.segs, start, &base, true),
+                None => self.text_line(&mut s, drawn, &line.segs, start, &base, true),
             }
         }
         s.push_str("</text>");
@@ -1941,7 +2113,7 @@ impl Writer<'_> {
 
     /// One line of laid-out text starting at `start`. Default: a positioned `<tspan>` per segment
     /// (only the first of an anchored line). Fewer tspans: one positioned `<tspan>` per line with
-    /// the style changes nested in it, positioned again only after tabs and justified word spaces.
+    /// the style changes nested in it, positioned again only after tabs and inline graphics.
     /// Baseline shifts are relative (`dy`), undone by the next segment that isn't shifted.
     /// `positioned`: false when the caller already positioned the line (an outer `<tspan>`).
     fn text_line(&mut self, s: &mut String, t: &TextObject, line: &[Segment], start: (f64, f64), base: &TextBase, positioned: bool) {
@@ -1954,7 +2126,14 @@ impl Writer<'_> {
         // The baseline shift the current text position carries.
         let mut shift = 0.0;
         for seg in line {
-            let Some(st) = t.runs.get(seg.run).map(|r| &r.style) else { continue };
+            let Some(run_style) = t.runs.get(seg.run).map(|r| &r.style) else { continue };
+            let marker_style;
+            let st = if seg.marker {
+                marker_style = vectorcraft_doc::text::ParaList::marker_style(run_style);
+                &marker_style
+            } else {
+                run_style
+            };
             let mut attrs = String::new();
             if place {
                 let (x, y) = if first { start } else { (seg.x, seg.y) };
@@ -1966,15 +2145,17 @@ impl Writer<'_> {
                 attrs.push_str(&format!(" dy=\"{}\"", self.num(shift - st.baseline_shift)));
                 shift = st.baseline_shift;
             }
-            // After a tab or a justified word space the next segment is placed.
+            // After a tab, an inline graphic or a justified word space, and before a character that a
+            // reader would draw elsewhere, the next segment is placed.
             place = seg.brk || (!fewer && !base.anchored && positioned);
-            if (st.h_scale - st.v_scale).abs() > 1e-9 {
-                attrs.push_str(&format!(" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\"", self.num(seg.advance)));
+            if (st.h_scale - st.v_scale).abs() > 1e-9 || seg.scale != 1.0 {
+                attrs.push_str(&format!(" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\"", self.num(seg.advance * seg.scale)));
             }
             if st.rotation != 0.0 {
                 attrs.push_str(&format!(" rotate=\"{}\"", self.num(-st.rotation)));
             }
-            let diff = run_diff(&base.props, self.char_props(st, base.space));
+            let mut diff = run_diff(&base.props, self.char_props(st, base.space));
+            diff.extend(direction_props(st));
             attrs.push_str(&self.attrs(&diff));
             let text = xml_text(&seg.text);
             if attrs.is_empty() && fewer {
@@ -2000,22 +2181,33 @@ impl Writer<'_> {
         let db = FontDb::global();
         let plain = t.plain_text();
         let mut face: Option<Arc<FontFace>> = None;
-        for g in &lay.glyphs {
+        for (i, g) in lay.glyphs.iter().enumerate() {
             let Some(st) = t.runs.get(g.run).map(|r| &r.style) else { continue };
+            // A colour font's subset would hold no bitmaps or COLR layers: its emoji are left to the
+            // viewer.
+            if g.image.is_some() || g.colour.is_some() {
+                self.warn("colour emoji fonts are not embedded: viewers show emoji in their own fonts");
+                continue;
+            }
             if face.as_ref().is_none_or(|f| f.id() != g.font_id) {
                 face = db.face_by_id(g.font_id);
             }
             let Some(f) = &face else { continue };
             let (weight, italic) = font_descriptor(st);
-            let at = self.fonts.iter().position(|u| u.face.id() == f.id() && (u.weight, u.italic) == (weight, italic) && u.family == st.font_family);
+            let stretch = css::font_stretch(st).map(f64::to_bits);
+            let at = self
+                .fonts
+                .iter()
+                .position(|u| u.face.id() == f.id() && (u.weight, u.italic, u.stretch) == (weight, italic, stretch) && u.family == st.font_family);
             let at = at.unwrap_or_else(|| {
                 let family = st.font_family.clone();
-                self.fonts.push(FontUse { family, weight, italic, face: f.clone(), chars: BTreeSet::new() });
+                self.fonts.push(FontUse { family, weight, italic, stretch, face: f.clone(), chars: BTreeSet::new() });
                 self.fonts.len() - 1
             });
             let Some(chars) = self.fonts.get_mut(at).map(|u| &mut u.chars) else { continue };
-            // As written: a hyphen where a line breaks, capitals for All Caps, the style's Digits.
-            let src = if g.len == 0 { "-" } else { plain.get(g.byte..g.byte + g.len).unwrap_or("") };
+            // As written: a list marker's characters, a hyphen where a line breaks, capitals for All
+            // Caps, the style's Digits.
+            let src = lay.marker_text(i).unwrap_or_else(|| if g.len == 0 { "-" } else { plain.get(g.byte..g.byte + g.len).unwrap_or("") });
             for c in src.chars().filter(|c| !c.is_control() && *c != '\u{ad}').map(|c| st.digits.map(c)) {
                 if st.all_caps {
                     chars.extend(c.to_uppercase());
@@ -2029,10 +2221,30 @@ impl Writer<'_> {
     /// The `@font-face` rules of the faces type uses ([`ExportOptions::embed_fonts`]): each face
     /// subset to its characters (whole when its licence forbids subsetting, left out with a
     /// warning when it forbids embedding). Faces sharing a description cover their own
-    /// characters (`unicode-range`).
+    /// characters (`unicode-range`); where two of them share characters as well, a warning says
+    /// that browsers draw those in one of the faces.
     fn font_faces(&mut self) -> Vec<String> {
         let uses = std::mem::take(&mut self.fonts);
         let mut rules = Vec::new();
+        fn described(u: &FontUse) -> (&str, u16, bool, Option<u64>) {
+            (&u.family, u.weight, u.italic, u.stretch)
+        }
+        let mut clashing: Vec<&String> = vec![];
+        for (i, u) in uses.iter().enumerate() {
+            let clash = uses
+                .get(..i)
+                .unwrap_or_default()
+                .iter()
+                .any(|o| described(o) == described(u) && o.face.id() != u.face.id() && !o.chars.is_disjoint(&u.chars));
+            if clash && !clashing.contains(&&u.family) {
+                clashing.push(&u.family);
+            }
+        }
+        for family in clashing {
+            self.warn(&format!(
+                "type in {family} uses faces of one weight, style and width that share characters: browsers draw those characters in one of the embedded faces"
+            ));
+        }
         for u in &uses {
             let chars: Vec<char> = u.chars.iter().copied().collect();
             let name = format!("{} {}", u.face.family, u.face.style);
@@ -2043,11 +2255,12 @@ impl Writer<'_> {
             if !font.subset {
                 self.warn(&format!("the font {name} is embedded whole: its licence doesn't allow subsetting"));
             }
-            let shared = uses.iter().filter(|o| (&o.family, o.weight, o.italic) == (&u.family, u.weight, u.italic)).count() > 1;
+            let shared = uses.iter().filter(|o| described(o) == described(u)).count() > 1;
             let range = if shared { format!(";unicode-range:{}", unicode_range(&u.chars)) } else { String::new() };
+            let stretch = u.stretch.map(|w| format!(";font-stretch:{}%", fmt_num(f64::from_bits(w), 3))).unwrap_or_default();
             let (mime, format) = if font.cff { ("font/otf", "opentype") } else { ("font/ttf", "truetype") };
             rules.push(format!(
-                "@font-face{{font-family:{};font-weight:{};font-style:{};src:url(data:{mime};base64,{}) format(\"{format}\"){range}}}",
+                "@font-face{{font-family:{};font-weight:{};font-style:{}{stretch};src:url(data:{mime};base64,{}) format(\"{format}\"){range}}}",
                 css_string(&u.family),
                 u.weight,
                 if u.italic { "italic" } else { "normal" },
@@ -2079,7 +2292,8 @@ impl Writer<'_> {
         let offset = fmt_num(start * 100.0, 3);
         let mut s = format!("<text{id} xml:space=\"preserve\"{a}><textPath xlink:href=\"#{pid}\" startOffset=\"{offset}%\">");
         for run in &t.runs {
-            let diff = run_diff(&base, self.char_props(&run.style, space));
+            let mut diff = run_diff(&base, self.char_props(&run.style, space));
+            diff.extend(direction_props(&run.style));
             let a = self.attrs(&diff);
             s.push_str(&format!("<tspan{a}>{}</tspan>", xml_text(&run.text.replace('\n', " "))));
         }
@@ -2094,6 +2308,34 @@ fn aligned(st: &CharStyle) -> bool {
     st.has_stroke() && st.stroke_align != StrokeAlign::Center
 }
 
+/// Does type on a path `t`, laid out as `lay`, hang glyphs outside its brackets? It does when
+/// Optical Margin Alignment or its first paragraph's Roman Hanging Punctuation is on and its
+/// glyphs sit elsewhere with both off.
+fn hangs_on_path(t: &TextObject, lay: &vectorcraft_text::TextLayout) -> bool {
+    if !t.optical_margin && !t.para_at(0).roman_hanging {
+        return false;
+    }
+    let mut flush = t.clone();
+    flush.optical_margin = false;
+    let mut styles = flush.paragraph_styles();
+    for p in &mut styles {
+        p.roman_hanging = false;
+    }
+    flush.set_paragraph_styles(styles);
+    let flush = vectorcraft_text::layout(FontDb::global(), &flush);
+    lay.glyphs.len() != flush.glyphs.len() || lay.glyphs.iter().zip(&flush.glyphs).any(|(a, b)| a.origin != b.origin)
+}
+
+/// The `direction` and `unicode-bidi` of a `<tspan>` of characters in style `st`: an embedding in
+/// its Character Direction, and nothing without one. Each `<tspan>` of characters with a direction
+/// carries them, and the `<text>` does not. Type with a run set Right to Left is written as
+/// outlines ([`Writer::text`]), so live text writes `direction="ltr"` only.
+fn direction_props(st: &CharStyle) -> Props {
+    let Some(d) = st.char_direction else { return Props::new() };
+    let direction = if d == vectorcraft_doc::ParaDirection::RightToLeft { "rtl" } else { "ltr" };
+    vec![("direction", direction.into()), ("unicode-bidi", "embed".into())]
+}
+
 /// What the `<tspan>` of a run whose properties are `run` sets over its `<text>`'s `base`: the
 /// properties that differ, and the initial value of each one `base` sets and the run doesn't.
 fn run_diff(base: &Props, run: Props) -> Props {
@@ -2106,7 +2348,7 @@ fn run_diff(base: &Props, run: Props) -> Props {
 /// on a `<tspan>`).
 fn initial_value(k: &str) -> Option<&'static str> {
     Some(match k {
-        "font-weight" | "font-style" | "font-feature-settings" => "normal",
+        "font-weight" | "font-style" | "font-stretch" | "font-feature-settings" | "font-variation-settings" => "normal",
         "stroke" | "stroke-dasharray" => "none",
         "stroke-width" | "stroke-opacity" => "1",
         "stroke-linecap" => "butt",
@@ -2130,10 +2372,14 @@ fn doc_path(paths: &[&PathData]) -> BezPath {
 /// How closely stroke outlines that clip an image follow the stroke (points).
 const OUTLINE_TOLERANCE: f64 = 0.01;
 
-/// The freeform gradient a paint is, if it is one (SVG has no freeform gradients).
-fn freeform(p: &Paint) -> Option<&GradientPaint> {
+/// Most pixels along a side of a linear or radial gradient's image.
+const MAX_GRADIENT_PX: f64 = 4096.0;
+
+/// The gradient a fill (`fill`) or stroke paint is, if it is drawn as pixels
+/// ([`GradientPaint::draws_as_pixels`]; SVG has no freeform gradients, for one).
+fn pixel_gradient(p: &Paint, fill: bool) -> Option<&GradientPaint> {
     match p {
-        Paint::Gradient(g) if g.gradient.kind == GradientKind::Freeform => Some(g),
+        Paint::Gradient(g) if g.draws_as_pixels(fill) => Some(g),
         _ => None,
     }
 }
@@ -2164,40 +2410,78 @@ struct Line {
 struct Segment {
     /// Index into `TextObject::runs`.
     run: usize,
-    /// Where the segment starts (text space; `y` is the baseline).
+    /// Where a reader starts drawing the segment (text space; `y` is the baseline).
     x: f64,
     y: f64,
     text: String,
-    /// The laid-out width (tracking and justification included).
+    /// The width a reader gives the segment (tracking included). On a line that is justified or
+    /// set with Mojikumi (unless `fewer`), that is the width without justification and Mojikumi
+    /// ([`reader_advances`]), for horizontally scaled type also without its last character's
+    /// kerning against the character after it ([`end_segment`]); elsewhere, the laid-out width.
     advance: f64,
-    /// The next segment needs its own position (after a tab, or a word space of a justified line).
+    /// The next segment needs its own position (after a tab, a word space of a justified line, or
+    /// the next segment starts with a character the layout draws elsewhere than a reader would).
     brk: bool,
+    /// Glyph Scaling of the segment's one glyph (Justification…), which a reader stretches it to
+    /// (`textLength`); 1 for other segments.
+    scale: f64,
+    /// A list marker's characters and tab, written in
+    /// [`vectorcraft_doc::text::ParaList::marker_style`] of the run's style.
+    marker: bool,
 }
+
+/// How far a reader may draw a character from where the layout draws it before the character is
+/// given its own position (points).
+const PLACE_TOLERANCE: f64 = 1e-6;
 
 /// The laid-out lines of `t` as segments: a new segment at every style change, after tabs and,
 /// on justified lines, after each word space (unless `fewer`). The text comes from the clusters
 /// the layout placed: soft hyphens draw nothing, a line broken by hyphenation ends in `-`, all
-/// caps are upper case.
+/// caps are upper case. Unless `fewer`, a line that is justified or composed with Mojikumi also
+/// starts a new segment at each character the layout draws elsewhere than a reader continuing
+/// the segment would ([`reader_advances`]): a Justify All line's letter gaps, the gaps between
+/// the characters of a justified Japanese line, and the spacing Mojikumi changes.
 fn text_lines(t: &TextObject, lay: &vectorcraft_text::TextLayout, fewer: bool) -> Vec<Line> {
     let plain = t.plain_text();
     let mut lines = Vec::with_capacity(lay.lines.len());
+    let (mut kerned, mut unkerned) = (None, None);
     for line in &lay.lines {
         let para = plain.as_bytes().get(..line.start).map_or(0, |b| b.iter().filter(|&&c| c == b'\n').count());
-        let split_words = !fewer && !matches!(t.para_at(para).justify, Justify::Auto | Justify::Left | Justify::Center | Justify::Right);
+        let style = t.para_at(para);
+        let split_words = !fewer && !matches!(style.justify, Justify::Auto | Justify::Left | Justify::Center | Justify::Right);
+        // Each cluster's advance and drawing offset as a reader gives them, by its byte offset.
+        // Justification…'s Desired word and letter spacing and glyph scaling move characters from
+        // where a reader draws them, on every line.
+        let spaced = !fewer && !style.justification.desired_is_default();
+        let reader = if split_words || spaced || (!fewer && !style.mojikumi.is_none()) {
+            Some(&*kerned.get_or_insert_with(|| reader_advances(t, lay, true)))
+        } else {
+            None
+        };
+        // Where a reader draws the next character of the last segment, and the byte offset and
+        // reader's advance of the last segment's last cluster.
+        let mut pen = 0.0;
+        let mut tail = None;
         let mut segs: Vec<Segment> = Vec::new();
         let mut cluster = None;
-        let source = |g: &vectorcraft_text::PositionedGlyph| if g.len == 0 { "-" } else { plain.get(g.byte..g.byte + g.len).unwrap_or("") };
+        // A list marker's glyphs write its characters and then a tab (glyph `i` of the layout).
+        let source = |i: usize, g: &vectorcraft_text::PositionedGlyph| {
+            lay.marker_text(i).unwrap_or_else(|| if g.len == 0 { "-" } else { plain.get(g.byte..g.byte + g.len).unwrap_or("") })
+        };
         let mut glyphs = lay.glyphs.get(line.glyph_start..line.glyph_end).unwrap_or_default();
         // Spaces where the line wrapped (it doesn't end its paragraph) don't belong to the line.
         if plain.get(line.end..).is_some_and(|rest| !rest.is_empty() && !rest.starts_with('\n')) {
-            while let Some((_, rest)) = glyphs.split_last().filter(|(g, _)| source(g).chars().all(|c| c.is_whitespace() && c != '\t')) {
+            while let Some((_, rest)) =
+                glyphs.split_last().filter(|(g, rest)| source(line.glyph_start + rest.len(), g).chars().all(|c| c.is_whitespace() && c != '\t'))
+            {
                 glyphs = rest;
             }
         }
         let mut after_inline = false;
-        for g in glyphs {
+        for (k, g) in glyphs.iter().enumerate() {
             let Some(run) = t.runs.get(g.run) else { continue };
-            if run.inline.is_some() {
+            // A list marker before an inline graphic is in the graphic's run, and is text.
+            if run.inline.is_some() && lay.marker_of(line.glyph_start + k).is_none() {
                 // An inline graphic (written as art): the text after it is placed anew.
                 if let Some(last) = segs.last_mut() {
                     last.brk = true;
@@ -2206,26 +2490,60 @@ fn text_lines(t: &TextObject, lay: &vectorcraft_text::TextLayout, fewer: bool) -
                 cluster = None;
                 continue;
             }
+            // The cluster as a reader sets it (a hyphen the layout adds is set as laid out).
+            let set = reader.and_then(|r| r.get(&g.byte)).filter(|_| g.len > 0);
             if g.len > 0 && cluster == Some(g.byte) {
-                // Another glyph of the same cluster.
-                if let Some(last) = segs.last_mut() {
+                // Another glyph of the same cluster (a reader's advance covers the whole cluster).
+                if let Some(last) = segs.last_mut().filter(|_| set.is_none()) {
                     last.advance += g.advance;
+                    pen += g.advance;
                 }
                 continue;
             }
-            cluster = Some(g.byte);
-            let src: String = source(g).chars().filter(|c| *c != '\u{ad}').map(|c| run.style.digits.map(c)).collect();
+            // A glyph that stands for no character (a list marker before the paragraph's first
+            // character) starts no cluster.
+            cluster = (g.len > 0).then_some(g.byte);
+            let (advance, x) = match set {
+                Some(&(advance, offset)) => {
+                    // A glyph the layout draws before its pen (Mojikumi) starts that much earlier.
+                    let x = g.xf.translation().x - offset;
+                    (advance, if (x - g.origin.x).abs() > PLACE_TOLERANCE { x } else { g.origin.x })
+                }
+                None => (g.advance, g.origin.x),
+            };
+            let src: String = source(line.glyph_start + k, g).chars().filter(|c| *c != '\u{ad}').map(|c| run.style.digits.map(c)).collect();
             let piece = if run.style.all_caps { src.to_uppercase() } else { src };
             let brk = piece == "\t" || (split_words && !piece.is_empty() && piece.chars().all(char::is_whitespace));
-            let fresh = std::mem::take(&mut after_inline);
+            // A glyph Glyph Scaling widens or narrows is a segment of its own, stretched to its width.
+            let scale = if reader.is_some() && (g.scale - 1.0).abs() > 1e-9 && g.scale.is_finite() { g.scale } else { 1.0 };
+            let fresh = std::mem::take(&mut after_inline) || scale != 1.0 || segs.last().is_some_and(|last| last.scale != 1.0);
+            // The layout draws the character elsewhere than a reader continuing the line would.
+            let moved = reader.is_some()
+                && segs.last().is_some_and(|last| (x - pen).abs() > PLACE_TOLERANCE || (g.origin.y - last.y).abs() > PLACE_TOLERANCE);
+            pen = x + advance;
+            // A list marker is a segment of its own, and so is the text after it. In horizontally
+            // scaled type a tab is a segment apart from the characters before it, so a reader
+            // stretching those characters to their width (`textLength`) stretches them alone.
+            let marker = lay.marker_of(line.glyph_start + k).is_some();
+            let tab_apart = piece == "\t" && (run.style.h_scale - run.style.v_scale).abs() > 1e-9;
             match segs.last_mut() {
-                Some(last) if last.run == g.run && !last.brk && !fresh => {
+                Some(last) if last.run == g.run && !last.brk && !fresh && !moved && last.marker == marker && !tab_apart => {
                     last.text.push_str(&piece);
-                    last.advance += g.advance;
+                    last.advance += advance;
                     last.brk = brk;
                 }
-                _ => segs.push(Segment { run: g.run, x: g.origin.x, y: g.origin.y, text: piece, advance: g.advance, brk }),
+                last => {
+                    if let Some(last) = last {
+                        last.brk |= moved || last.marker != marker;
+                        end_segment(last, tail, t, lay, &mut unkerned);
+                    }
+                    segs.push(Segment { run: g.run, x, y: g.origin.y, text: piece, advance, brk, scale, marker });
+                }
             }
+            tail = set.map(|_| (g.byte, advance));
+        }
+        if let Some(last) = segs.last_mut() {
+            end_segment(last, tail, t, lay, &mut unkerned);
         }
         segs.retain(|s| !s.text.is_empty());
         if !segs.is_empty() {
@@ -2235,7 +2553,52 @@ fn text_lines(t: &TextObject, lay: &vectorcraft_text::TextLayout, fewer: bool) -
     lines
 }
 
-/// Where a line of segments starts: its first segment's origin or, `anchor`ed (0.5: centre, 1:
+/// Ends segment `seg` of horizontally scaled type (or a glyph Glyph Scaling scales), which a reader stretches to its width
+/// (`textLength`): its last cluster (`tail`: byte offset and reader's advance) takes the advance
+/// a reader gives it at the end of a `<tspan>`, without the font's kerning against the character
+/// after it. `unkerned` holds [`reader_advances`] without kerning once a segment needs them.
+fn end_segment(
+    seg: &mut Segment,
+    tail: Option<(usize, f64)>,
+    t: &TextObject,
+    lay: &vectorcraft_text::TextLayout,
+    unkerned: &mut Option<HashMap<usize, (f64, f64)>>,
+) {
+    let Some((byte, advance)) = tail else { return };
+    if seg.scale == 1.0 && t.runs.get(seg.run).is_none_or(|r| (r.style.h_scale - r.style.v_scale).abs() <= 1e-9) {
+        return;
+    }
+    if let Some(&(alone, _)) = unkerned.get_or_insert_with(|| reader_advances(t, lay, false)).get(&byte) {
+        seg.advance += alone - advance;
+    }
+}
+
+/// The advance a reader of live SVG text gives each character cluster of `t` and how far from
+/// its pen it draws the cluster's first glyph, keyed by the cluster's byte offset: `t` laid out
+/// as point type (which isn't justified) without Mojikumi, scaled as `t`'s layout `lay` is by
+/// Shrink Text to Fit. Without `kerning`, the font's pair kerning is left out (as manual
+/// kerning leaves it out).
+fn reader_advances(t: &TextObject, lay: &vectorcraft_text::TextLayout, kerning: bool) -> HashMap<usize, (f64, f64)> {
+    let mut set = TextObject { kind: TextKind::Point, ..t.clone() };
+    for p in std::iter::once(&mut set.para).chain(set.paras.iter_mut()) {
+        p.mojikumi = vectorcraft_doc::Mojikumi::None;
+        // A reader spaces words and letters as the font does.
+        p.justification = vectorcraft_doc::JustificationOptions::default();
+    }
+    if !kerning {
+        for r in &mut set.runs {
+            r.style.kerning.get_or_insert(0.0);
+        }
+    }
+    let mut out: HashMap<usize, (f64, f64)> = HashMap::new();
+    for g in vectorcraft_text::layout(FontDb::global(), &set).glyphs.iter().filter(|g| g.len > 0) {
+        let (advance, _) = out.entry(g.byte).or_insert((0.0, (g.xf.translation().x - g.origin.x) * lay.fit_scale));
+        *advance += g.advance * lay.fit_scale;
+    }
+    out
+}
+
+/// Where a line of segments starts: where its first segment starts or, `anchor`ed (0.5: center, 1:
 /// right end), that point of its width. `None` for an empty line.
 fn line_start(line: &[Segment], anchor: Option<f64>) -> Option<(f64, f64)> {
     let (first, last) = (line.first()?, line.last()?);

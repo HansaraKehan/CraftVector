@@ -27,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Vector Halftone…",
         ["Object"],
         None,
-        "{shape?: \"circle\"|\"ellipse\"|\"square\"|\"diamond\"|\"line\" (circle), frequency?: lines per inch 1–300 (20), angle?: deg (45; CMYK: the black screen's, cyan −30°, magenta +30°, yellow −45° from it), mode?: \"mono\"|\"cmyk\" (mono), color?: mono dot colour (\"#000000\"), invert?: bool (dots for light tones), clip?: true (clip the dots to the art's outline), keepOriginal?: false} the selection as vector halftone dots sized by its tone, a group of one path per screen (CMYK screens multiply), as one undo step → {id, dots}",
+        "{shape?: \"circle\"|\"ellipse\"|\"square\"|\"diamond\"|\"line\" (circle), frequency?: lines per inch 1–300 (20), angle?: deg (45; CMYK: the black screen's, cyan −30°, magenta +30°, yellow −45° from it), mode?: \"mono\"|\"cmyk\" (mono), color?: mono dot colour (\"#000000\"), invert?: bool (dots for light tones), clip?: true (clip the dots to the art's outline), keepOriginal?: false} the selection as vector halftone dots sized by its tone, a group of one path per screen (CMYK screens multiply), as one undo step → {id, dots, warning? (an image in the art couldn't be decoded, as object.rasterize says)}",
         has_selection,
         halftone
     )]
@@ -185,11 +185,13 @@ fn halftone(s: &mut Session, p: &Value) -> Result<Value> {
     let mut r = vectorcraft_render::Renderer::new();
     let (w, h) = vectorcraft_render::region_pixels(region, scale);
     let (w, h) = (w as usize, h as usize);
+    let failed = vectorcraft_render::decode_failures();
     let px = if mono {
         r.render_region(&tmp, region, scale, true).pixels
     } else {
         r.render_region_inks(&tmp, region, scale, &vectorcraft_render::RenderOptions { skip_templates: true, ..Default::default() })
     };
+    let warning = super::rasterfx::undecoded_warning(failed);
     if px.len() < w * h * 4 {
         return Err(EngineError::Other("the art could not be sampled".into()));
     }
@@ -241,7 +243,11 @@ fn halftone(s: &mut Session, p: &Value) -> Result<Value> {
         sel.set([gid]);
         Ok(gid)
     })?;
-    Ok(json!({ "id": id.0, "dots": dots }))
+    let mut out = json!({ "id": id.0, "dots": dots });
+    if let Some(w) = warning {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
 }
 
 /// The dots of one screen over `bounds` as one path, with their count.

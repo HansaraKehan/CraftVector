@@ -1,8 +1,9 @@
 //! Direction, source-cluster and editing regressions; no RTL font assets required.
 use super::*;
-use kurbo::{Point, Rect, Shape};
+use kurbo::{Affine, BezPath, Point, Rect, Shape};
+use std::ops::Range;
 use std::sync::Arc;
-use vectorcraft_doc::{CharStyle, TextKind, TextRun};
+use vectorcraft_doc::{CharStyle, ParaDirection, TextKind, TextRun};
 
 fn text_layout(s: &str) -> TextLayout {
     layout(FontDb::global(), &TextObject::point(Point::ZERO, s, CharStyle::default()))
@@ -88,6 +89,40 @@ fn mixed_text_preserves_latin_and_number_order() {
     assert_eq!(s, "שלום Rust 123", "layout must not rewrite source text");
 }
 
+/// The characters of `s` in the order a layout of it draws them, left to right, with the bytes
+/// `set` given Character Direction `d`.
+fn drawn_with_direction(s: &str, set: Range<usize>, d: Option<ParaDirection>) -> String {
+    let mut t = TextObject::point(Point::ZERO, s, CharStyle::default());
+    edit::style_range(&mut t.runs, set.start, set.end, |st| st.char_direction = d);
+    let l = layout(FontDb::global(), &t);
+    let mut glyphs: Vec<_> = l.glyphs.iter().collect();
+    glyphs.sort_by(|a, b| a.origin.x.total_cmp(&b.origin.x));
+    glyphs.iter().filter_map(|g| s.get(g.byte..)?.chars().next()).collect()
+}
+
+/// Character Direction Left to Right keeps a date written with spaces in its own order inside a
+/// right-to-left paragraph, where the bidi algorithm alone sets its numbers right to left.
+#[test]
+fn left_to_right_characters_keep_a_date_in_order_in_right_to_left_text() {
+    let s = "שלום 21 10 2026";
+    let date = s.find('2').unwrap_or_default()..s.len();
+    assert_eq!(drawn_with_direction(s, date.clone(), None), "2026 10 21 םולש");
+    assert_eq!(drawn_with_direction(s, date, Some(ParaDirection::LeftToRight)), "21 10 2026 םולש");
+}
+
+/// Character Direction Right to Left sets a Hebrew word and the exclamation mark after it right to
+/// left inside a left-to-right paragraph, where the bidi algorithm alone leaves the mark after the
+/// word in the paragraph's direction.
+#[test]
+fn right_to_left_characters_set_a_word_and_its_mark_right_to_left_in_left_to_right_text() {
+    let s = "abc שלום! def";
+    let word = s.find('ש').unwrap_or_default()..s.find('!').map_or(0, |i| i + 1);
+    assert_eq!(drawn_with_direction(s, word.clone(), None), "abc םולש! def");
+    assert_eq!(drawn_with_direction(s, word.clone(), Some(ParaDirection::RightToLeft)), "abc !םולש def");
+    // Left to Right on the same characters of a left-to-right paragraph draws them as without it.
+    assert_eq!(drawn_with_direction(s, word, Some(ParaDirection::LeftToRight)), "abc םולש! def");
+}
+
 #[test]
 fn rtl_hit_testing_arrows_and_selection_follow_visual_positions() {
     let s = "שלום";
@@ -101,6 +136,84 @@ fn rtl_hit_testing_arrows_and_selection_follow_visual_positions() {
     assert_eq!(caret_horizontal(&l, 0, false), 2);
     assert_eq!(caret_horizontal(&l, 2, true), 0);
     assert!(!selection_quads(&l, 0, s.len()).is_empty());
+}
+
+/// Lines of glyphs, one glyph per cluster, each line given in visual order as (byte, len, advance)
+/// and starting at x 0.
+fn lines_of_clusters(lines: &[&[(usize, usize, f64)]], rtl: bool) -> TextLayout {
+    let mut l = TextLayout::default();
+    for (li, clusters) in lines.iter().enumerate() {
+        let (glyph_start, baseline) = (l.glyphs.len(), li as f64 * 20.0);
+        let mut x = 0.0;
+        for &(byte, len, advance) in *clusters {
+            l.glyphs.push(PositionedGlyph {
+                outline: BezPath::new(),
+                run: 0,
+                byte,
+                origin: Point::new(x, baseline),
+                advance,
+                len,
+                angle: 0.0,
+                line: li,
+                font_id: 0,
+                gid: 0,
+                xf: Affine::IDENTITY,
+                rtl,
+                scale: 1.0,
+                image: None,
+                colour: None,
+            });
+            x += advance;
+        }
+        l.lines.push(LineInfo {
+            rtl,
+            baseline,
+            x0: 0.0,
+            x1: x,
+            ascent: 10.0,
+            descent: 3.0,
+            first_baseline: 0.0,
+            start: clusters.iter().map(|c| c.0).min().unwrap_or(0),
+            end: clusters.iter().map(|c| c.0 + c.1).max().unwrap_or(0),
+            glyph_start,
+            glyph_end: l.glyphs.len(),
+            avail: (0.0, x),
+            region: 0,
+        });
+    }
+    l
+}
+
+fn arrow_steps(l: &TextLayout, from: usize, right: bool, steps: usize) -> Vec<usize> {
+    let mut caret = from;
+    (0..steps)
+        .map(|_| {
+            caret = caret_horizontal(l, caret, right);
+            caret
+        })
+        .collect()
+}
+
+#[test]
+fn arrows_step_through_both_caret_stops_of_a_cluster_without_advance() {
+    // A letter (bytes 0..6), a zero width non-joiner drawn as its own glyph with no advance
+    // (6..9) and a letter (9..12): the stops at 6 and 9 share one x.
+    let l = lines_of_clusters(&[&[(0, 6, 10.0), (6, 3, 0.0), (9, 3, 10.0)]], false);
+    assert_eq!(arrow_steps(&l, 0, true, 4), [6, 9, 12, 12]);
+    assert_eq!(arrow_steps(&l, 12, false, 4), [9, 6, 0, 0]);
+    // The same clusters right to left: the glyphs run from byte 9 at the left to byte 0 at the right.
+    let l = lines_of_clusters(&[&[(9, 3, 10.0), (6, 3, 0.0), (0, 6, 10.0)]], true);
+    assert_eq!(arrow_steps(&l, 12, true, 4), [9, 6, 0, 0]);
+    assert_eq!(arrow_steps(&l, 0, false, 4), [6, 9, 12, 12]);
+}
+
+#[test]
+fn arrows_keep_to_their_line_where_a_wrapped_line_starts_at_the_same_x() {
+    // A soft wrap at byte 2: the end of the first line is the start of the second, at the same x
+    // as the start of the first.
+    let l = lines_of_clusters(&[&[(0, 1, 10.0), (1, 1, 10.0)], &[(2, 1, 10.0), (3, 1, 10.0)]], false);
+    assert_eq!(arrow_steps(&l, 0, true, 4), [1, 2, 3, 4]);
+    assert_eq!(caret_horizontal(&l, 1, false), 0);
 }
 
 #[test]
@@ -233,6 +346,35 @@ fn different_style_arabic_boundary_receives_joining_context() {
             (usize::from(glyph.byte >= beh_len), glyph.byte, beh_len),
             "every component must retain its source run and cluster"
         );
+    }
+}
+
+#[test]
+fn a_change_of_paint_in_a_mixed_direction_line_moves_no_glyph() {
+    let db = FontDb::global();
+    let text = "AVAV سلام AVAV";
+    if db.face_covering('س').is_none_or(|face| !face.covers('ل')) {
+        eprintln!("SKIPPED: a_change_of_paint_in_a_mixed_direction_line_moves_no_glyph; no font covers Arabic seen and lam");
+        return;
+    }
+    let plain = layout(db, &TextObject::point(Point::ZERO, text, CharStyle::default()));
+    assert!(plain.glyphs.iter().any(|g| g.rtl) && plain.glyphs.iter().any(|g| !g.rtl), "{plain:?}");
+    let seen = text.find('س').unwrap_or_default();
+    let mut restyled = TextObject::point(Point::ZERO, text, CharStyle::default());
+    for byte in [1, seen] {
+        let end = byte + text[byte..].chars().next().map_or(1, char::len_utf8);
+        edit::style_range(&mut restyled.runs, byte, end, |s| s.fill = Default::default());
+    }
+    assert_eq!(restyled.runs.len(), 5);
+    let restyled_layout = layout(db, &restyled);
+    assert_same_shaped_glyphs(&plain, &restyled_layout);
+    for glyph in &restyled_layout.glyphs {
+        let run_ends = restyled.runs.iter().scan(0, |end, r| {
+            *end += r.text.len();
+            Some(*end)
+        });
+        let expected = run_ends.take_while(|end| *end <= glyph.byte).count();
+        assert_eq!(glyph.run, expected, "glyph {glyph:?}");
     }
 }
 
@@ -445,4 +587,64 @@ fn digits_draw_every_digit_in_the_styles_numeral_system() {
     assert_eq!(clusters(&arabic), clusters(&lay("صفحة ٣", Digits::Default)));
     // Default leaves each digit as typed.
     assert_ne!(gids(&lay("3 ٣ ۳", Digits::Default)), gids(&lay("3 ٣ ۳", Digits::Hindi)));
+}
+
+/// Right-to-left type on a path that overflows shows the start of its text, as a line of area
+/// type does, not whatever comes first in visual order.
+#[test]
+fn overflowing_rtl_type_on_a_path_keeps_the_start_of_its_text() {
+    let s = "שלום עולם ".repeat(8);
+    let mut t = TextObject::point(Point::ZERO, &s, CharStyle::default());
+    let line = kurbo::Line::new((0.0, 0.0), (100.0, 0.0)).to_path(0.1);
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&line), start: 0.0, end: None };
+    let l = layout(FontDb::global(), &t);
+    assert!(l.overflow && !l.glyphs.is_empty());
+    let shown: Vec<_> = source_clusters(&l).into_iter().map(|(byte, _)| byte).collect();
+    let last = shown.last().copied().unwrap_or(0);
+    let start: Vec<_> = s.char_indices().map(|(i, _)| i).take_while(|i| *i <= last).collect();
+    assert_eq!(shown, start, "the glyphs shown are the text's start");
+    let x = |byte: usize| l.glyphs.iter().find(|g| g.byte == byte).map(|g| g.origin.x).unwrap();
+    assert!(x(0) > x(last), "the text runs right to left along the path");
+}
+
+/// On a curve with spacing, where a glyph's step depends on where it sits, what fits is measured
+/// where the glyphs are placed: the start of the text shows, and every glyph of it.
+#[test]
+fn overflowing_rtl_type_on_a_spaced_curve_keeps_the_start_of_its_text() {
+    let s = "שלום, עולם! אבג ".repeat(6);
+    // Straight, then tightly curved: glyphs take other steps there.
+    let mut path = BezPath::new();
+    path.move_to((0.0, 0.0));
+    path.line_to((60.0, 0.0));
+    path.extend(kurbo::Arc::new((60.0, 12.0), (12.0, 12.0), -std::f64::consts::FRAC_PI_2, std::f64::consts::PI, 0.0).append_iter(0.1));
+    let mut t = TextObject::point(Point::ZERO, &s, CharStyle::default());
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&path), start: 0.0, end: None };
+    for spacing in (-12..=12).map(|i| f64::from(i) * 5.0) {
+        t.path_spacing = spacing;
+        let l = layout(FontDb::global(), &t);
+        assert!(l.overflow && !l.glyphs.is_empty());
+        let shown: Vec<_> = source_clusters(&l).into_iter().map(|(byte, _)| byte).collect();
+        let last = shown.last().copied().unwrap_or(0);
+        let start: Vec<_> = s.char_indices().map(|(i, _)| i).take_while(|i| *i <= last).collect();
+        assert_eq!(shown, start, "the glyphs shown are the text's start ({spacing})");
+    }
+}
+
+/// A left-to-right line with right-to-left text in it fits as it is laid out: a period that
+/// hangs past the end bracket (Roman Hanging Punctuation) stays, and nothing overflows.
+#[test]
+fn mixed_type_on_a_path_hangs_its_final_period() {
+    let s = "bא.";
+    let line = kurbo::Line::new((0.0, 0.0), (400.0, 0.0)).to_path(0.1);
+    let mut t = TextObject::point(Point::ZERO, s, CharStyle::default());
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&line), start: 0.0, end: None };
+    t.para.roman_hanging = true;
+    let advances: Vec<f64> = layout(FontDb::global(), &t).glyphs.iter().map(|g| g.advance).collect();
+    assert_eq!(advances.len(), 3);
+    // The end bracket halfway through the period, with path beyond it.
+    let end = advances[0] + advances[1] + advances[2] * 0.5;
+    t.kind = TextKind::OnPath { path: vectorcraft_geom::PathData::from_bezpath(&line), start: 0.0, end: Some(end / 400.0) };
+    let l = layout(FontDb::global(), &t);
+    assert!(l.glyphs.iter().any(|g| g.byte == s.len() - 1), "the period shows");
+    assert!(!l.overflow, "all of it fits");
 }

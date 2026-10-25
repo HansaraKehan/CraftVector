@@ -66,6 +66,66 @@ fn print_writes_the_saved_setup_with_overrides() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A document with four 300 × 200 artboards, set up to print two copies, and a saved print preset
+/// "Sheet" that prints artboard 4 only.
+fn four_artboards_and_a_preset() -> Session {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 200, "artboards": 4})).unwrap();
+    s.execute("print.setup", &json!({"settings": {"copies": 2}})).unwrap();
+    s.execute("print.presets.save", &json!({"name": "Sheet", "settings": {"artboards": "range", "range": "4"}})).unwrap();
+    s
+}
+
+#[test]
+fn print_takes_a_print_preset_by_name() {
+    let mut s = four_artboards_and_a_preset();
+    // The preset's settings stand in for the document's: one copy of artboard 4.
+    let (bytes, v) = print(&mut s, json!({"preset": "sheet"}));
+    assert_eq!((v["pages"].clone(), vectorcraft_pdf::info(&bytes, None).unwrap().pages.len()), (json!(1), 1));
+    let (_, v) = print(&mut s, json!({"preset": "Sheet", "settings": {"copies": 3}}));
+    assert_eq!(v["pages"], 3, "settings apply over the preset's");
+    let (_, v) = print(&mut s, json!({"preset": "[Default]"}));
+    assert_eq!(v["pages"], 4, "[Default]: every artboard, one copy");
+    assert_eq!(s.execute("print.setup", &json!({})).unwrap()["settings"]["copies"], 2, "printing doesn't change the saved setup");
+    // A PostScript file too.
+    let v = s.execute("file.print", &json!({"preset": "Sheet", "format": "postscript"})).unwrap();
+    assert_eq!(v["pages"], 1);
+}
+
+#[test]
+fn an_unknown_print_preset_is_refused_with_the_presets() {
+    let mut s = four_artboards_and_a_preset();
+    for c in ["file.print", "print.preview", "print.setup"] {
+        // Agents (MCP, the control channel) may pass `preset`.
+        s.check_params(c, &json!({"preset": "Sheet", "settings": {}})).unwrap();
+        let e = s.execute(c, &json!({"preset": "Nope"})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }), "{c}: {e}");
+        assert!(e.to_string().contains("no print preset named `Nope` (presets: [Default], Sheet)"), "{c}: {e}");
+        assert!(matches!(s.execute(c, &json!({"preset": 4})), Err(EngineError::BadParams { .. })), "{c}");
+    }
+    assert_eq!(s.doc().unwrap().doc.print_setup.as_ref().unwrap()["copies"], 2);
+}
+
+#[test]
+fn setup_with_a_preset_stores_its_settings() {
+    let mut s = four_artboards_and_a_preset();
+    let undo = s.doc().unwrap().history.undo.len();
+    let v = s.execute("print.setup", &json!({"preset": "Sheet"})).unwrap();
+    let got = (v["settings"]["copies"].clone(), v["settings"]["artboards"].clone(), v["settings"]["range"].clone());
+    assert_eq!(got, (json!(1), json!("range"), json!("4")));
+    let stored = s.doc().unwrap().doc.print_setup.clone().unwrap();
+    assert_eq!(stored, v["settings"]);
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+    // The same preset again is no new step; settings apply over it.
+    s.execute("print.setup", &json!({"preset": "Sheet"})).unwrap();
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+    let v = s.execute("print.setup", &json!({"preset": "Sheet", "settings": {"collate": false}})).unwrap();
+    assert_eq!((v["settings"]["range"].clone(), v["settings"]["collate"].clone()), (json!("4"), json!(false)));
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.print_setup.as_ref().unwrap()["copies"], 2);
+}
+
 #[test]
 fn preview_lists_pages_tiles_inks_and_warnings() {
     let (mut s, _) = session();
@@ -151,4 +211,16 @@ fn type_that_does_not_fit_its_frame_is_named() {
     s.execute("text.areaOptions", &json!({"ids": [id], "height": 150})).unwrap();
     let (_, v) = print(&mut s, json!({}));
     assert_eq!(over(&v), Vec::<String>::new());
+}
+
+#[test]
+fn for_a_printer_a_landscape_page_is_written_upright() {
+    let (mut s, _) = session();
+    let size = |pdf: &[u8]| vectorcraft_pdf::info(pdf, None).unwrap().pages.iter().map(|p| (p.width, p.height)).collect::<Vec<_>>();
+    let settings = json!({"autoRotate": false, "orientation": "landscape"});
+    let (saved, _) = print(&mut s, json!({"settings": settings}));
+    assert_eq!(size(&saved), [(792.0, 612.0)]);
+    let (spooled, v) = print(&mut s, json!({"settings": settings, "forPrinter": true}));
+    assert_eq!(size(&spooled), [(612.0, 792.0)]);
+    assert_eq!(v["pages"], 1);
 }

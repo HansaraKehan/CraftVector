@@ -229,7 +229,9 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, d: &mut Dialog) -> bool {
     let mut rs = rows(d);
     let top = ui.cursor().top();
     let changed = if d.str("tab") == "edit" { edit_tab(ui, d, &mut rs) } else { assign_tab(app, ui, d, &mut rs) };
-    ui.add_space((TAB_H - (ui.cursor().top() - top)).max(0.0));
+    if d.str("tab") != "edit" {
+        ui.add_space((TAB_H - (ui.cursor().top() - top)).max(0.0));
+    }
     if changed {
         snap(app, d, &mut rs);
         d.fields.insert("rows".into(), Value::Array(rs));
@@ -255,7 +257,7 @@ fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
     sync(app, &mut d);
     if d.bool("__newGroup") {
         let colors: Vec<Value> = rows(&d).into_iter().filter(|r| !excluded(r)).map(|r| r["to"].clone()).collect();
-        return form::commit_preview(app, "swatch.newGroup", json!({"name": d.str("groupName"), "colors": colors}));
+        return form::commit_preview(app, "swatch.newGroup", json!({"name": d.str("groupName"), "colors": colors, "keepModel": true}));
     }
     form::commit_preview(app, CMD, apply_params(&d))
 }
@@ -452,7 +454,8 @@ fn assign_tab(app: &mut VectorcraftApp, ui: &mut Ui, d: &mut Dialog, rows: &mut 
             // Import a library (.ase, .acb, .gpl, .vcswatches or a document's swatches) and limit to it.
             if app.services.pick_open.is_some() && widgets::icon_button(ui, "folder-open", tl!("Other Library…"), false, 24.0).clicked() {
                 let r = crate::picks::in_dialog(app, d, |app, d| {
-                    let pick = crate::FilePick { filters: vectorcraft_engine::cmd::fileio::open_filters().collect(), ..Default::default() };
+                    let pick =
+                        crate::FilePick { filters: crate::FilePick::filters(vectorcraft_engine::cmd::fileio::open_filters()), ..Default::default() };
                     let Some(path) = crate::picks::open(app, &pick) else { return Ok(()) };
                     let r = app.run("swatch.library.load", json!({ "path": path }))?;
                     d.fields.insert("limitTo".into(), r["library"].clone());
@@ -537,8 +540,12 @@ fn move_color(rows: &mut [Value], i: usize, hsb: [f32; 3], linked: bool) {
     }
 }
 
+/// The rows when a drag on the Edit tab's wheel started.
+const DRAG: &str = "__drag";
+
 /// The Edit tab. Returns true when the rows changed.
 fn edit_tab(ui: &mut Ui, d: &mut Dialog, rows: &mut [Value]) -> bool {
+    let top = ui.cursor().top();
     let t = Tokens::get(ui.ctx());
     let mut changed = false;
     let linked = d.bool("linked");
@@ -569,23 +576,44 @@ fn edit_tab(ui: &mut Ui, d: &mut Dialog, rows: &mut [Value]) -> bool {
     if let Some(k) = w.pressed {
         d.fields.insert("__sel".into(), json!([active[k]]));
     }
-    if let Some((k, hsb)) = w.moved {
-        move_color(rows, active[k], hsb, linked);
-        changed = true;
+    // A drag (of a marker or the brightness slider) moves the rows as they were when it started:
+    // a new colour read back from its model (CMYK through the colour profile) isn't exactly the
+    // colour written, so building on last frame's rows drifted the linked colours (#1733).
+    if let Some((k, set)) = w.moved {
+        let start = match d.fields.get(DRAG).and_then(Value::as_array) {
+            Some(s) if s.len() == rows.len() => s.clone(),
+            _ => rows.to_vec(),
+        };
+        // What the control didn't set comes from the start too, not from last frame's colour.
+        if let Some(old) = start.get(active[k]).and_then(to_color).map(|c| c.to_hsb()) {
+            let hsb = [0, 1, 2].map(|n| set[n].unwrap_or(old[n]));
+            rows.clone_from_slice(&start);
+            move_color(rows, active[k], hsb, linked);
+            changed = true;
+        }
+        d.fields.insert(DRAG.into(), Value::Array(start));
+    }
+    if !ui.input(|i| i.pointer.any_down()) {
+        d.fields.remove(DRAG);
     }
     ui.add_space(6.0);
     // The new colours: click one to make it the base colour.
-    ui.horizontal_wrapped(|ui| {
-        for &i in &active {
-            let (r, resp) = ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
-            chip(ui, r, to_color(&rows[i]).unwrap_or_default(), false);
-            if Some(i) == base {
-                ui.painter().rect_stroke(r.expand(1.5), 2.0, egui::Stroke::new(1.5, t.accent), egui::StrokeKind::Outside);
+    let min_height = (TAB_H - (ui.cursor().top() - top)).max(0.0);
+    super::modal::scrolled_rows(ui, "recolor-edit-colors", |ui| {
+        // Keep the usual tab height when it fits; the empty space scrolls with the chips.
+        ui.set_min_height(min_height);
+        ui.horizontal_wrapped(|ui| {
+            for &i in &active {
+                let (r, resp) = ui.allocate_exact_size(vec2(28.0, 20.0), Sense::click());
+                chip(ui, r, to_color(&rows[i]).unwrap_or_default(), false);
+                if Some(i) == base {
+                    ui.painter().rect_stroke(r.expand(1.5), 2.0, egui::Stroke::new(1.5, t.accent), egui::StrokeKind::Outside);
+                }
+                if resp.on_hover_text(rows[i]["to"].as_str().unwrap_or_default()).clicked() {
+                    d.fields.insert("__sel".into(), json!([i]));
+                }
             }
-            if resp.on_hover_text(rows[i]["to"].as_str().unwrap_or_default()).clicked() {
-                d.fields.insert("__sel".into(), json!([i]));
-            }
-        }
+        });
     });
     changed
 }
@@ -611,6 +639,16 @@ mod tests {
             json!({"from": ["rgb 0 0 255", "rgb 0 0 128"], "to": "rgb 0 0 255"}),
             json!({"from": ["rgb 0 255 0"], "to": "rgb 0 255 0"}),
         ]
+    }
+
+    #[test]
+    fn recolor_dialog_keeps_the_default_model_without_an_extra_dropdown() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+        app.run("ui.recolorDialog", json!({"colors": ["#ff8000"]})).unwrap();
+        let d = app.ui.dialog.as_ref().unwrap();
+        assert!(!d.fields.contains_key("model"));
+        assert!(apply_params(d).get("model").is_none());
     }
 
     #[test]
@@ -648,5 +686,17 @@ mod tests {
         let mut r = rows();
         apply_rule(&mut r, Harmony::Triad, 0, Color::rgb(1.0, 0.0, 0.0), &[0, 1, 2]);
         assert_eq!([&r[0]["to"], &r[1]["to"], &r[2]["to"]], ["rgb 255 0 0", "rgb 0 255 0", "rgb 0 0 255"]);
+    }
+
+    /// In a CMYK document colors opened alone are saved as a new color group in their own model.
+    #[test]
+    fn a_new_group_from_colors_keeps_their_model_in_a_cmyk_document() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 100, "height": 100, "colorMode": "cmyk"})).unwrap();
+        app.run("ui.recolorDialog", json!({"colors": ["#ff8000"]})).unwrap();
+        let d = app.ui.dialog.clone().expect("Recolor Artwork opens");
+        confirm(&mut app, &d).unwrap();
+        let g = app.session.doc().unwrap().doc.swatch_groups.last().expect("a new color group");
+        assert_eq!(g.swatches.iter().filter_map(|w| w.paint.color()).collect::<Vec<_>>(), [Color::rgb8(255, 128, 0)]);
     }
 }

@@ -1,6 +1,8 @@
 //! Export for Screens: sizes (factor, width, height, resolution), presets and sub-folders, Full
 //! Document, Include Bleed, per-format settings, ZIP downloads and the settings the document keeps.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use super::screens::ScreenSize;
@@ -110,6 +112,99 @@ fn density_buckets_go_into_sub_folders() {
     assert_eq!(names(&r), ["Artboard-2-..-x-..-y.svg", "Artboard-2-ok.png"]);
 }
 
+/// Windows does not allow `<`, `>`, `"`, `|`, `?`, `*` or control characters in a file name
+/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>): Export for Screens
+/// writes them as `-` in a prefix and a suffix, on every platform.
+#[test]
+fn a_prefix_or_suffix_writes_the_characters_windows_does_not_allow_as_dashes() {
+    let mut s = session(1);
+    let r = export(&mut s, json!({"prefix": "a<b>c\"", "formats": [{"format": "svg", "suffix": "|d?e*f\u{1}\t"}]}));
+    assert_eq!(names(&r), ["a-b-c-Artboard-1-d-e-f--.svg"]);
+}
+
+/// A file or folder named after a Windows device (`CON`, `NUL`, `COM1`…, alone or before an
+/// extension) gets a `-` after the device name, and a folder loses a trailing period, on every
+/// platform.
+#[test]
+fn device_names_and_trailing_periods_follow_windows_naming_rules() {
+    let mut s = session(3);
+    for (index, name) in ["CON", "CON-", "lpt1"].iter().enumerate() {
+        s.execute("artboard.setProps", &json!({"index": index, "name": name})).unwrap();
+    }
+    let r = export(&mut s, json!({"formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["CON-.svg", "CON--2.svg", "lpt1-.svg"]);
+    let r =
+        export(&mut s, json!({"range": "1", "subfolders": true, "formats": [{"format": "svg", "folder": "aux"}, {"format": "pdf", "folder": "x."}]}));
+    assert_eq!(names(&r), ["aux-/CON-.svg", "x/CON-.pdf"]);
+    let r = export(&mut s, json!({"range": "3", "folders": "item", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["lpt1-/lpt1-.svg"]);
+    // A name pattern, with an extension after the device name, and the document's own name.
+    let r = export(&mut s, json!({"range": "1", "name": "<name>.tar", "formats": [{"format": "svg"}]}));
+    assert_eq!(names(&r), ["CON-.tar.svg"]);
+    s.execute("file.new", &json!({"width": 40, "height": 30, "name": "nul"})).unwrap();
+    let r = export(&mut s, json!({"fullDocument": true, "folders": "item", "formats": [{"format": "pdf"}]}));
+    assert_eq!(names(&r), ["nul-/nul-.pdf"]);
+    let r = s.execute("document.exportForScreens", &json!({"zip": true, "formats": [{"format": "svg"}]})).unwrap();
+    assert_eq!(r["name"], "nul-.zip");
+}
+
+/// `first_file` names the file the export writes first, for the same params: the item's file name,
+/// a prefix and a suffix with characters Windows does not allow, a range, a Windows device name,
+/// every kind of folder, presets, size suffixes, a name pattern with its counter and date, an
+/// export preset, a ZIP, Full Document, Include Bleed, assets, layers and the selection; and it
+/// refuses what the export refuses.
+#[test]
+fn the_first_file_is_the_file_the_export_writes_first() {
+    let mut s = session(3);
+    s.execute("artboard.setProps", &json!({"index": 1, "name": "CON"})).unwrap();
+    let layer = s.doc().unwrap().doc.layers[0].id.0;
+    let square = s.doc().unwrap().doc.layers[0].children().unwrap()[0].id.0;
+    let asset = s.execute("assets.add", &json!({"ids": [square], "name": "Logo?"})).unwrap()["assets"][0].as_u64().unwrap();
+    s.execute("shape.ellipse", &json!({"x": 2, "y": 2, "width": 10, "height": 10})).unwrap();
+    s.execute("select.all", &json!({})).unwrap();
+    let written = |r: &Value| r["files"][0].as_str().or_else(|| r["files"][0]["name"].as_str()).unwrap_or_default().to_string();
+    let cases = [
+        json!({}),
+        json!({"prefix": "a?b/", "formats": [{"format": "png", "suffix": "<x>"}]}),
+        json!({"range": "2-3", "folders": "item"}),
+        json!({"range": "2", "folders": "itemFormat", "formats": [{"format": "svg", "scale": "2x", "suffix": "@2x"}]}),
+        json!({"preset": "mobile"}),
+        json!({"preset": "density"}),
+        json!({"subfolders": true, "formats": [{"format": "png", "scale": "144ppi", "folder": "a b"}]}),
+        json!({"folders": "format", "formats": [{"format": "jpg", "quality": 50}]}),
+        json!({
+            "name": "<filename>-<name>-<scale>-<index>-###-YYYYMMDD",
+            "counterStart": 7,
+            "counterPer": "file",
+            "date": "2026-10-17",
+            "formats": [{"format": "png", "scale": "2x"}]
+        }),
+        json!({"name": "<suffix>", "formats": [{"format": "png", "suffix": ""}]}),
+        json!({"exportPreset": "Logo Package"}),
+        json!({"zip": true, "formats": [{"format": "svg"}, {"format": "png"}]}),
+        json!({"fullDocument": true, "folders": "item", "formats": [{"format": "pdf"}]}),
+        json!({"fullDocument": true, "formats": [{"format": "png"}]}),
+        json!({"includeBleed": true}),
+        json!({"assets": [asset], "formats": [{"format": "svg"}]}),
+        json!({"layers": [layer], "folders": "item"}),
+        json!({"selection": "one"}),
+        json!({"selection": "each", "name": "<name>"}),
+    ];
+    for p in cases {
+        let first = super::screens::first_file(&s, &p).unwrap();
+        assert_eq!(first, written(&export(&mut s, p.clone())), "{p}");
+    }
+    for p in [json!({"layers": [layer], "assets": [asset]}), json!({"selection": "all"}), json!({"counterPer": "row"})] {
+        assert!(super::screens::first_file(&s, &p).is_err() && s.execute("document.exportForScreens", &p).is_err(), "{p}");
+    }
+    // A document named after a Windows device.
+    s.execute("file.new", &json!({"width": 40, "height": 30, "name": "nul"})).unwrap();
+    for p in [json!({"fullDocument": true, "folders": "item", "formats": [{"format": "pdf"}]}), json!({"name": "<filename>"})] {
+        let first = super::screens::first_file(&s, &p).unwrap();
+        assert_eq!(first, written(&export(&mut s, p.clone())), "{p}");
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn sub_folders_are_made_in_the_export_folder() {
@@ -162,6 +257,208 @@ fn a_zip_is_written_into_the_folder() {
     let zip = std::fs::read(r["path"].as_str().unwrap()).unwrap();
     assert_eq!(super::zip::entries(&zip).unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The reply of a prepared export's [`super::ScreenExport::write`] and the files it gave the
+/// writer, by path.
+fn write_prepared(export: super::ScreenExport) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let mut files = BTreeMap::new();
+    let mut write = |path: &str, bytes: &[u8]| {
+        files.insert(path.to_string(), bytes.to_vec());
+        Ok(())
+    };
+    let r = export.write(&mut write).unwrap_or_else(|e| panic!("{e}"));
+    (r, files)
+}
+
+/// The files reply `r` names (its `files`, else the zip at its `path`) as they are on disk, by path.
+fn on_disk(r: &Value) -> BTreeMap<String, Vec<u8>> {
+    let paths: Vec<&str> = match r["path"].as_str() {
+        Some(zip) => vec![zip],
+        None => r["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap()).collect(),
+    };
+    paths.into_iter().map(|p| (p.to_string(), std::fs::read(p).unwrap())).collect()
+}
+
+/// [`Session::prepare_screen_export`] runs `document.exportForScreens` and `assets.export` as
+/// commands, journaled, and writes nothing; the export it gives writes the files the command
+/// writes, with the same names (`-2` included), sub-folders, bytes and reply, into a folder, as a
+/// zip in it and without a folder, through the writer it is given. Export for Screens remembers
+/// its settings when it is prepared.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_prepared_export_writes_what_the_command_writes() {
+    let mut s = session(2);
+    s.execute("artboard.setProps", &json!({"index": 0, "name": "Icon"})).unwrap();
+    s.execute("artboard.setProps", &json!({"index": 1, "name": "icon"})).unwrap();
+    let dir = std::env::temp_dir().join(format!("vc-screens-prepared-{}", std::process::id()));
+    let folder = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let rows = json!([{"format": "png", "suffix": ""}, {"format": "png", "scale": "2x"}, {"format": "svg"}]);
+    for zip in [false, true] {
+        let p = json!({"folder": folder, "zip": zip, "folders": "rows", "name": "<name>", "formats": rows});
+        let want = export(&mut s, p.clone());
+        if !zip {
+            let names = ["1x/Icon.png", "2x/Icon@2x.png", "SVG/Icon.svg", "1x/icon-2.png", "2x/icon@2x-2.png", "SVG/icon-2.svg"];
+            assert_eq!(want["files"], json!(names.map(|n| format!("{folder}/{n}"))));
+        }
+        let disk = on_disk(&want);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let journaled = s.journal.len();
+        let prepared = s.prepare_screen_export("document.exportForScreens", &p).unwrap();
+        assert_eq!((s.journal.len(), s.journal.last().map(|(id, _)| id.as_str())), (journaled + 1, Some("document.exportForScreens")));
+        assert!(!dir.exists(), "nothing is written until the export writes");
+        let (got, files) = write_prepared(prepared);
+        assert_eq!(got, want, "zip: {zip}");
+        assert_eq!(files, disk, "zip: {zip}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Without a folder, the files come back in the reply and nothing is written.
+    let p = json!({"name": "<name>", "formats": rows});
+    let want = export(&mut s, p.clone());
+    let (got, files) = write_prepared(s.prepare_screen_export("document.exportForScreens", &p).unwrap());
+    assert_eq!((got, files.len()), (want, 0));
+    // The settings are remembered when the export is prepared.
+    s.prepare_screen_export("document.exportForScreens", &json!({"prefix": "pre-", "formats": rows})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.export_settings.get("prefix"), Some(&json!("pre-")));
+    // The Asset Export panel's export.
+    s.execute("select.all", &json!({})).unwrap();
+    s.execute("assets.add", &json!({"multiple": false})).unwrap();
+    let p = json!({"folder": folder, "formats": rows});
+    let want = s.execute("assets.export", &p).unwrap();
+    let disk = on_disk(&want);
+    assert_eq!(disk.len(), 3, "{want}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let prepared = s.prepare_screen_export("assets.export", &p).unwrap();
+    assert_eq!(s.journal.last().map(|(id, _)| id.as_str()), Some("assets.export"));
+    assert_eq!(write_prepared(prepared), (want, disk));
+    // An encoder's refusal names the command, as the command's own reply does.
+    let p = json!({"folder": folder, "formats": [{"format": "bmp", "colorModel": "cmyk"}]});
+    let want = s.execute("assets.export", &p).unwrap_err();
+    let got = s.prepare_screen_export("assets.export", &p).unwrap().write(&mut |_: &str, _: &[u8]| Ok(())).unwrap_err();
+    assert!(matches!(&got, crate::EngineError::BadParams { cmd, .. } if cmd == "assets.export"), "{got:?}");
+    assert_eq!(got.to_string(), want.to_string());
+    // The checks come first, as the command's do.
+    let journaled = s.journal.len();
+    assert!(s.prepare_screen_export("document.exportForScreens", &json!({"range": "9"})).is_err());
+    assert_eq!(s.journal.len(), journaled);
+    assert!(s.screens_hand_off.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_prepared_export_holds_the_document_as_it_was() {
+    let mut s = session(1);
+    let p = json!({"formats": [{"format": "svg"}]});
+    let want = export(&mut s, p.clone());
+    let prepared = s.prepare_screen_export("document.exportForScreens", &p).unwrap();
+    s.execute("select.all", &json!({})).unwrap();
+    s.execute("edit.clear", &json!({})).unwrap();
+    assert_ne!(export(&mut s, p), want, "the edit changes the file");
+    assert_eq!(write_prepared(prepared).0, want);
+}
+
+/// Output All Blacks as Rich Black (Appearance of Black › Printing / Exporting) makes the RGB files
+/// draw a CMYK black as RGB black, prepared or not.
+#[test]
+fn rich_black_reaches_the_files() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 40, "height": 30, "colorMode": "cmyk"})).unwrap();
+    s.execute("paint.setStroke", &json!({"none": true})).unwrap();
+    s.execute("paint.setFill", &json!({"color": {"c": 0, "m": 0, "y": 0, "k": 1}})).unwrap();
+    s.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 40, "height": 30})).unwrap();
+    let p = json!({"formats": [{"format": "png"}]});
+    let px = |r: &Value| image::load_from_memory(&files(r)[0].1).unwrap().to_rgba8().get_pixel(10, 10).0;
+    let accurate = px(&export(&mut s, p.clone()));
+    assert!(accurate[0] > 10, "accurate: dark grey, {accurate:?}");
+    s.execute("prefs.set", &json!({"key": "blackOutput", "value": "rich"})).unwrap();
+    assert_eq!(px(&export(&mut s, p.clone())), [0, 0, 0, 255]);
+    let (prepared, _) = write_prepared(s.prepare_screen_export("document.exportForScreens", &p).unwrap());
+    assert_eq!(px(&prepared), [0, 0, 0, 255]);
+}
+
+/// A cancel stops a prepared export before its next file; the file written before it stays.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_canceled_export_stops_before_its_next_file() {
+    let mut s = session(3);
+    let dir = std::env::temp_dir().join(format!("vc-screens-cancel-{}", std::process::id()));
+    let folder = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let prepared = s.prepare_screen_export("document.exportForScreens", &json!({"folder": folder, "formats": [{"format": "svg"}]})).unwrap();
+    let progress = super::progress::Progress::new();
+    let mut written = vec![];
+    let r = super::progress::scope(&progress, || {
+        prepared.write(&mut |path: &str, _: &[u8]| {
+            written.push(path.to_string());
+            progress.cancel();
+            Ok(())
+        })
+    });
+    assert!(matches!(r, Err(crate::EngineError::Cancelled)), "{r:?}");
+    assert_eq!(written, [format!("{folder}/Artboard-1.svg")]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A prepared export reports one progress step per file, and the raster encoders' artboard steps
+/// are not reported.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_prepared_export_counts_its_files() {
+    let mut s = session(3);
+    let dir = std::env::temp_dir().join(format!("vc-screens-steps-{}", std::process::id()));
+    let folder = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let rows = json!([{"format": "png"}, {"format": "png", "scale": "2x"}]);
+    let prepared = s.prepare_screen_export("document.exportForScreens", &json!({"folder": folder, "formats": rows})).unwrap();
+    let progress = super::progress::Progress::of_files();
+    let mut seen = vec![];
+    let r = super::progress::scope(&progress, || {
+        prepared.write(&mut |_: &str, _: &[u8]| {
+            seen.push(progress.counts());
+            Ok(())
+        })
+    });
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(seen, (0..6).map(|n| (n, 6)).collect::<Vec<_>>());
+    assert!(progress.counts_files());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The warnings in `r` that contain `text`.
+fn warned<'a>(r: &'a Value, text: &str) -> Vec<&'a str> {
+    r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|w| w.contains(text)).collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn every_reply_says_once_when_an_image_could_not_be_decoded() {
+    let mut s = session(1);
+    let rows = json!([{"format": "png"}, {"format": "jpg", "scale": "2x"}]);
+    assert_eq!(export(&mut s, json!({ "formats": rows }))["warnings"], json!([]));
+    // The renderer can't decode the placed image and draws nothing in its place.
+    crate::tests_menucmds::place_undecodable_png(&mut s);
+    let dir = std::env::temp_dir().join(format!("vc-screens-undecoded-{}", std::process::id()));
+    let folder = dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    for p in [
+        json!({ "formats": rows }),
+        json!({ "formats": rows, "zip": true }),
+        json!({ "formats": rows, "folder": folder }),
+        json!({ "formats": rows, "folder": folder, "zip": true }),
+        json!({ "formats": rows, "fullDocument": true }),
+    ] {
+        let r = export(&mut s, p.clone());
+        assert_eq!(warned(&r, "couldn't be decoded").len(), 1, "{p}: {}", r["warnings"]);
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "the files are still written");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn type_in_a_missing_family_is_named_once_for_every_format() {
+    let mut s = session(2);
+    s.execute("text.create", &json!({"x": 5, "y": 20, "text": "Ab", "font": "Nonexistent Sans Probe"})).unwrap();
+    let r = export(&mut s, json!({"formats": [{"format": "png"}, {"format": "pdf"}, {"format": "eps"}]}));
+    let fallback = warned(&r, "fallback font");
+    assert_eq!(fallback.len(), 1, "{}", r["warnings"]);
+    assert!(fallback[0].contains("Nonexistent Sans Probe"), "{fallback:?}");
 }
 
 #[test]

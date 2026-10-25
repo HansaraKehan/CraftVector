@@ -98,13 +98,13 @@ fn discarded_and_simulated_overprints_write_no_overprint() {
     assert!(preserve.warnings.is_empty(), "{:?}", preserve.warnings);
     assert!(String::from_utf8_lossy(&preserve.bytes).contains("/OP true/op true/OPM 1"), "preserved overprints overprint in the file");
     assert!(overprints(&printed_document(&d, &settings(json!({})))), "preserved");
-    for (how, multiplies) in [("discard", false), ("simulate", true)] {
+    for (how, darkens) in [("discard", false), ("simulate", true)] {
         let set = json!({"advanced": {"overprints": how}});
         assert!(!overprints(&printed_document(&d, &settings(set.clone()))), "{how}: nothing overprints");
         let r = job(&d, set);
         let text = String::from_utf8_lossy(&r.bytes);
         assert!(!text.contains("/OP"), "{how}: no overprint in the file");
-        assert_eq!(text.contains("/Multiply"), multiplies, "{how}");
+        assert_eq!(text.contains("/Darken"), darkens, "{how}");
         assert!(!r.warnings.iter().any(|w| w.contains("knockouts")), "{how}: {:?}", r.warnings);
     }
     // Separations honour overprints whatever the option says.

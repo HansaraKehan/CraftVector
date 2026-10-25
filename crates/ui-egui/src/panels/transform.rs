@@ -1,7 +1,8 @@
 //! Transform panel: reference point, X/Y/W/H with the constrain link, rotate and shear, flips,
 //! live-shape properties and the Scale Corners / Scale Strokes & Effects options. While the
-//! Artboard tool is in use it shows and edits the active artboard's X/Y/W/H instead, and with only
-//! ruler guides selected their X (vertical guides) and Y (horizontal ones).
+//! Artboard tool is in use it shows and edits the active artboard's X/Y/W/H instead (a new W or H
+//! resizes every selected artboard), and with only ruler guides selected their X (vertical guides)
+//! and Y (horizontal ones).
 
 use egui::Ui;
 use serde_json::json;
@@ -50,26 +51,48 @@ pub fn artboard_rect(r: Rect, refi: usize, x: Option<f64>, y: Option<f64>, w: Op
     Rect::new(x0, y0, x0 + nw, y0 + nh)
 }
 
-/// The Artboard tool's view of the panel: the active artboard's position and size.
+/// The reference point the Transform panel and the Control bar share (0 to 8, the center by default).
+pub fn reference_index(ui: &Ui) -> usize {
+    ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4)
+}
+
+/// The shared reference point's locator; a click on it chooses another point.
+pub fn reference_locator(ui: &mut Ui, refi: usize) {
+    if let Some(i) = widgets::reference_point(ui, refi) {
+        ui.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), i));
+    }
+}
+
+/// Set artboard `index` to a new X, Y, W or H from reference point `refi` ([`artboard_rect`]) with
+/// `artboard.setProps`, passing the Artboard tool's Move and Scale Artwork with Artboard options as
+/// `moveArt` and `scaleArt`; an error is shown in the status bar. A new X or Y moves artboard
+/// `index` alone; a new W or H resizes every selected artboard about its own reference point
+/// ([`crate::panels::artboards::resized_with`]), in one undo step.
+pub fn set_artboard(app: &mut VectorcraftApp, index: usize, refi: usize, xywh: [Option<f64>; 4], link: bool) {
+    let [x, y, w, h] = xywh;
+    let scale_art = crate::panels::artboards::scale_art(app);
+    let move_art = crate::panels::artboards::move_art(app);
+    let indices = if x.is_none() && y.is_none() { crate::panels::artboards::resized_with(app, index) } else { vec![index] };
+    let common = json!({"scaleArt": scale_art, "moveArt": move_art});
+    let r = crate::panels::artboards::set_props(app, &indices, common, |i, r| {
+        let n = artboard_rect(r, refi, x, y, w, h, link);
+        Some(json!({"index": i, "x": n.x0, "y": n.y0, "width": n.width(), "height": n.height()}))
+    });
+    if let Err(e) = r {
+        app.status(e);
+    }
+}
+
+/// The Artboard tool's view of the panel: the active artboard's position and size ([`set_artboard`]).
 fn artboard_fields(app: &mut VectorcraftApp, ui: &mut Ui, index: usize, r: Rect) {
     let units = app.session.general_unit();
     let origin = app.ruler_origin();
-    let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
+    let refi = reference_index(ui);
     let link = proportional(app, ui);
     let rp = vectorcraft_geom::reference_point(r, refi);
-    let set = |app: &mut VectorcraftApp, x, y, w, h| {
-        let n = artboard_rect(r, refi, x, y, w, h, link);
-        let scale_art = crate::panels::artboards::scale_art(app);
-        let move_art = crate::panels::artboards::move_art(app);
-        let p = json!({"index": index, "x": n.x0, "y": n.y0, "width": n.width(), "height": n.height(), "scaleArt": scale_art, "moveArt": move_art});
-        if let Err(e) = app.run("artboard.setProps", p) {
-            app.status(e);
-        }
-    };
+    let set = |app: &mut VectorcraftApp, x, y, w, h| set_artboard(app, index, refi, [x, y, w, h], link);
     ui.horizontal(|ui| {
-        if let Some(i) = widgets::reference_point(ui, refi) {
-            ui.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), i));
-        }
+        reference_locator(ui, refi);
         ui.add_space(4.0);
         egui::Grid::new("xfp-ab-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
             widgets::dim_label(ui, "X:");
@@ -285,8 +308,8 @@ pub(crate) fn polygon_rows(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, live
     let mut set = None;
     egui::Grid::new((id, "grid")).num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
         widgets::dim_label(ui, tl!("Sides:"));
-        if let Some(s) = widgets::plain_field(ui, (id, "sides"), f64::from(*sides), "", 0, fw) {
-            set = Some(("sides", json!(s.round().max(3.0) as u64)));
+        if let Some(s) = widgets::range_field(ui, (id, "sides"), f64::from(*sides), 3.0..=f64::INFINITY, "", 0, fw) {
+            set = Some(("sides", json!(s as u64)));
         }
         ui.end_row();
         widgets::dim_label(ui, tl!("Angle:"));
@@ -365,15 +388,18 @@ pub fn set_pref(app: &mut VectorcraftApp, key: &str, on: bool) {
 pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let hidden: bool = pstate(ui.ctx(), "xf-hide-options");
     let has = super::selection_len(app) > 0;
+    // The flips mirror across the panel's reference point, as its flip buttons do.
+    let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
+    let origin = app.selection_box().map(|b| b.reference_point(refi)).map(|p| json!([p.x, p.y]));
     if menu_item(ui, if hidden { tl!("Show Options") } else { tl!("Hide Options") }, true, false) {
         set_pstate(ui.ctx(), "xf-hide-options", !hidden);
     }
     ui.separator();
     if menu_item(ui, tl!("Flip Horizontal"), has, false) {
-        app.run("object.reflect", json!({"axis": "vertical"})).ok();
+        app.run("object.reflect", json!({"axis": "vertical", "origin": origin})).ok();
     }
     if menu_item(ui, tl!("Flip Vertical"), has, false) {
-        app.run("object.reflect", json!({"axis": "horizontal"})).ok();
+        app.run("object.reflect", json!({"axis": "horizontal", "origin": origin})).ok();
     }
     ui.separator();
     let ss = app.session.prefs.scale_strokes;
@@ -425,6 +451,21 @@ mod tests {
     }
 
     #[test]
+    fn use_preview_bounds_shows_the_size_after_geometry_effects() {
+        // A 100 × 50 rectangle without a stroke, with Offset Path 10: 120 × 70 as drawn.
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.rectangle", json!({"x": 50, "y": 50, "width": 100, "height": 50})).unwrap();
+        app.run("paint.setStroke", json!({"none": true})).unwrap();
+        app.run("effect.apply", json!({"effect": "path.offsetPath", "params": {"offset": 10}, "item": null})).unwrap();
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "100 pt") && shown.iter().any(|t| t == "50 pt"), "{shown:?}");
+        set_pref(&mut app, "usePreviewBounds", true);
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "120 pt") && shown.iter().any(|t| t == "70 pt"), "{shown:?}");
+    }
+
+    #[test]
     fn rotation_field_shows_the_angle_the_box_keeps() {
         let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
         app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
@@ -462,6 +503,24 @@ mod tests {
         assert!(!live(&app).polygon_sides_equal());
         app.run("object.setLiveShape", json!({"makeSidesEqual": true})).unwrap();
         assert!(live(&app).polygon_sides_equal());
+    }
+
+    /// #3451: a live ellipse shows pie start/end angles and Invert Pie in the Transform panel and
+    /// the Properties panel's Transform section; typed angles update the shape.
+    #[test]
+    fn an_ellipse_shows_its_pie_properties() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.ellipse", json!({"x": 50, "y": 50, "width": 120, "height": 80})).unwrap();
+        for draw in [show as fn(&mut VectorcraftApp, &mut Ui), crate::panels::properties::transform_section] {
+            let shown = texts(&mut app, draw);
+            for t in ["Ellipse Properties:", "Pie Start Angle:", "0°", "Pie End Angle:", "360°", "Invert Pie"] {
+                assert!(shown.iter().any(|s| s == t), "{t} in {shown:?}");
+            }
+        }
+        app.run("object.setLiveShape", json!({"pieStart": 30, "pieEnd": 120})).unwrap();
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|s| s == "30°") && shown.iter().any(|s| s == "120°"), "{shown:?}");
     }
 
     #[test]
@@ -522,6 +581,28 @@ mod tests {
         let Some(path) = n.path_data() else { panic!("a path") };
         let xs: Vec<f64> = path.subpaths[0].anchors.iter().map(|a| a.p.x).collect();
         assert_eq!(xs, [20.0, 150.0, 120.0, 20.0]);
+    }
+
+    /// #2398: the panel menu's Flip Horizontal and Flip Vertical mirror the selection across the
+    /// reference point, as the panel's flip buttons do, not across its centre.
+    #[test]
+    fn menu_flips_keep_the_reference_point() {
+        use crate::panels::tests_appearance::{click, frame_events};
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.rectangle", json!({"x": 20, "y": 30, "width": 100, "height": 50})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Top-right reference point: (120, 30).
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), 2usize));
+        let flip = |app: &mut VectorcraftApp, item: &str| {
+            let texts = frame_events(&ctx, app, vec![], menu);
+            let r = texts.iter().find(|(t, _)| t.trim_start() == item).unwrap_or_else(|| panic!("{item} in {texts:?}")).1;
+            click(&ctx, app, r.center(), menu);
+            app.selection_box().unwrap().rect
+        };
+        assert_eq!(flip(&mut app, "Flip Horizontal"), Rect::new(120.0, 30.0, 220.0, 80.0));
+        assert_eq!(flip(&mut app, "Flip Vertical"), Rect::new(120.0, -20.0, 220.0, 30.0));
     }
 
     #[test]

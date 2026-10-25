@@ -233,7 +233,7 @@ fn the_window_menu_panel_keys() {
     assert_eq!((shortcut("Align"), shortcut("Layers"), shortcut("Paragraph")), ("Shift+F7".into(), "F7".into(), "Cmd+Alt+T".into()));
     assert!(shortcut_editor::entry("panel:layers").is_some(), "the dock's tabs can be given keys too");
     // Changed in the editor, the old key is free.
-    app.ui.shortcut_overrides.insert("panel:align".into(), "Cmd+Alt+Shift+F7".into());
+    crate::keymap::set_override(&mut app.ui.shortcut_overrides, "panel:align", "Cmd+Alt+Shift+F7");
     shortcut_editor::sync(&app.ui);
     press(&mut app, egui::Key::F7, shift);
     assert_eq!(app.ui.open_panel, None);
@@ -319,6 +319,6 @@ fn the_popover_swatch_libraries_button_opens_the_libraries_menu() {
     let earth = menu_item_rect(&shapes, "Earth Tones").expect("the menu lists the built-in libraries");
     assert!(earth.top() > defaults.top());
     click(&mut app, &ctx, earth.center(), Modifiers::NONE, control_bar);
-    let open = app.ui.library_panel.as_ref().map(|o| (o.kind.clone(), o.id.clone()));
+    let open = crate::panels::library_panel::last_open(&app.ui).map(|o| (o.kind.clone(), o.id.clone()));
     assert_eq!(open, Some(("swatches".into(), "earth-tones".into())));
 }

@@ -13,6 +13,7 @@ use vectorcraft_geom::{FillRule, PathData};
 use vectorcraft_render::effects;
 
 use super::appearance::{ItemTarget, appearance_targets, index_param, item_target, item_target_at};
+use super::expand::has_seeded;
 use super::rasterfx;
 use super::*;
 
@@ -55,11 +56,20 @@ pub fn specs() -> Vec<CommandSpec> {
             set_params
         ),
         cmd!(
+            "effect.lightingPreset",
+            "3D Lighting Preset",
+            [],
+            None,
+            "{index: int, preset: standard|diffuse|topLeft|right, item?: appearance item index|null (omitted: the active item, else the object's), ids?|id?: [..], target?: object|contents} replace an applied 3D effect's light rig and ambient with an original lighting preset; preserve shading, geometry and view; all targets must have a 3D effect at index; one undo step → {ids}",
+            has_doc,
+            lighting_preset
+        ),
+        cmd!(
             "effect.expandAppearance",
             "Expand Appearance",
             ["Object"],
             None,
-            "{ids?|id?: [..], target?} turn each object's appearance into objects: every fill and stroke becomes an object of its own (strokes outlined, brushed strokes their brush art) grouped in paint order under the object's id and transparency, geometry effects are baked, raster effects become an embedded image (shadows and outer glows below the art; blur, feather and inner glow replace it), type with effects or fills of its own is outlined; Crop Marks become a group of the object and its marks; a group's or layer's own fills and strokes become objects among its members, which are expanded too. Hidden fills, strokes and effects are dropped. Enabled when a selected or targeted object's appearance isn't basic (`ids` then pick which objects) → {ids}",
+            "{ids?|id?: [..], target?} turn each object's appearance into objects: every fill and stroke becomes an object of its own (strokes outlined, brushed strokes their brush art) grouped in paint order under the object's id and transparency, geometry effects are baked, raster effects become an embedded image (shadows and outer glows below the art; blur, feather and inner glow replace it; an object whose only raster effect is its own Rasterize becomes the image object.rasterize makes with the effect's options), type with effects or fills of its own is outlined; Crop Marks become a group of the object and its marks; a group's or layer's own fills and strokes become objects among its members, which are expanded too. An outlined frame of threaded text leaves its thread with the text it shows, and a frame kept as type in a group stays in its thread. Hidden fills, strokes and effects are dropped. Enabled when a selected or targeted object's appearance isn't basic (`ids` then pick which objects) → {ids, warning? (an image in the art couldn't be decoded, as object.rasterize says)}",
             can_expand,
             expand_appearance
         ),
@@ -129,8 +139,11 @@ fn check_revolve_count(n: &Node, cmd: &str) -> Result<()> {
     Ok(())
 }
 
-const ONE_3D: &str = "An object takes one 3D effect. Edit the existing effect's options, or remove it first.";
+pub(crate) const ONE_3D: &str = "An object takes one 3D effect. Edit the existing effect's options, or remove it first.";
 
+/// `effect.apply`: adds effect `effect` (or `id`) with `params`, its defaults filled in, to the
+/// targets' active item as one undo step. A 3D effect must fit each target, which takes only one;
+/// a Pathfinder effect on loose objects groups them first. → `{ids, index, item}`.
 pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "effect.apply";
     let id = str_param(p, "effect").or_else(|| str_param(p, "id")).ok_or_else(|| bad(C, "missing `effect` id"))?;
@@ -138,11 +151,13 @@ pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     if !params.is_null() && !params.is_object() {
         return Err(bad(C, "`params` must be an object"));
     }
+    super::params::check_effect_color(C, id, &params)?;
+    super::params::check_effect_channel(C, id, &params)?;
     // Crop Marks take their style from the preferences when applied.
     if id == effects::CROP_MARKS && params.get("style").is_none() {
         params["style"] = json!(s.crop_mark_style().id());
     }
-    if id == GLASS {
+    if texture_load_effect(id) {
         load_texture(&mut params, C)?;
     }
     let effect = effects::new_effect(id, &params).ok_or_else(|| bad(C, format!("unknown effect `{id}`")))?;
@@ -160,13 +175,9 @@ pub(crate) fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     if effects::is_three_d(id) {
         for target in appearance_targets(s, p)? {
             let n = s.doc()?.doc.node(target).ok_or(EngineError::NoNode(target))?;
-            if id == effects::REVOLVE {
-                effects::validate_revolve(n, &effect.params).map_err(|e| bad(C, e))?;
-                if effects::has_revolve(n) {
-                    return Err(bad(C, "A profile supports one Revolve effect. Edit the existing effect's options instead."));
-                }
-            } else {
-                effects::validate_solid(n, id, &effect.params).map_err(|e| bad(C, e))?;
+            effects::validate_three_d(n, id, &effect.params).map_err(|e| bad(C, e))?;
+            if id == effects::REVOLVE && effects::has_revolve(n) {
+                return Err(bad(C, "A profile supports one Revolve effect. Edit the existing effect's options instead."));
             }
             if effects::has_revolve(n) || effects::has_solid(n) {
                 return Err(bad(C, ONE_3D));
@@ -297,6 +308,33 @@ pub(crate) fn set_params_effects(s: &Session, p: &Value) -> Vec<String> {
     ids.iter().filter_map(effect).collect()
 }
 
+fn lighting_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "effect.lightingPreset";
+    let patch = str_param(p, "preset")
+        .and_then(effects::lighting_preset_params)
+        .ok_or_else(|| bad(C, "preset must be standard, diffuse, topLeft or right"))?;
+    let index = index_param(p, "index", C)?;
+    let item = item_target(s, p, C)?;
+    // Validate the whole selection before changing any object. An unrelated effect or
+    // a missing index must not leave just some objects with a new lighting rig.
+    for id in appearance_targets(s, p)? {
+        let n = s.doc()?.doc.node(id).ok_or(EngineError::NoNode(id))?;
+        let slot = item.effects_item(&n.appearance, C)?;
+        let effect = n.appearance.effects_at(slot).and_then(|fx| fx.get(index));
+        if !effect.is_some_and(|e| effects::is_three_d(&e.id)) {
+            return Err(bad(C, format!("object {} needs a 3D effect at index {index}", id.0)));
+        }
+    }
+    let mut options = p.clone();
+    let map = options.as_object_mut().ok_or_else(|| bad(C, "parameters must be an object"))?;
+    map.remove("preset");
+    map.insert("params".into(), patch);
+    set_params(s, &options)
+}
+
+/// `effect.setParams`: merges `params` into the effect at `index` of the targets' active item, and
+/// sets its Warp style (`warpStyle`) or visibility (`visible`), as one undo step. They are checked
+/// as `effect.apply` checks them, and a visible 3D effect must still fit. → `{ids}`.
 fn set_params(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "effect.setParams";
     let index = index_param(p, "index", C)?;
@@ -313,7 +351,12 @@ fn set_params(s: &mut Session, p: &Value) -> Result<Value> {
         .transpose()?;
     let visible = p.get("visible").and_then(Value::as_bool);
     let item = item_target(s, p, C)?;
-    if set_params_effects(s, p).iter().any(|e| e == GLASS) {
+    let edited = set_params_effects(s, p);
+    for effect in &edited {
+        super::params::check_effect_color(C, effect, &params)?;
+        super::params::check_effect_channel(C, effect, &params)?;
+    }
+    if edited.iter().any(|e| texture_load_effect(e)) {
         load_texture(&mut params, C)?;
     }
     for id in appearance_targets(s, p)? {
@@ -331,11 +374,7 @@ fn set_params(s: &mut Session, p: &Value) -> Result<Value> {
             if let (Some(cur), Value::Object(new)) = (prospective.as_object_mut(), effects::upgrade_params(&e.id, &params)) {
                 cur.extend(new);
             }
-            if e.id == effects::REVOLVE {
-                effects::validate_revolve(n, &prospective).map_err(|e| bad(C, e))?;
-            } else {
-                effects::validate_solid(n, &e.id, &prospective).map_err(|e| bad(C, e))?;
-            }
+            effects::validate_three_d(n, &e.id, &prospective).map_err(|e| bad(C, e))?;
         }
     }
     let ids = edit_effects(s, p, item, C, "Effect Options", &format!("{C}: no effect at index {index}"), |fx| {
@@ -366,6 +405,14 @@ fn set_params(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Effect › Distort › Glass.
 const GLASS: &str = "distort.glass";
+/// Effect › Texture › Texturizer.
+const TEXTURIZER: &str = "texture.texturizer";
+
+/// Does effect `id` have Load Texture: a `textureImage` that `effect.apply` reads from an image
+/// file (Glass, Texturizer)?
+pub(crate) fn texture_load_effect(id: &str) -> bool {
+    id == GLASS || id == TEXTURIZER
+}
 
 /// Glass's `textureImage` in `params` as Glass stores it: an image file (`{path}`, or `{name?,
 /// dataBase64}`) is read with [`fileio::texture_image`] and picked (`texture: "loaded"`) unless
@@ -401,6 +448,7 @@ fn expandable(n: &Node) -> bool {
             !n.appearance.items.is_empty() || !n.appearance.effects.is_empty() || children.iter().any(|c| expandable(c))
         }
         NodeKind::Text(_) => !n.appearance.items.is_empty() || !n.appearance.effects.is_empty(),
+        NodeKind::Image(_) => effects::has_item_geometry(n) || !n.appearance.effects.is_empty(),
         _ => !n.appearance.effects.is_empty(),
     }
 }
@@ -421,9 +469,10 @@ fn is_container(n: &Node) -> bool {
 }
 
 /// The raster effects of `n` (its own, its fills' and strokes') as an embedded image rendered at
-/// the document's raster effects resolution, with whether they all paint below it (shadows and
-/// outer glows: the image then holds just them). A group's or layer's image leaves out its
-/// members' raster effects, which are expanded with them. `None` when it has none.
+/// the document's raster effects resolution or a Rasterize effect's finer one, with whether they
+/// all paint below it (shadows and outer glows: the image then holds just them). A group's or
+/// layer's image leaves out its members' raster effects, which are expanded with them. `None`
+/// when it has none.
 fn raster_image(d: &mut Document, n: &Node) -> Option<(Node, bool)> {
     let fx = rasterfx::raster_fx(n);
     if fx.is_empty() {
@@ -433,18 +482,70 @@ fn raster_image(d: &mut Document, n: &Node) -> Option<(Node, bool)> {
     Some((rasterfx::raster_image(d, n, below, true)?, below))
 }
 
-/// Give the members of `m`, art evaluated from the object of the same id (its pieces share that
-/// id), ids of their own and expand the pieces: those made from its own fills and strokes, or with
-/// `all` every member.
-fn expand_pieces(d: &mut Document, m: &mut Node, all: bool, stroke_art: effects::StrokeArt) {
+/// Expand the pieces of `m`, art evaluated from the object of the same id (its pieces share that
+/// id): those made from its own fills and strokes, or with `all` every member. The other members
+/// that repeat an id ([`repeats_an_id`]) and hold a random Transform effect ([`has_seeded`]) are
+/// expanded as well ([`expand_in_place`]). Then the members get ids of their own. Random in a
+/// Transform effect takes its seed from the id, and the canvas draws the pieces with the ids they
+/// have before that. Returns what each of those other members' expansions lists, by the member's
+/// new id.
+fn expand_pieces(
+    d: &mut Document,
+    m: &mut Node,
+    all: bool,
+    brushes: &[vectorcraft_brush::Brush],
+    stroke_art: effects::StrokeArt,
+) -> std::collections::HashMap<NodeId, Vec<Listed>> {
     let id = m.id;
     let mut seen = std::collections::HashSet::from([id]);
+    let mut expanded = std::collections::HashMap::new();
     for c in m.children_mut().into_iter().flatten() {
-        let own = all || c.id == id;
         let c = Arc::make_mut(c);
-        effects::fresh_ids(d, c, &mut seen);
-        if own {
+        let mut listed = None;
+        if all || c.id == id {
             effects::expand_art(d, c, stroke_art);
+        } else if has_seeded(c) && repeats_an_id(c, &seen) {
+            listed = Some(expand_in_place(d, c, brushes));
+        }
+        fresh_ids_listed(d, c, &mut seen, listed.as_deref_mut().unwrap_or_default());
+        if let Some(listed) = listed {
+            expanded.insert(c.id, listed);
+        }
+    }
+    expanded
+}
+
+/// Does `n` hold an id of `seen`, or one id twice: does [`effects::fresh_ids`] give it new ids?
+fn repeats_an_id(n: &Node, seen: &std::collections::HashSet<NodeId>) -> bool {
+    let mut ids = std::collections::HashSet::new();
+    let mut repeats = false;
+    n.walk(&mut |c| repeats |= seen.contains(&c.id) || !ids.insert(c.id));
+    repeats
+}
+
+/// An object whose appearance expanded: its id, and its place in the walk ([`Node::walk`]) of the
+/// art it was listed in. Art evaluated from an object can hold one id more than once, and the place
+/// tells which of those nodes it is.
+type Listed = (NodeId, usize);
+
+/// [`expanded_node`] of `c` in place. Returns what the expansion lists, by places in the walk of `c`.
+fn expand_in_place(d: &mut Document, c: &mut Node, brushes: &[vectorcraft_brush::Brush]) -> Vec<Listed> {
+    let mut listed = vec![];
+    if let Some(e) = expanded_node(d, c.clone(), brushes, &mut listed) {
+        *c = e;
+    }
+    listed
+}
+
+/// [`effects::fresh_ids`] on `c`, with each of `listed` (places in the walk of `c`) given the new
+/// id of the node at its place.
+fn fresh_ids_listed(d: &mut Document, c: &mut Node, seen: &mut std::collections::HashSet<NodeId>, listed: &mut [Listed]) {
+    effects::fresh_ids(d, c, seen);
+    let mut ids = vec![];
+    c.walk(&mut |n| ids.push(n.id));
+    for (id, at) in listed {
+        if let Some(new) = ids.get(*at) {
+            *id = *new;
         }
     }
 }
@@ -453,46 +554,73 @@ fn expand_pieces(d: &mut Document, m: &mut Node, all: bool, stroke_art: effects:
 /// stroke becomes an object of its own (strokes outlined, brushes as their art), geometry effects
 /// are baked, raster effects become an embedded image, and the object keeps its transparency.
 pub(crate) fn expand_node(d: &mut Document, id: NodeId, brushes: &[vectorcraft_brush::Brush], out: &mut Vec<NodeId>) {
-    let Some(mut n) = d.node(id).cloned() else { return };
+    let Some(n) = d.node(id).cloned() else { return };
+    let mut listed = vec![];
+    let m = expanded_node(d, n, brushes, &mut listed);
+    out.extend(listed.into_iter().map(|(id, _)| id));
+    if let Some(mut m) = m {
+        // Art made from type takes its emoji's pixels into the document.
+        d.adopt_pixels(&mut m);
+        if let Some(slot) = d.node_mut(id) {
+            *slot = m;
+        }
+    }
+}
+
+/// [`expand_node`] of `n`, which need not be in `d`: `n` with its appearance expanded, `None` when
+/// it has nothing to expand. `out` gets the objects whose appearance expands, by places in the walk
+/// of the expanded `n`, `n`'s first when its own does.
+fn expanded_node(d: &mut Document, mut n: Node, brushes: &[vectorcraft_brush::Brush], out: &mut Vec<Listed>) -> Option<Node> {
+    let id = n.id;
     if !expandable(&n) {
-        return;
+        return None;
     }
     // Colour adjustments: the colours inside become the adjusted ones (an embedded image a
     // recoloured copy), then the rest of the appearance expands.
+    let mut changed = false;
+    // Is `n` in `out` yet?
+    let mut listed_n = false;
     if effects::has_adjustment(&n)
         && let Some(m) = effects::adjust_in_document(d, &n)
-        && let Some(slot) = d.node_mut(id)
     {
-        *slot = m.clone();
-        out.push(id);
+        out.push((id, 0));
+        listed_n = true;
         n = m;
+        changed = true;
         if !expandable(&n) {
-            return;
+            return Some(n);
         }
     }
     // (A symbol instance has become its art, a group.)
     let container = is_container(&n);
-    // Crop Marks: a group of the object and its marks, then the object expands on its own.
+    // Crop Marks: the object and its marks become a group. The object expands on its own first,
+    // with `id`: the canvas draws it with that id, which Random in a Transform effect takes its
+    // seed from. Then the object and the marks get ids of their own.
     if let Some(mut m) = effects::crop_marks_art(&n) {
         let mut seen = std::collections::HashSet::from([id]);
-        for c in m.children_mut().into_iter().flatten() {
-            effects::fresh_ids(d, Arc::make_mut(c), &mut seen);
+        let mut expanded = vec![];
+        for (i, c) in m.children_mut().into_iter().flatten().enumerate() {
+            let c = Arc::make_mut(c);
+            if i == 0 {
+                expanded = expand_in_place(d, c, brushes);
+                fresh_ids_listed(d, c, &mut seen, &mut expanded);
+            } else {
+                effects::fresh_ids(d, c, &mut seen);
+            }
         }
-        let object = m.children().and_then(|c| c.first()).map(|c| c.id);
-        if let Some(slot) = d.node_mut(id) {
-            *slot = m;
-            out.push(id);
+        if !listed_n {
+            out.push((id, 0));
         }
-        if let Some(object) = object {
-            expand_node(d, object, brushes, out);
-        }
-        return;
+        out.extend(expanded.into_iter().map(|(id, at)| (id, at + 1)));
+        return Some(m);
     }
     let image = raster_image(d, &n);
     let mut v = n.clone();
     rasterfx::strip_raster(&mut v, false);
     let mut stroke_art =
         |d: &mut Document, path: &PathData, rule: FillRule, st: &StrokeLayer| super::pathops::outlined_stroke(d, brushes, path, rule, st);
+    // Members of a group or layer that `expand_pieces` expanded, by id, with what their expansion lists.
+    let mut members = std::collections::HashMap::new();
     let expanded = match image {
         // Blur, feather and inner glow change the object itself: it becomes the image (a layer
         // keeps it as its only member).
@@ -500,20 +628,21 @@ pub(crate) fn expand_node(d: &mut Document, id: NodeId, brushes: &[vectorcraft_b
         image => {
             let m = if container {
                 // A group's or layer's own fills and strokes become art among its members.
-                effects::evaluate_container(&v).map(|mut m| {
-                    expand_pieces(d, &mut m, false, &mut stroke_art);
+                effects::evaluate_container(Some(&*d), &v).map(|mut m| {
+                    members = expand_pieces(d, &mut m, false, brushes, &mut stroke_art);
                     m
                 })
-            } else if matches!(n.kind, NodeKind::Path { .. } | NodeKind::Compound { .. }) {
+            } else if matches!(n.kind, NodeKind::Path { .. } | NodeKind::Compound { .. }) && !effects::has_transform_art(&v) {
                 effects::expand_leaf(d, &v, &mut stroke_art)
             } else {
-                // Type, images, symbol instances, live objects: through their outlines.
+                // Type, images, symbol instances, live objects (and paths whose Transform effect copies
+                // them with a gradient or changes their fills and strokes): through their outlines.
                 let symbol = match &n.kind {
                     NodeKind::SymbolInstance { symbol, .. } => d.symbols.iter().find(|s| s.name == *symbol).map(|s| s.art.clone()),
                     _ => None,
                 };
-                effects::expand_outlined(&v, symbol.as_deref()).map(|mut m| {
-                    expand_pieces(d, &mut m, true, &mut stroke_art);
+                effects::expand_outlined(Some(&*d), &v, symbol.as_deref()).map(|mut m| {
+                    expand_pieces(d, &mut m, true, brushes, &mut stroke_art);
                     m
                 })
             };
@@ -527,37 +656,65 @@ pub(crate) fn expand_node(d: &mut Document, id: NodeId, brushes: &[vectorcraft_b
             }
         }
     };
-    if let Some(m) = expanded
-        && let Some(slot) = d.node_mut(id)
-    {
-        *slot = m;
-        if out.last() != Some(&id) {
-            out.push(id);
+    if let Some(m) = expanded {
+        n = m;
+        changed = true;
+        if !listed_n {
+            out.push((id, 0));
         }
     }
     if container {
-        let children: Vec<NodeId> = d.node(id).and_then(|n| n.children()).map(|c| c.iter().map(|c| c.id).collect()).unwrap_or_default();
-        for c in children {
-            expand_node(d, c, brushes, out);
+        // The place of each member in the walk of `n`: after `n` and the members before it.
+        let mut at = 1;
+        for c in n.children_mut().into_iter().flatten() {
+            let from = out.len();
+            match members.remove(&c.id) {
+                Some(listed) => out.extend(listed),
+                None => {
+                    if let Some(e) = expanded_node(d, (**c).clone(), brushes, out) {
+                        *c = Arc::new(e);
+                        changed = true;
+                    }
+                }
+            }
+            for (_, place) in &mut out[from..] {
+                *place += at;
+            }
+            at += c.count();
         }
     }
+    changed.then_some(n)
 }
 
 fn expand_appearance(s: &mut Session, p: &Value) -> Result<Value> {
     let roots = appearance_targets(s, p)?;
+    let failed = vectorcraft_render::decode_failures();
     let ids = s.edit("Expand Appearance", |d, _| {
         let brushes = vectorcraft_brush::library(d);
         let mut out = vec![];
+        let threaded = super::threads::frames(d);
         for id in &roots {
             expand_node(d, *id, &brushes, &mut out);
         }
+        // Outlined frames of threaded text leave their threads with the text they show; type that
+        // stays type under a new id takes its frame's place.
+        super::threads::leave_threads(d, &threaded);
         if out.is_empty() {
             return Err(EngineError::Other("Expand Appearance: the selection has a basic appearance".into()));
         }
         Ok(out)
     })?;
-    Ok(json!({ "ids": ids_json(&ids) }))
+    let mut out = json!({ "ids": ids_json(&ids) });
+    // Raster effects become images rendered from the art.
+    if let Some(w) = rasterfx::undecoded_warning(failed) {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
 }
+
+#[cfg(test)]
+#[path = "tests_lighting_presets.rs"]
+mod lighting_presets_tests;
 
 #[cfg(test)]
 mod tests {
@@ -960,7 +1117,7 @@ mod tests {
         let glyphs = effects::outline_text(&node(&s, t)).unwrap();
         let b = glyphs.geometric_bounds().unwrap();
         assert!(b.x0 > 105.0 && b.y0 > 105.0 && b.x1 < 195.0 && b.y1 < 195.0, "the type lies inside the square: {b:?}");
-        let area = |n: &vectorcraft_doc::Node| effects::member_shapes(n).iter().map(|(p, r)| vectorcraft_pathops::area(p, *r)).sum::<f64>();
+        let area = |n: &vectorcraft_doc::Node| effects::member_shapes(None, n).iter().map(|(p, r)| vectorcraft_pathops::area(p, *r)).sum::<f64>();
         let glyph_area = area(&glyphs);
         s.execute("select.set", &json!({"ids": [a.0, t.0]})).unwrap();
         let g = NodeId(s.execute("object.group", &json!({})).unwrap()["id"].as_u64().unwrap());
@@ -994,5 +1151,28 @@ mod tests {
         let ch = n.children().unwrap();
         assert_eq!(ch.len(), 1);
         assert!((ch[0].geometric_bounds().unwrap().width() - 50.0).abs() < 1e-6);
+    }
+    #[test]
+    fn expand_appearance_gives_each_copy_of_a_transform_its_own_gradient() {
+        use vectorcraft_color::{Color, Gradient, GradientKind, GradientPaint, GradientStop, Paint};
+        let (mut s, id) = session_with_rect();
+        let stops = vec![GradientStop::new(0.0, Color::rgb(1.0, 0.0, 0.0)), GradientStop::new(1.0, Color::rgb(0.0, 0.0, 1.0))];
+        let ramp = Paint::Gradient(Box::new(GradientPaint::new(Gradient::new(GradientKind::Linear, stops))));
+        s.edit("gradient", |d, _| {
+            let n = d.node_mut(id).unwrap();
+            n.appearance.set_fill(ramp);
+            Ok(())
+        })
+        .unwrap();
+        s.execute("effect.apply", &json!({"effect":"distort.transform","ids":[id.0],"item":null})).unwrap();
+        s.execute("effect.setParams", &json!({"index":0,"params":{"moveH":150,"copies":2},"ids":[id.0],"item":null})).unwrap();
+        s.execute("effect.expandAppearance", &json!({"ids":[id.0]})).unwrap();
+        let mut boxes = vec![];
+        node(&s, id).walk(&mut |n| {
+            if matches!(n.kind, NodeKind::Path { .. }) && matches!(n.appearance.fill_paint(), Paint::Gradient(_)) {
+                boxes.push(n.geometric_bounds().unwrap().width());
+            }
+        });
+        assert_eq!(boxes, vec![100.0; 3], "three squares, each with its own gradient");
     }
 }

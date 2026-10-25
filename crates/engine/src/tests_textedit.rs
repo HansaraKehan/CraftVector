@@ -55,6 +55,9 @@ fn edit_range_replaces_and_undoes() {
     assert_eq!(obj(&s, id).plain_text(), "Hello!");
     s.execute("edit.undo", &json!({})).unwrap();
     assert_eq!(obj(&s, id).plain_text(), "Hello there");
+    // An offset of 2^32 is past the end too. A 32-bit build read it as 0 and inserted at the start.
+    s.execute("text.editRange", &json!({"id": id.0, "start": 1u64 << 32, "end": 1u64 << 32, "insert": "!"})).unwrap();
+    assert_eq!(obj(&s, id).plain_text(), "Hello there!");
     assert!(s.execute("text.editRange", &json!({"start": 0})).is_err(), "id required");
     let rect = s.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap();
     assert!(s.execute("text.editRange", &json!({"id": rect["id"], "insert": "x"})).is_err(), "not text");
@@ -84,6 +87,17 @@ fn set_range_style_splits_runs() {
     assert!(s.execute("text.setRangeStyle", &json!({"id": id.0, "size": -1})).is_err());
 }
 
+/// A character style applied from byte 2^32 to 2^32 + 5 styles no character, as a range past the
+/// end does. A 32-bit build read the range as bytes 0 to 5 and styled "Hello".
+#[test]
+fn char_style_range_past_u32_styles_nothing() {
+    let mut s = session();
+    let id = text(&mut s, "Hello world");
+    s.execute("charStyle.new", &json!({"name": "Big", "attrs": {"size": 40.0}})).unwrap();
+    s.execute("charStyle.apply", &json!({"name": "Big", "id": id.0, "start": 1u64 << 32, "end": (1u64 << 32) + 5})).unwrap();
+    assert!(obj(&s, id).runs.iter().all(|r| r.style.size == 20.0 && r.style.style_name.is_none()), "{:?}", obj(&s, id).runs);
+}
+
 #[test]
 fn set_range_style_defaults_to_all_text_and_get_range() {
     let mut s = session();
@@ -96,6 +110,387 @@ fn set_range_style_defaults_to_all_text_and_get_range() {
     assert_eq!(r["text"], json!("ab"));
     assert_eq!(r["runs"].as_array().unwrap().len(), 2);
     assert_eq!(r["length"], json!(3));
+}
+
+/// The type commands refuse a number or an on/off option given as text or as another value of the
+/// wrong kind, naming the key, and leave the document and its undo history as they were; true,
+/// false, numbers and null still work.
+#[test]
+fn type_commands_refuse_a_number_or_boolean_given_as_text() {
+    use super::tests::{not_a_number, not_a_switch, not_refused};
+    let mut s = session();
+    let id = text(&mut s, "abc");
+    let frame = s.execute("shape.rectangle", &json!({"x": 300, "y": 300, "width": 100, "height": 50})).unwrap()["id"].clone();
+    let boxed = s.execute("text.create", &json!({"x": 0, "y": 300, "text": "a", "area": {"width": 100, "height": 50}})).unwrap()["id"].clone();
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    let area = json!({"x": 0, "y": 0, "text": "a", "area": {"width": "200", "height": 100}});
+    let mut calls = vec![("text.create".to_string(), area, "`width` must be a number, not \"200\"".to_string())];
+    let area = json!({"x": 0, "y": 0, "text": "a", "area": {"width": 200, "height": 100, "fit": "shrinkText", "fitMinPercent": "40"}});
+    calls.push(("text.create".to_string(), area, "`fitMinPercent` must be a number, not \"40\"".to_string()));
+    calls.extend(
+        [
+            ("text.create", json!({"x": 0, "y": 0, "text": "a", "size": "12"}), "size"),
+            ("text.createInPath", json!({"path": frame, "text": "a", "size": [12]}), "size"),
+            ("text.createInPath", json!({"path": frame, "mode": "area", "fitMinPercent": "40"}), "fitMinPercent"),
+            ("text.setRangeStyle", json!({"id": id.0, "size": "30"}), "size"),
+            ("text.setRangeStyle", json!({"id": id.0, "tracking": "50"}), "tracking"),
+            ("text.setRangeStyle", json!({"id": id.0, "hScale": true}), "hScale"),
+            ("text.setRangeStyle", json!({"id": id.0, "strokeWidth": "1"}), "strokeWidth"),
+            ("text.setRangeStyle", json!({"id": id.0, "start": "1", "size": 30}), "start"),
+            ("text.setRangeStyle", json!({"id": id.0, "end": [1], "size": 30}), "end"),
+            ("text.editRange", json!({"id": id.0, "start": 0, "end": "1", "insert": "x"}), "end"),
+            ("text.getRange", json!({"id": id.0, "start": "1"}), "start"),
+            ("text.touchType", json!({"id": id.0, "start": 0, "rotation": "10"}), "rotation"),
+            ("text.touchType", json!({"id": id.0, "start": "0", "rotation": 10}), "start"),
+            ("type.step", json!({"attribute": "size", "by": "2"}), "by"),
+            ("type.step", json!({"attribute": "size", "id": id.0, "start": "1"}), "start"),
+            ("type.size.increase", json!({"by": "2"}), "by"),
+            ("type.size.decrease", json!({"by": [2]}), "by"),
+            ("type.ruby", json!({"text": "a", "size": "60"}), "size"),
+            ("text.areaOptions", json!({"ids": [boxed], "width": "200"}), "width"),
+            ("text.areaOptions", json!({"ids": [boxed], "height": [80]}), "height"),
+            ("text.areaOptions", json!({"ids": [boxed], "fit": "shrinkText", "fitMinPercent": "40"}), "fitMinPercent"),
+        ]
+        .map(|(cmd, p, key)| not_a_number(cmd, p, key)),
+    );
+    calls.extend(
+        [
+            ("text.create", json!({"x": 0, "y": 0, "text": "a", "vertical": "true"}), "vertical"),
+            ("text.create", json!({"x": 0, "y": 0, "placeholder": 1}), "placeholder"),
+            ("text.createInPath", json!({"path": frame, "vertical": "true"}), "vertical"),
+            ("text.createInPath", json!({"path": frame, "placeholder": "true"}), "placeholder"),
+            ("text.setRangeStyle", json!({"id": id.0, "underline": "true"}), "underline"),
+            ("text.setRangeStyle", json!({"id": id.0, "allCaps": 1}), "allCaps"),
+            ("text.setRangeStyle", json!({"id": id.0, "noBreak": "true"}), "noBreak"),
+            ("text.setRangeStyle", json!({"id": id.0, "size": 30, "tateChuYoko": 1}), "tateChuYoko"),
+            ("text.getRange", json!({"id": id.0, "effective": "true"}), "effective"),
+            ("type.opticalMarginAlignment", json!({"on": "true"}), "on"),
+            ("type.systemLayout", json!({"on": "true"}), "on"),
+            ("type.fractionalWidths", json!({"on": "false"}), "on"),
+            ("type.ruby", json!({"remove": "true"}), "remove"),
+            ("type.ruby", json!({"text": "a", "overhang": "false"}), "overhang"),
+        ]
+        .map(|(cmd, p, key)| not_a_switch(cmd, p, key)),
+    );
+    let wrong = not_refused(&mut s, &calls);
+    assert!(wrong.is_empty(), "not refused: {wrong:#?}");
+    let style = json!({"id": id.0, "size": 30, "underline": true, "tracking": null, "start": null, "noBreak": true});
+    s.execute("text.setRangeStyle", &style).unwrap();
+    s.execute("type.size.increase", &json!({"by": null})).unwrap();
+    s.execute("type.opticalMarginAlignment", &json!({"on": true})).unwrap();
+    s.execute("type.ruby", &json!({"text": "a", "size": null, "overhang": false})).unwrap();
+    let t = obj(&s, id);
+    let st = &t.runs[0].style;
+    assert!(st.underline && st.no_break && t.optical_margin && st.size > 30.0, "{st:?}");
+    assert!(!t.ruby.is_empty() && t.ruby.iter().all(|r| !r.overhang && r.size_percent == 50.0), "{:?}", t.ruby);
+}
+
+/// Where each glyph of type object `id` is drawn from (its origin in font units), document space.
+fn glyph_pens(s: &Session, id: NodeId) -> Vec<(usize, Point)> {
+    let t = obj(s, id);
+    let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+    lay.glyphs.iter().map(|g| (g.byte, t.xf * (g.xf * Point::ZERO))).collect()
+}
+
+fn moved_by(before: &[(usize, Point)], after: &[(usize, Point)], byte: usize) -> (f64, f64) {
+    let at = |v: &[(usize, Point)]| v.iter().find(|(b, _)| *b == byte).map(|(_, p)| *p).unwrap_or_else(|| panic!("no glyph at byte {byte}"));
+    let d = at(after) - at(before);
+    (d.x, d.y)
+}
+
+fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+    (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
+}
+
+#[test]
+fn touch_type_moves_one_character_and_leaves_the_others_where_they_are() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    let before = glyph_pens(&s, id);
+    let r = s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dx": 10, "dy": 4})).unwrap();
+    assert_eq!((r["start"].clone(), r["end"].clone()), (json!(1), json!(2)));
+    let after = glyph_pens(&s, id);
+    assert!(near(moved_by(&before, &after, 1), (10.0, -4.0)), "the y moves 10 pt right and 4 pt up: {:?}", moved_by(&before, &after, 1));
+    for byte in [0, 2, 3] {
+        assert!(near(moved_by(&before, &after, byte), (0.0, 0.0)), "byte {byte} stays: {:?}", moved_by(&before, &after, byte));
+    }
+    // Kerning on the T and the y, and a baseline shift on the y: live attributes, one undo step.
+    let t = obj(&s, id);
+    let style = |byte: usize| vectorcraft_text::edit::slice_runs(&t.runs, byte, byte + 1)[0].style.clone();
+    let (k0, k1) = (style(0).kerning.unwrap(), style(1).kerning.unwrap());
+    assert!(k0 > 0.0 && k1 < 0.0, "{k0} {k1}");
+    assert!((style(1).baseline_shift - 4.0).abs() < 1e-9 && style(2).baseline_shift == 0.0);
+    assert_eq!(undo_labels(&s).iter().filter(|l| *l == "Touch Type").count(), 1);
+    // The type stays editable, and the moved character keeps its attributes.
+    s.execute("text.editRange", &json!({"id": id.0, "start": 4, "end": 4, "insert": "!"})).unwrap();
+    assert_eq!(obj(&s, id).plain_text(), "Type!");
+    assert!(near(moved_by(&before, &glyph_pens(&s, id), 1), (10.0, -4.0)));
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(near(moved_by(&before, &glyph_pens(&s, id), 1), (0.0, 0.0)), "undone");
+    // The first character of a line moves only up and down.
+    assert!(s.execute("text.touchType", &json!({"id": id.0, "start": 0, "dx": 5})).is_err());
+    s.execute("text.touchType", &json!({"id": id.0, "start": 0, "dy": -2})).unwrap();
+    assert!(near(moved_by(&before, &glyph_pens(&s, id), 0), (0.0, 2.0)));
+    assert!(s.execute("text.touchType", &json!({"id": id.0, "start": 1})).is_err(), "nothing to change");
+    assert!(s.execute("text.touchType", &json!({"id": id.0, "start": 9, "dy": 1})).is_err(), "no character there");
+    // A 32-bit build read 2^32 + 1 as character 1.
+    assert!(s.execute("text.touchType", &json!({"id": id.0, "start": (1u64 << 32) + 1, "dy": 1})).is_err(), "no character there");
+}
+
+/// Touch Type on the first character of a list item moves that character and leaves the bullet
+/// where it is. The bullet stands for no character, so the first character still moves only up
+/// and down.
+#[test]
+fn touch_type_moves_the_first_character_of_a_list_item_and_not_its_bullet() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("text.setFormat", &json!({"ids": [id.0], "list": "bullet"})).unwrap();
+    let pens = |s: &Session| {
+        let t = obj(s, id);
+        let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+        let bullet = lay.glyphs.iter().find(|g| g.len == 0).map(|g| t.xf * (g.xf * Point::ZERO)).unwrap();
+        (bullet, lay.glyphs.iter().filter(|g| g.len > 0).map(|g| (g.byte, t.xf * (g.xf * Point::ZERO))).collect::<Vec<_>>())
+    };
+    let (bullet, before) = pens(&s);
+    assert!(s.execute("text.touchType", &json!({"id": id.0, "start": 0, "dx": 5})).is_err(), "no character before it to kern");
+    s.execute("text.touchType", &json!({"id": id.0, "start": 0, "dy": 3})).unwrap();
+    let (bullet_after, after) = pens(&s);
+    assert!(near(moved_by(&before, &after, 0), (0.0, -3.0)), "the T moves 3 pt up: {:?}", moved_by(&before, &after, 0));
+    assert!(near(moved_by(&before, &after, 1), (0.0, 0.0)));
+    assert!((bullet_after - bullet).hypot() < 1e-6, "the bullet stays: {bullet:?} {bullet_after:?}");
+}
+
+/// Raising, scaling or rotating a character leaves it and the characters after it where they
+/// were along the line, also where the font kerns it with its neighbors (the T and the y).
+#[test]
+fn touch_type_keeps_the_kerning_of_a_raised_or_scaled_character() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dy": 5})).unwrap();
+    let after = glyph_pens(&s, id);
+    assert!(near(moved_by(&before, &after, 1), (0.0, -5.0)), "{:?}", moved_by(&before, &after, 1));
+    for byte in [0, 2, 3] {
+        assert!(near(moved_by(&before, &after, byte), (0.0, 0.0)), "byte {byte}: {:?}", moved_by(&before, &after, byte));
+    }
+    // A wider y pushes the p and e on by what it widens, and no further.
+    s.execute("edit.undo", &json!({})).unwrap();
+    let width = |s: &Session| {
+        let t = obj(s, id);
+        let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+        let y = lay.glyphs.iter().find(|g| g.byte == 1).unwrap();
+        let face = vectorcraft_text::FontDb::global().face_by_id(y.font_id).unwrap();
+        let [a, b, ..] = y.xf.as_coeffs();
+        face.advance(y.gid) * a.hypot(b)
+    };
+    let w0 = width(&s);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "hScale": 150})).unwrap();
+    let after = glyph_pens(&s, id);
+    assert!(near(moved_by(&before, &after, 1), (0.0, 0.0)), "{:?}", moved_by(&before, &after, 1));
+    let wider = width(&s) - w0;
+    assert!((wider - w0 / 2.0).abs() < 1e-6, "{wider} {w0}");
+    for byte in [2, 3] {
+        assert!(near(moved_by(&before, &after, byte), (wider, 0.0)), "byte {byte}: {:?}", moved_by(&before, &after, byte));
+    }
+    // A move is limited to what kerning can give (-1000/1000 em on the y): the p does not move
+    // by more than the font's kerning pair with the y.
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dx": 80})).unwrap();
+    let after = glyph_pens(&s, id);
+    let (y, _) = moved_by(&before, &after, 1);
+    assert!((39.0..=41.0).contains(&y), "the y stops at about 40 pt (1 em): {y}");
+    assert!(moved_by(&before, &after, 2).0.abs() < 1.0, "{:?}", moved_by(&before, &after, 2));
+}
+
+/// A character drawn with two glyphs (ß in All Caps is SS) widens by both when it is scaled.
+#[test]
+fn touch_type_scales_a_character_drawn_with_two_glyphs() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "aße", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("text.setRangeStyle", &json!({"id": id.0, "allCaps": true})).unwrap();
+    let t = obj(&s, id);
+    let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+    let esses: Vec<_> = lay.glyphs.iter().filter(|g| g.byte == 1).collect();
+    assert_eq!(esses.len(), 2, "ß in All Caps is two glyphs");
+    let width: f64 = esses
+        .iter()
+        .map(|g| {
+            let face = vectorcraft_text::FontDb::global().face_by_id(g.font_id).unwrap();
+            let [a, b, ..] = g.xf.as_coeffs();
+            face.advance(g.gid) * a.hypot(b)
+        })
+        .sum();
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "hScale": 150})).unwrap();
+    // Half the width of SS (the font's kerning between the two S glyphs scales with them).
+    let (x, _) = moved_by(&before, &glyph_pens(&s, id), 3);
+    assert!((x - width / 2.0).abs() < 1.0, "the E moves on by half the width of SS: {x} {width}");
+}
+
+/// In a centered or right-aligned line, the kerning still moves only the dragged character.
+#[test]
+fn touch_type_moves_one_character_in_centered_and_right_aligned_lines() {
+    for justify in ["center", "right"] {
+        let mut s = session();
+        let r = s.execute("text.create", &json!({"x": 200, "y": 100, "text": "Type", "size": 40, "justify": justify})).unwrap();
+        let id = NodeId(r["id"].as_u64().unwrap());
+        let before = glyph_pens(&s, id);
+        s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dx": 10, "dy": 4})).unwrap();
+        let after = glyph_pens(&s, id);
+        assert!(near(moved_by(&before, &after, 1), (10.0, -4.0)), "{justify}: {:?}", moved_by(&before, &after, 1));
+        for byte in [2, 3] {
+            assert!(near(moved_by(&before, &after, byte), (0.0, 0.0)), "{justify}, byte {byte}: {:?}", moved_by(&before, &after, byte));
+        }
+    }
+}
+
+/// `dy` moves a rotated character that many document points along its own up axis, also in type
+/// scaled unevenly.
+#[test]
+fn touch_type_raises_a_rotated_character_in_unevenly_scaled_type() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("object.transform", &json!({"ids": [id.0], "matrix": [2, 0, 0, 1, 0, 0]})).unwrap();
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "rotation": 90})).unwrap();
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dy": 10})).unwrap();
+    let (x, y) = moved_by(&before, &glyph_pens(&s, id), 1);
+    assert!(((x * x + y * y).sqrt() - 10.0).abs() < 1e-6, "({x}, {y})");
+}
+
+/// `dy` moves a character that many document points in type scaled up 2000 times, where baseline
+/// shift is limited to 0.648 pt of text space.
+#[test]
+fn touch_type_raises_a_character_in_type_scaled_up_2000_times() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 0, "y": 0, "text": "Type", "size": 1})).unwrap()["id"].as_u64().unwrap());
+    s.execute("object.transform", &json!({"ids": [id.0], "matrix": [2000, 0, 0, 2000, 0, 0]})).unwrap();
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dy": 10})).unwrap();
+    let (x, y) = moved_by(&before, &glyph_pens(&s, id), 1);
+    assert!(near((x, y), (0.0, -10.0)), "({x}, {y})");
+}
+
+/// A character whose baseline shift is beyond the range that the object's scale leaves keeps its
+/// shift through a change that does not raise it, and a `dy` moves it back into the range.
+#[test]
+fn touch_type_moves_a_character_shifted_beyond_the_range() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("text.setRangeStyle", &json!({"id": id.0, "start": 1, "end": 2, "baselineShift": 1000})).unwrap();
+    s.execute("object.transform", &json!({"ids": [id.0], "matrix": [2, 0, 0, 2, 0, 0]})).unwrap();
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "hScale": 150})).unwrap();
+    let (_, up) = moved_by(&before, &glyph_pens(&s, id), 1);
+    assert!(up.abs() < 1e-6, "the shift stays: {up}");
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dy": -10})).unwrap();
+    let (_, down) = moved_by(&before, &glyph_pens(&s, id), 1);
+    assert!(down >= 10.0 - 1e-6, "{down}");
+}
+
+/// `dy` moves a rotated character on a path with the Skew effect that many document points too,
+/// where the effect stretches its baseline shift.
+#[test]
+fn touch_type_raises_a_rotated_character_on_a_skewed_path() {
+    let mut s = session();
+    let pid = s.execute("path.create", &json!({"d": "M100 400 L400 100"})).unwrap()["id"].as_u64().unwrap();
+    let r = s.execute("text.createInPath", &json!({"path": pid, "mode": "onPath", "text": "Type", "size": 40, "at": [100, 400]})).unwrap();
+    let id = NodeId(r["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    s.execute("type.pathOptions", &json!({"effect": "skew"})).unwrap();
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "rotation": 45})).unwrap();
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "dy": 10})).unwrap();
+    let (x, y) = moved_by(&before, &glyph_pens(&s, id), 1);
+    assert!(((x * x + y * y).sqrt() - 10.0).abs() < 1e-6, "({x}, {y})");
+}
+
+/// A right-to-left character moves only up and down.
+#[test]
+fn touch_type_moves_a_right_to_left_character_only_up_and_down() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "אבג", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    assert!(s.execute("text.touchType", &json!({"id": id.0, "start": 2, "dx": 5})).is_err());
+    let before = glyph_pens(&s, id);
+    s.execute("text.touchType", &json!({"id": id.0, "start": 2, "dy": 3})).unwrap();
+    let (_, up) = moved_by(&before, &glyph_pens(&s, id), 2);
+    assert!((up + 3.0).abs() < 1e-9, "{up}");
+}
+
+#[test]
+fn touch_type_scales_and_rotates_one_character() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("text.touchType", &json!({"id": id.0, "start": 2, "hScale": 150, "vScale": 50, "rotation": 30})).unwrap();
+    let t = obj(&s, id);
+    let st = |byte: usize| vectorcraft_text::edit::slice_runs(&t.runs, byte, byte + 1)[0].style.clone();
+    assert_eq!((st(2).h_scale, st(2).v_scale, st(2).rotation), (150.0, 50.0, 30.0));
+    for byte in [1, 3] {
+        assert_eq!((st(byte).h_scale, st(byte).v_scale, st(byte).rotation), (100.0, 100.0, 0.0));
+    }
+}
+
+/// The Touch Type tool through the session: a click on a character selects it, and dragging its
+/// box sends `text.touchType` as one undo step.
+#[test]
+fn the_touch_type_tool_drags_a_character() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": []})).unwrap();
+    let before = glyph_pens(&s, id);
+    let v = ViewInfo::default();
+    s.select_tool("touchType", v).unwrap();
+    let t = obj(&s, id);
+    let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+    let y = lay.glyphs.iter().find(|g| g.byte == 1).unwrap();
+    let at = t.xf * (y.origin + vectorcraft_geom::Vec2::new(y.advance / 2.0, -10.0));
+    click(&mut s, at.x, at.y);
+    assert_eq!(s.doc().unwrap().selection.objects, vec![id], "the click selects the type");
+    assert_eq!(s.tool_options(), json!({"id": id.0, "start": 1}));
+    for (k, x, y) in [(PointerKind::Down, at.x, at.y), (PointerKind::Drag, at.x + 10.0, at.y - 4.0), (PointerKind::Up, at.x + 10.0, at.y - 4.0)] {
+        s.pointer(&PointerEvent::new(k, x, y), v).unwrap();
+    }
+    let after = glyph_pens(&s, id);
+    assert!(near(moved_by(&before, &after, 1), (10.0, -4.0)), "{:?}", moved_by(&before, &after, 1));
+    assert!(near(moved_by(&before, &after, 2), (0.0, 0.0)));
+    assert_eq!(undo_labels(&s).iter().filter(|l| *l == "Touch Type").count(), 1);
+    // Turned 30°, the y still follows the pointer: an upward drag of its box moves it straight up.
+    s.execute("text.touchType", &json!({"id": id.0, "start": 1, "rotation": 30})).unwrap();
+    let before = glyph_pens(&s, id);
+    let t = obj(&s, id);
+    let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+    let y = lay.glyphs.iter().find(|g| g.byte == 1).unwrap();
+    let face = vectorcraft_text::FontDb::global().face_by_id(y.font_id).unwrap();
+    let (ascent, descent) = face.vertical_metrics();
+    let at = t.xf * (y.xf * Point::new(face.advance(y.gid) / 2.0, (descent - ascent) / 2.0));
+    for (k, x, y) in [(PointerKind::Down, at.x, at.y), (PointerKind::Drag, at.x, at.y - 4.0), (PointerKind::Up, at.x, at.y - 4.0)] {
+        s.pointer(&PointerEvent::new(k, x, y), v).unwrap();
+    }
+    let after = glyph_pens(&s, id);
+    assert!(near(moved_by(&before, &after, 1), (0.0, -4.0)), "{:?}", moved_by(&before, &after, 1));
+    assert!(near(moved_by(&before, &after, 2), (0.0, 0.0)), "{:?}", moved_by(&before, &after, 2));
+}
+
+/// Arrow keys with the Touch Type tool nudge the selected character by the keyboard increment.
+#[test]
+fn touch_type_arrow_keys_nudge_the_selected_character() {
+    let mut s = session();
+    let id = NodeId(s.execute("text.create", &json!({"x": 100, "y": 100, "text": "Type", "size": 40})).unwrap()["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": []})).unwrap();
+    let v = ViewInfo::default();
+    s.select_tool("touchType", v).unwrap();
+    let t = obj(&s, id);
+    let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t);
+    let y = lay.glyphs.iter().find(|g| g.byte == 1).unwrap();
+    let at = t.xf * (y.origin + vectorcraft_geom::Vec2::new(y.advance / 2.0, -10.0));
+    click(&mut s, at.x, at.y);
+    let before = glyph_pens(&s, id);
+    s.tool_key(vectorcraft_tools::ToolKey::Right, Mods::default(), v).unwrap();
+    let after = glyph_pens(&s, id);
+    assert!(near(moved_by(&before, &after, 1), (1.0, 0.0)), "{:?}", moved_by(&before, &after, 1));
+    assert_eq!(undo_labels(&s).iter().filter(|l| *l == "Touch Type").count(), 1);
 }
 
 #[test]
@@ -172,6 +567,62 @@ fn a_cmd_drag_while_typing_moves_the_type_and_keeps_the_typing() {
     assert_eq!(obj(&s, id).plain_text(), "Hello!");
     let after = s.doc().unwrap().doc.bounds_of(&[id], false).unwrap();
     assert!((after.x0 - moved.x0).abs() < 1e-6, "and stays where it was moved: {after:?}");
+}
+
+fn cmd_click(s: &mut Session, x: f64, y: f64) {
+    let (v, cmd) = (ViewInfo::default(), Mods { cmd: true, ..Default::default() });
+    for k in [PointerKind::Down, PointerKind::Up] {
+        s.pointer(&PointerEvent::new(k, x, y).with_mods(cmd), v).unwrap();
+    }
+}
+
+/// #3779: a Cmd/Ctrl click on another object while typing selects it and ends the text edit, so
+/// the keys that follow are shortcuts again and not typing.
+#[test]
+fn a_cmd_click_on_another_object_while_typing_ends_the_text_edit() {
+    let mut s = session();
+    let v = ViewInfo::default();
+    let r = s.execute("shape.rectangle", &json!({"x": 500, "y": 400, "width": 50, "height": 50})).unwrap();
+    let rect = NodeId(r["id"].as_u64().unwrap());
+    s.select_tool("type", v).unwrap();
+    click(&mut s, 200.0, 200.0);
+    let id = s.doc().unwrap().selection.objects[0];
+    s.tool_text("Hello", v).unwrap();
+    cmd_click(&mut s, 525.0, 425.0);
+    assert_eq!(s.doc().unwrap().selection.objects, vec![rect], "the rectangle is selected");
+    assert!(!s.tool_wants_text(), "the text edit ended");
+    s.tool_text("v", v).unwrap();
+    assert_eq!(obj(&s, id).plain_text(), "Hello", "a later key is not typed into the text");
+    assert_eq!(s.tool_id(), "type", "the Type tool is back");
+}
+
+/// #3779: a Cmd/Ctrl click on empty canvas while typing deselects the text and ends its edit.
+#[test]
+fn a_cmd_click_on_empty_canvas_while_typing_ends_the_text_edit() {
+    let mut s = session();
+    let v = ViewInfo::default();
+    s.select_tool("type", v).unwrap();
+    click(&mut s, 200.0, 200.0);
+    let id = s.doc().unwrap().selection.objects[0];
+    s.tool_text("Hello", v).unwrap();
+    cmd_click(&mut s, 600.0, 450.0);
+    assert!(s.doc().unwrap().selection.objects.is_empty(), "nothing is selected");
+    assert!(!s.tool_wants_text(), "the text edit ended");
+    s.tool_text("v", v).unwrap();
+    assert_eq!(obj(&s, id).plain_text(), "Hello", "a later key is not typed into the text");
+}
+
+/// #3779: point type a click placed and nothing was typed into goes away on a Cmd/Ctrl click
+/// elsewhere, as it does on Escape.
+#[test]
+fn a_cmd_click_away_from_empty_point_type_discards_it() {
+    let mut s = session();
+    let v = ViewInfo::default();
+    s.select_tool("type", v).unwrap();
+    click(&mut s, 200.0, 200.0);
+    let id = s.doc().unwrap().selection.objects[0];
+    cmd_click(&mut s, 600.0, 450.0);
+    assert!(s.doc().unwrap().doc.node(id).is_none(), "the empty type is discarded");
 }
 
 #[test]
@@ -736,4 +1187,85 @@ fn a_colour_previewed_while_typing_keeps_the_typing() {
     assert_eq!(&labels[labels.len() - 2..], ["Typing", "Fill Color"]);
     s.tool_text("d", v).unwrap();
     assert_eq!(obj(&s, id).plain_text(), "abcd");
+}
+
+/// The red out port of selected overflowing area type is drawn with the Selection tool too, and
+/// not twice with the Type tool, which draws it itself (#2323).
+#[test]
+fn overflow_marker_shows_with_the_selection_tool() {
+    let mut s = session();
+    let v = ViewInfo::default();
+    let long = "Words that fill more than the frame holds. ".repeat(20);
+    let r = s.execute("text.create", &json!({"x": 50, "y": 50, "text": long, "size": 20, "area": {"width": 100, "height": 40}})).unwrap();
+    let id = NodeId(r["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    s.select_tool("selection", v).unwrap();
+    let red = |s: &mut Session| s.overlays(v).iter().filter(|o| matches!(o, vectorcraft_tools::Overlay::Path { color: [230, 30, 30], .. })).count();
+    assert_eq!(red(&mut s), 1, "the out port");
+    s.select_tool("type", v).unwrap();
+    assert_eq!(red(&mut s), 1, "the Type tool's own, not a second one");
+    s.execute("select.set", &json!({"ids": []})).unwrap();
+    s.select_tool("selection", v).unwrap();
+    assert_eq!(red(&mut s), 0, "nothing selected");
+}
+
+/// #2572: with the Selection tool, a click on the out port and a click on empty canvas thread the
+/// overflow into a new frame there, in one undo step; Escape, or another tool, drops the loaded text.
+#[test]
+fn clicking_the_out_port_then_the_canvas_threads_the_text_into_a_new_frame() {
+    let mut s = session();
+    let v = ViewInfo::default();
+    let long = "Words that fill more than the frame holds. ".repeat(20);
+    let r = s.execute("text.create", &json!({"x": 50, "y": 50, "text": long, "size": 20, "area": {"width": 100, "height": 40}})).unwrap();
+    let id = NodeId(r["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    s.select_tool("selection", v).unwrap();
+    let port = Point::new(150.0, 90.0 - vectorcraft_tools::text::PORT_RISE_PX);
+    let loaded = |s: &mut Session| s.cursor(Point::new(400.0, 400.0), Mods::default(), v) == vectorcraft_tools::Cursor::LoadedText;
+    click(&mut s, port.x, port.y);
+    assert!(loaded(&mut s));
+    key(&mut s, ToolKey::Escape, Mods::default());
+    assert!(!loaded(&mut s), "Escape drops the text");
+    click(&mut s, port.x, port.y);
+    s.select_tool("directSelection", v).unwrap();
+    s.select_tool("selection", v).unwrap();
+    assert!(!loaded(&mut s), "another tool drops the text");
+    let steps = undo_labels(&s).len();
+    click(&mut s, port.x, port.y);
+    click(&mut s, 400.0, 400.0);
+    let doc = &s.doc().unwrap().doc;
+    let [thread] = &doc.text_threads[..] else { panic!("one thread: {:?}", doc.text_threads) };
+    assert_eq!(thread[0], id);
+    assert_eq!(format!("{}{}", obj(&s, id).plain_text(), obj(&s, thread[1]).plain_text()), long);
+    assert_eq!(&undo_labels(&s)[steps..], ["Thread Text"]);
+}
+
+/// #2572: with the Selection tool, area type whose text fits shows both ports, and a click on its
+/// in port then on empty canvas makes a new frame the story starts in, flowing on into the frame
+/// clicked, in one undo step; the ports then show the thread's arrows.
+#[test]
+fn clicking_the_in_port_then_the_canvas_threads_a_new_frame_before_it() {
+    let mut s = session();
+    let v = ViewInfo::default();
+    let words = "Words that fit. ";
+    let r = s.execute("text.create", &json!({"x": 50, "y": 50, "text": words, "size": 12, "area": {"width": 100, "height": 40}})).unwrap();
+    let id = NodeId(r["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    s.select_tool("selection", v).unwrap();
+    let boxes = |s: &mut Session| {
+        s.overlays(v).iter().filter(|o| matches!(o, vectorcraft_tools::Overlay::Highlight { color: [255, 255, 255, 255], .. })).count()
+    };
+    assert_eq!(boxes(&mut s), 2, "an in port and an out port");
+    let steps = undo_labels(&s).len();
+    click(&mut s, 50.0, 50.0 + vectorcraft_tools::text::PORT_RISE_PX);
+    assert_eq!(s.cursor(Point::new(400.0, 400.0), Mods::default(), v), vectorcraft_tools::Cursor::LoadedText);
+    click(&mut s, 400.0, 400.0);
+    let doc = &s.doc().unwrap().doc;
+    let [thread] = &doc.text_threads[..] else { panic!("one thread: {:?}", doc.text_threads) };
+    assert_eq!(thread[1], id, "the frame clicked comes second");
+    assert_eq!(format!("{}{}", obj(&s, thread[0]).plain_text(), obj(&s, id).plain_text()), words);
+    assert!(!obj(&s, thread[0]).plain_text().is_empty(), "the story starts in the new frame");
+    assert_eq!(&undo_labels(&s)[steps..], ["Thread Text"]);
+    let strokes = s.overlays(v).iter().filter(|o| matches!(o, vectorcraft_tools::Overlay::Line { .. })).count();
+    assert_eq!(strokes, 6, "both frames selected: the first one's out port and the second one's in port show arrows");
 }

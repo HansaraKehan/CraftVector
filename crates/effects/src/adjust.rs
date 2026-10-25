@@ -48,13 +48,27 @@ enum Channel {
 
 impl Channel {
     fn of(p: &Value) -> Self {
-        match text(p, "channel", "rgb").to_ascii_lowercase().as_str() {
-            "red" | "r" => Channel::One(0),
-            "green" | "g" => Channel::One(1),
-            "blue" | "b" => Channel::One(2),
-            _ => Channel::All,
+        Self::parse(text(p, "channel", "rgb")).unwrap_or(Channel::All)
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "rgb" => Some(Channel::All),
+            "red" | "r" => Some(Channel::One(0)),
+            "green" | "g" => Some(Channel::One(1)),
+            "blue" | "b" => Some(Channel::One(2)),
+            _ => None,
         }
     }
+}
+
+/// The channels Curves and Levels apply to (`channel`), as their parameters list them.
+pub const CHANNELS: [&str; 4] = ["rgb", "red", "green", "blue"];
+
+/// Do Curves and Levels read `s` as their `channel`: one of [`CHANNELS`], or r, g or b, in any
+/// case? They draw any other value on all three channels, as RGB.
+pub fn is_channel(s: &str) -> bool {
+    Channel::parse(s).is_some()
 }
 
 /// Entries of a sampled tone curve.
@@ -401,7 +415,7 @@ pub fn adjust_in_document(d: &mut Document, n: &Node) -> Option<Node> {
     let src = match &n.kind {
         NodeKind::SymbolInstance { symbol, .. } if has_adjustment(n) => {
             let symbol = d.symbols.iter().find(|s| s.name == *symbol).map(|s| s.art.clone());
-            art = crate::reshape::as_art(n, symbol.as_deref())?;
+            art = crate::reshape::as_art(Some(d), n, symbol.as_deref())?;
             &art
         }
         _ => n,
@@ -489,5 +503,21 @@ mod tests {
         assert_eq!(out.appearance.items[1].paint().color().unwrap().to_hex(), "#ffffff");
         assert_eq!(out.appearance.items[0].paint(), p.appearance.items[0].paint());
         assert!(out.appearance.items[1].effects().is_empty());
+    }
+
+    #[test]
+    fn adjust_recolours_the_points_of_a_freeform_gradient() {
+        use vectorcraft_doc::color::{Freeform, FreeformPoint, Gradient, GradientKind, GradientPaint};
+        let mut gp = GradientPaint::new(Gradient { kind: GradientKind::Freeform, ..Gradient::default() });
+        let pt = |x, c| FreeformPoint::new(kurbo::Point::new(x, 5.0), c);
+        gp.set_freeform(Freeform { points: vec![pt(2.0, Color::rgb(1.0, 0.0, 0.0)), pt(8.0, Color::rgb(0.0, 0.0, 1.0))], ..Default::default() });
+        let fill = Appearance::basic(Paint::Gradient(Box::new(gp)), Paint::None, 0.0);
+        let mut p = Node::path(NodeId(1), shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), fill);
+        p.appearance.effects.push(Effect { id: "adjust.hueSaturation".into(), params: json!({"hue": 120}), visible: true });
+        let out = adjust(&p, None, &mut |_, _| None).unwrap();
+        let Paint::Gradient(g) = out.appearance.fill_paint() else { panic!("a gradient fill") };
+        // The points are what a freeform gradient draws from, not its stops.
+        let hexes: Vec<String> = g.freeform.as_ref().unwrap().points.iter().map(|p| p.color.to_hex()).collect();
+        assert_eq!(hexes, ["#00ff00", "#ff0000"]);
     }
 }

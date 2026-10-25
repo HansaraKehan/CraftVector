@@ -16,6 +16,21 @@ use crate::{ArtBrush, ArtScale, Direction, PatternBrush, PatternFit, Scatter, Va
 const MAX_SEG: f64 = 1.5;
 /// Hard cap on subdivisions per art segment.
 const MAX_SUB: usize = 4000;
+/// Anchors one brushed stroke may emit in total, across every track, tile and copy.
+///
+/// Each factor is capped on its own (20,000 tiles a run, [`MAX_SUB`] subdivisions a segment,
+/// 20,000 copies a track), but those caps are per track and a path has as many tracks as it has
+/// subpaths, so they multiply rather than bound: one track at its cap measures 20,000 nodes and
+/// 320,000 anchors, and sixteen subpaths measure exactly sixteen times that (#3594). This is the
+/// cap on the product. The per-factor caps still shape each one.
+///
+/// The same figure as the stacked-effects budget (`effects::distort::MAX_COPY_ANCHORS`, #3578),
+/// and bounded the same way: per brushed stroke rather than per document, so many strokes that
+/// each reach it still add up. Six times what one track at its own cap draws, so it bites only
+/// where the caps were multiplying.
+const MAX_ANCHORS: usize = 2_000_000;
+/// Nodes [`anchors_of`] walks into before it gives up and charges the whole budget.
+const MAX_WALK: usize = 10_000;
 
 /// Bend every path under `n` through `f`. Paths are flattened with `flat_tol` (art space) and
 /// segments subdivided so none is longer than `max_du` along x. Stroke widths scale by
@@ -154,35 +169,65 @@ fn bend(t: &Track, art: &Node, b: Rect, along: AlongMap, cross: f64) -> Option<N
     warp_node(art, &f, flat_tol, MAX_SEG / along.max_scale(), cross.abs())
 }
 
+/// Arc-length spans to place art on when [`ArtBrush::overlap`] is on: one run between each sharp
+/// corner (the whole path when it has none).
+fn art_runs(t: &Track) -> Vec<(f64, f64)> {
+    let l = t.len();
+    let corners = t.corner_positions();
+    if corners.is_empty() {
+        return vec![(0.0, l)];
+    }
+    if t.closed {
+        let first = corners[0].1;
+        let mut bounds = corners.iter().map(|c| c.1).collect::<Vec<_>>();
+        bounds.push(first + l);
+        return bounds.windows(2).map(|w| (w[0], w[1])).collect();
+    }
+    let mut bounds = vec![0.0];
+    bounds.extend(corners.iter().map(|c| c.1));
+    bounds.push(l);
+    bounds.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+fn art_on_run(a: &ArtBrush, t: &Track, s0: f64, s1: f64, art: &Node, b: Rect, cross: f64) -> Option<Node> {
+    let l = s1 - s0;
+    if l <= 1e-9 {
+        return None;
+    }
+    let w = b.width();
+    let (along, cross) = match a.scale {
+        ArtScale::Stretch => (AlongMap::linear(w, s0, s1), cross),
+        ArtScale::Proportional => {
+            let k = l / w;
+            (AlongMap::linear(w, s0, s1), k * a.width / 100.0)
+        }
+        ArtScale::BetweenGuides { start, end } => {
+            let (g0, g1) = (start.clamp(0.0, 1.0) * w, end.clamp(0.0, 1.0) * w);
+            let (g0, g1) = (g0.min(g1), g0.max(g1));
+            let fixed = (g0 + (w - g1)) * cross;
+            if fixed >= l || g1 - g0 < 1e-9 {
+                (AlongMap::linear(w, s0, s1), cross)
+            } else {
+                (AlongMap { xs: [0.0, g0, g1, w], ss: [s0, s0 + g0 * cross, s1 - (w - g1) * cross, s1] }, cross)
+            }
+        }
+    };
+    bend(t, art, b, along, cross)
+}
+
 pub(crate) fn art(a: &ArtBrush, bp: &BezPath, weight: f64) -> Vec<Node> {
     let Some((art, b)) = oriented(&a.art, a.direction, a.flip_along, a.flip_across) else { return vec![] };
     let cross = weight * a.width / 100.0;
     let mut out = vec![];
     for t in tracks(bp, 0.05) {
-        let l = t.len();
-        if l <= 1e-9 {
+        if t.len() <= 1e-9 {
             continue;
         }
-        let w = b.width();
-        let (along, cross) = match a.scale {
-            ArtScale::Stretch => (AlongMap::linear(w, 0.0, l), cross),
-            ArtScale::Proportional => {
-                let k = l / w;
-                (AlongMap::linear(w, 0.0, l), k * a.width / 100.0)
+        let runs = if a.overlap { art_runs(&t) } else { vec![(0.0, t.len())] };
+        for (s0, s1) in runs {
+            if let Some(n) = art_on_run(a, &t, s0, s1, &art, b, cross) {
+                out.push(n);
             }
-            ArtScale::BetweenGuides { start, end } => {
-                let (g0, g1) = (start.clamp(0.0, 1.0) * w, end.clamp(0.0, 1.0) * w);
-                let (g0, g1) = (g0.min(g1), g0.max(g1));
-                let fixed = (g0 + (w - g1)) * cross;
-                if fixed >= l || g1 - g0 < 1e-9 {
-                    (AlongMap::linear(w, 0.0, l), cross)
-                } else {
-                    (AlongMap { xs: [0.0, g0, g1, w], ss: [0.0, g0 * cross, l - (w - g1) * cross, l] }, cross)
-                }
-            }
-        };
-        if let Some(n) = bend(&t, &art, b, along, cross) {
-            out.push(n);
         }
     }
     out
@@ -205,8 +250,11 @@ pub(crate) fn scatter(sc: &Scatter, bp: &BezPath, weight: f64, pressure: Option<
     let (aw, ah) = (b.width().max(1e-3), b.height().max(1e-3));
     let mut rng = Rng::new(seed_of(bp, name));
     let [size_mode, spacing_mode, scatter_mode, rotation_mode] = sc.modes();
-    let mut out = vec![];
+    let mut out = Budget::default();
     for t in tracks(bp, 0.05) {
+        if out.full() {
+            break;
+        }
         let l = t.len();
         // The pen pressure at arc length `at` (half way without a recorded one).
         let pressure_at = |at: f64| pressure.map_or(PressureProfile::MID, |p| p.at(if l > 1e-9 { at / l } else { 0.0 }));
@@ -240,10 +288,61 @@ pub(crate) fn scatter(sc: &Scatter, bp: &BezPath, weight: f64, pressure: Option<
             let xf = Affine::translate(place.to_vec2()) * Affine::rotate(base - rot) * Affine::scale(size) * Affine::translate(-b.center().to_vec2());
             let mut n = sc.art.clone();
             n.transform(xf, true);
-            out.push(n);
+            out.take(Some(n));
+            if out.full() {
+                break;
+            }
         }
     }
-    out
+    out.out
+}
+
+/// Anchors `n` and its children hold. Walked with a stack rather than by recursion, and a tree
+/// deeper or wider than [`MAX_WALK`] nodes is charged the whole budget rather than undercounted,
+/// so an art tile cannot buy room by nesting.
+fn anchors_of(n: &Node) -> usize {
+    let (mut total, mut seen) = (0usize, 0usize);
+    let mut stack = vec![n];
+    while let Some(n) = stack.pop() {
+        seen += 1;
+        if seen > MAX_WALK {
+            return MAX_ANCHORS;
+        }
+        if let NodeKind::Path { path, .. } = &n.kind {
+            total = total.saturating_add(path.subpaths.iter().map(|s| s.anchors.len()).sum::<usize>());
+        }
+        if let Some(c) = n.children() {
+            stack.extend(c.iter().map(Arc::as_ref));
+        }
+    }
+    total
+}
+
+/// Brush output collected under [`MAX_ANCHORS`].
+///
+/// A piece is taken whole or not at all, so the art a brush places is never half-drawn; the
+/// total is therefore the budget plus at most one piece.
+#[derive(Default)]
+struct Budget {
+    out: Vec<Node>,
+    anchors: usize,
+}
+
+impl Budget {
+    /// Take a piece if there is room. `None` (art that could not be placed) costs nothing.
+    fn take(&mut self, n: Option<Node>) {
+        let Some(n) = n else { return };
+        if self.full() {
+            return;
+        }
+        self.anchors = self.anchors.saturating_add(anchors_of(&n));
+        self.out.push(n);
+    }
+
+    /// Whether the budget is spent, so the caller can stop walking the path.
+    fn full(&self) -> bool {
+        self.anchors >= MAX_ANCHORS
+    }
 }
 
 /// A tile placed on [s0, s1] of the track (stretched along, `cross` across).
@@ -261,8 +360,11 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
     let end = pb.end.as_ref().and_then(orient);
     let tw = side.1.width() * k;
     let gap = tw * pb.spacing.max(0.0) / 100.0;
-    let mut out = vec![];
+    let mut out = Budget::default();
     for t in tracks(bp, 0.05) {
+        if out.full() {
+            break;
+        }
         let l = t.len();
         if l <= 1e-9 {
             continue;
@@ -284,7 +386,7 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
                 * Affine::translate(-bb.center().to_vec2());
             let mut n = art.clone();
             n.transform(xf, true);
-            out.push(n);
+            out.take(Some(n));
         }
         // Runs between corners (closed tracks wrap past the end).
         let mut bounds: Vec<f64> = corners.iter().map(|c| c.1).collect();
@@ -316,7 +418,7 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
             {
                 let w = st.1.width() * k;
                 if b - a > w {
-                    out.extend(tile_on(&t, st, a, a + w, k));
+                    out.take(tile_on(&t, st, a, a + w, k));
                     a += w;
                 }
             }
@@ -326,7 +428,7 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
             {
                 let w = en.1.width() * k;
                 if b - a > w {
-                    out.extend(tile_on(&t, en, b - w, b, k));
+                    out.take(tile_on(&t, en, b - w, b, k));
                     b -= w;
                 }
             }
@@ -342,7 +444,10 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
                     let (w, g) = (tw * f, gap * f);
                     for i in 0..n.min(20000) {
                         let s0 = a + i as f64 * (w + g);
-                        out.extend(tile_on(&t, &side, s0, s0 + w, k));
+                        out.take(tile_on(&t, &side, s0, s0 + w, k));
+                        if out.full() {
+                            break;
+                        }
                     }
                 }
                 PatternFit::AddSpace => {
@@ -351,7 +456,10 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
                     let lead = if n == 1 { (avail - tw) / 2.0 } else { 0.0 };
                     for i in 0..n.min(20000) {
                         let s0 = a + lead + i as f64 * (tw + g.max(0.0));
-                        out.extend(tile_on(&t, &side, s0, s0 + tw, k));
+                        out.take(tile_on(&t, &side, s0, s0 + tw, k));
+                        if out.full() {
+                            break;
+                        }
                     }
                 }
                 PatternFit::Approximate => {
@@ -360,11 +468,14 @@ pub(crate) fn pattern(pb: &PatternBrush, bp: &BezPath, weight: f64) -> Vec<Node>
                     let lead = (avail - used) / 2.0;
                     for i in 0..n.min(20000) {
                         let s0 = a + lead + i as f64 * unit;
-                        out.extend(tile_on(&t, &side, s0, s0 + tw, k));
+                        out.take(tile_on(&t, &side, s0, s0 + tw, k));
+                        if out.full() {
+                            break;
+                        }
                     }
                 }
             }
         }
     }
-    out
+    out.out
 }

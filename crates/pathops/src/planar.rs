@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use kurbo::{Affine, BezPath, CubicBez, ParamCurve, PathSeg, Point, Shape as _};
+use kurbo::{Affine, BezPath, CubicBez, ParamCurve, ParamCurveArclen, PathSeg, Point, Shape as _};
 use linesweeper::topology::{Topology, WindingNumber};
 use vectorcraft_geom::{FillRule, PathData, SubPath};
 
@@ -94,9 +94,135 @@ fn mid(segs: &[Seg]) -> Option<Point> {
     segs.get(segs.len() / 2).map(|s| s.c.eval(0.5))
 }
 
+/// Rectangles looked up by a point inside them, when there are too many to test one by one for
+/// every point (the map asks once per edge and once per hole, so a scan of them all made it
+/// quadratic in the input, #937). A grid of cells over their bounds, each cell listing the
+/// rectangles touching it; a lookup reads the cells around the point. The grid has about one cell
+/// per rectangle, so a lookup reads about the rectangles of the point's neighbourhood. A rectangle
+/// covering too many cells (a long diagonal's bounds take in most of the art, so an index of the
+/// bounds alone scanned a diagonal hatch whole for every point) is filed under the cells of a
+/// smaller footprint instead ([`Self::with_footprint`]), or, failing that, scanned for every point.
+struct RectIndex<T> {
+    items: Vec<(kurbo::Rect, T)>,
+    /// The grid's top-left corner, cell size and column count; `cells` lists the items touching
+    /// each cell, row by row.
+    origin: Point,
+    cell: (f64, f64),
+    cols: usize,
+    cells: Vec<Vec<u32>>,
+    /// Items the grid doesn't hold (bounds covering most of it, or not finite), scanned for
+    /// every point.
+    rest: Vec<usize>,
+}
+
+/// The fewest cells one footprint rectangle may always be filed under. The cap is this or two
+/// rows or columns of the grid, whichever is more: a thin stripe across the art (one of the faces
+/// a hatch cuts a shape into) is filed under the cells along it, while a rectangle covering most
+/// of the grid costs more to file and to read than to scan for every point.
+const CELLS_PER_FOOTPRINT: usize = 64;
+
+/// The cells (columns or rows) an interval `lo..=hi` touches on one axis of a grid: clamped to the
+/// grid, so an interval past its edge gets the nearest cell (whose items `contains` then rejects),
+/// and `None` for an interval that isn't a number.
+fn cell_span(lo: f64, hi: f64, origin: f64, size: f64, count: usize) -> Option<std::ops::RangeInclusive<usize>> {
+    let last = count.saturating_sub(1) as f64;
+    let a = ((lo - origin) / size).floor().clamp(0.0, last);
+    let b = ((hi - origin) / size).floor().clamp(0.0, last);
+    (a.is_finite() && b.is_finite()).then(|| (a as usize)..=(b.max(a) as usize))
+}
+
+impl<T> RectIndex<T> {
+    fn new(items: Vec<(kurbo::Rect, T)>) -> Self {
+        Self::with_footprint(items, |r, _, _| vec![*r])
+    }
+
+    /// `footprint(bounds, item, cell side)` gives the rectangles an item is filed under: a lookup
+    /// finds the item when its bounds hold the point and one footprint rectangle is within the
+    /// lookup's tolerance of it. The bounds themselves (`new`) suit items as compact as their
+    /// bounds; a long diagonal segment is better filed under the bounds of its pieces, about a
+    /// cell long each, which take in the cells along it rather than every cell its bounds cover.
+    fn with_footprint(items: Vec<(kurbo::Rect, T)>, footprint: impl Fn(&kurbo::Rect, &T, f64) -> Vec<kurbo::Rect>) -> Self {
+        let n = items.len().max(1);
+        let all = items.iter().map(|(r, _)| *r).filter(kurbo::Rect::is_finite).reduce(|a, b| a.union(b)).unwrap_or(kurbo::Rect::ZERO);
+        // A cell's side holds one rectangle on average; a grid of collinear rectangles (zero area)
+        // is divided along its length.
+        let side = (all.area() / n as f64).sqrt();
+        let side = if side > 0.0 { side } else { all.width().max(all.height()) / n as f64 }.max(1e-9);
+        // Saturating casts: an extent of a billion cells is clamped to the item count, then the
+        // grid is kept to a few cells per item however lopsided its bounds.
+        let mut cols = ((all.width() / side).ceil() as usize).clamp(1, 2 * n);
+        let mut rows = ((all.height() / side).ceil() as usize).clamp(1, 2 * n);
+        while cols * rows > 4 * n + 4 {
+            if cols > rows { cols = cols.div_ceil(2) } else { rows = rows.div_ceil(2) }
+        }
+        let cell = ((all.width() / cols as f64).max(1e-9), (all.height() / rows as f64).max(1e-9));
+        let cap = CELLS_PER_FOOTPRINT.max(2 * cols.max(rows));
+        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+        let mut rest = Vec::new();
+        for (i, (r, t)) in items.iter().enumerate() {
+            // Cells hold `u32` indices to halve the memory of a long stripe filed under a row of them.
+            let Ok(index) = u32::try_from(i) else {
+                rest.push(i);
+                continue;
+            };
+            let mut scan = !r.is_finite();
+            for f in if scan { Vec::new() } else { footprint(r, t, cell.0.min(cell.1)) } {
+                match (cell_span(f.x0, f.x1, all.x0, cell.0, cols), cell_span(f.y0, f.y1, all.y0, cell.1, rows)) {
+                    (Some(xs), Some(ys)) if (xs.end() - xs.start() + 1) * (ys.end() - ys.start() + 1) <= cap => {
+                        for y in ys {
+                            for x in xs.clone() {
+                                if let Some(c) = cells.get_mut(y * cols + x) {
+                                    c.push(index);
+                                }
+                            }
+                        }
+                    }
+                    _ => scan = true,
+                }
+            }
+            if scan {
+                rest.push(i);
+            }
+        }
+        Self { items, origin: all.origin(), cell, cols, cells, rest }
+    }
+
+    /// The items whose rectangle, grown by `tol`, holds `p` (and, with a footprint, one of whose
+    /// footprint rectangles is within `tol` of it).
+    fn at(&self, p: Point, tol: f64) -> impl Iterator<Item = &T> {
+        let mut found = self.rest.clone();
+        let rows = self.cells.len() / self.cols.max(1);
+        if let (Some(xs), Some(ys)) = (
+            cell_span(p.x - tol, p.x + tol, self.origin.x, self.cell.0, self.cols),
+            cell_span(p.y - tol, p.y + tol, self.origin.y, self.cell.1, rows),
+        ) {
+            for y in ys {
+                for x in xs.clone() {
+                    found.extend(self.cells.get(y * self.cols + x).into_iter().flatten().map(|&i| i as usize));
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found.into_iter().filter_map(move |i| self.items.get(i)).filter(move |(r, _)| r.inflate(tol, tol).contains(p)).map(|(_, t)| t)
+    }
+}
+
+/// A segment's footprint in a [`RectIndex`]: the bounds of its pieces about a cell long, so a long
+/// diagonal is filed under the cells along it, not under every cell its bounds cover.
+fn segment_footprint(bounds: &kurbo::Rect, seg: &PathSeg, cell: f64) -> Vec<kurbo::Rect> {
+    let pieces = (bounds.width().max(bounds.height()) / cell).ceil();
+    // A count past the cap gives longer pieces, each filed under more cells.
+    if pieces.is_nan() || pieces <= 1.0 {
+        return vec![*bounds];
+    }
+    let pieces = pieces.min(4096.0) as usize;
+    (0..pieces).map(|k| seg.subsegment(k as f64 / pieces as f64..(k + 1) as f64 / pieces as f64).bounding_box()).collect()
+}
+
 /// The inputs' segments (in the sweep's frame), to tell which inputs an edge lies on.
 struct Outlines {
-    segs: Vec<(kurbo::Rect, PathSeg, usize)>,
+    segs: RectIndex<(PathSeg, usize)>,
     tol: f64,
 }
 
@@ -105,18 +231,18 @@ impl Outlines {
         // A zero-length segment (a point) is the source of no edge, even one running through it.
         let segs = inputs
             .iter()
-            .flat_map(|(bp, i)| bp.segments().map(move |s| (s.bounding_box(), s, *i)))
+            .flat_map(|(bp, i)| bp.segments().map(move |s| (s.bounding_box(), (s, *i))))
             .filter(|(r, ..)| r.width() > 0.0 || r.height() > 0.0)
             .collect();
         // The sweep moves points by a few `eps` at most.
-        Self { segs, tol: 16.0 * eps }
+        Self { segs: RectIndex::with_footprint(segs, |r, (s, _), cell| segment_footprint(r, s, cell)), tol: 16.0 * eps }
     }
 
     /// The front-most input whose outline passes through `p`.
     fn source_at(&self, p: Point) -> Option<usize> {
         use kurbo::ParamCurveNearest;
         let tol = self.tol;
-        self.segs.iter().filter(|(r, s, _)| r.inflate(tol, tol).contains(p) && s.nearest(p, 1e-9).distance_sq <= tol * tol).map(|(_, _, i)| *i).max()
+        self.segs.at(p, tol).filter(|(s, _)| s.nearest(p, 1e-9).distance_sq <= tol * tol).map(|(_, i)| *i).max()
     }
 }
 
@@ -170,12 +296,24 @@ fn twin(h: usize) -> usize {
 
 /// The segments of half-edge `h`, in its direction.
 fn half_segs(edges: &[Edge], h: usize) -> Vec<Seg> {
-    let Some(e) = edges.get(h / 2) else { return Vec::new() };
-    if h.is_multiple_of(2) {
-        e.segs.clone()
-    } else {
-        e.segs.iter().rev().map(|s| Seg { c: CubicBez::new(s.c.p3, s.c.p2, s.c.p1, s.c.p0), line: s.line }).collect()
-    }
+    half_seg_iter(edges, h).collect()
+}
+
+/// The segments of half-edge `h` in its direction, without copying the edge first (an edge can
+/// hold thousands of segments, and the angle it leaves a vertex at needs the first few).
+fn half_seg_iter(edges: &[Edge], h: usize) -> impl Iterator<Item = Seg> + '_ {
+    let segs = edges.get(h / 2).map(|e| e.segs.as_slice()).unwrap_or_default();
+    let forward = h.is_multiple_of(2);
+    (0..segs.len()).filter_map(move |k| {
+        let s = segs.get(if forward { k } else { segs.len() - 1 - k })?;
+        Some(if forward { *s } else { Seg { c: CubicBez::new(s.c.p3, s.c.p2, s.c.p1, s.c.p0), line: s.line } })
+    })
+}
+
+/// Where half-edge `h` ends (the vertex at the other end of its edge).
+fn far_end(edges: &[Edge], h: usize) -> Option<Point> {
+    let e = edges.get(h / 2)?;
+    if h.is_multiple_of(2) { e.segs.last().map(|s| s.c.p3) } else { e.segs.first().map(|s| s.c.p0) }
 }
 
 /// The vertex half-edge `h` leaves from.
@@ -188,32 +326,33 @@ fn origin(edges: &[Edge], h: usize) -> Option<usize> {
 /// Edges that only meet at `v` cross a circle around it in the order they leave `v` in, however
 /// they start out (tangent curves, or the sweep's short straight stubs at a vertex).
 fn leaving_angle(edges: &[Edge], h: usize, v: Point, r: f64) -> f64 {
-    let segs = half_segs(edges, h);
-    let mut bp = BezPath::new();
-    for (k, s) in segs.iter().enumerate() {
-        if k == 0 {
-            bp.move_to(s.c.p0);
-        }
-        bp.curve_to(s.c.p1, s.c.p2, s.c.p3);
-    }
-    let mut prev = segs.first().map_or(v, |s| s.c.p0);
+    let first = half_seg_iter(edges, h).next();
+    let mut prev = first.map_or(v, |s| s.c.p0);
     let mut hit: Option<Point> = None;
-    kurbo::flatten(bp.iter(), (r * 1e-4).max(1e-12), |el| {
-        if let (None, kurbo::PathEl::LineTo(p)) = (hit, el) {
-            if p.distance(v) >= r {
-                // The point on prev → p at distance r (prev is closer).
-                let (d, f) = (p - prev, prev - v);
-                let (a, b, c) = (d.hypot2(), 2.0 * f.dot(d), f.hypot2() - r * r);
-                let t = if a > 0.0 { ((-b + (b * b - 4.0 * a * c).max(0.0).sqrt()) / (2.0 * a)).clamp(0.0, 1.0) } else { 1.0 };
-                hit = Some(prev + d * t);
+    // One segment at a time, stopping at the first that gets r away: an edge can run on for
+    // thousands of segments (a traced outline between two crossings), all of which flattening
+    // the whole edge to this tolerance would visit, at every vertex.
+    for s in half_seg_iter(edges, h) {
+        let path = [kurbo::PathEl::MoveTo(s.c.p0), kurbo::PathEl::CurveTo(s.c.p1, s.c.p2, s.c.p3)];
+        kurbo::flatten(path, (r * 1e-4).max(1e-12), |el| {
+            if let (None, kurbo::PathEl::LineTo(p)) = (hit, el) {
+                if p.distance(v) >= r {
+                    // The point on prev → p at distance r (prev is closer).
+                    let (d, f) = (p - prev, prev - v);
+                    let (a, b, c) = (d.hypot2(), 2.0 * f.dot(d), f.hypot2() - r * r);
+                    let t = if a > 0.0 { ((-b + (b * b - 4.0 * a * c).max(0.0).sqrt()) / (2.0 * a)).clamp(0.0, 1.0) } else { 1.0 };
+                    hit = Some(prev + d * t);
+                }
+                prev = p;
             }
-            prev = p;
+        });
+        if hit.is_some() {
+            break;
         }
-    });
+    }
     // An edge too short to reach r (it can't, r is at most half of every chord) leaves along its
     // tangent.
-    let far =
-        hit.unwrap_or_else(|| segs.first().map_or(v, |s| [s.c.p1, s.c.p2, s.c.p3].into_iter().find(|p| p.distance(s.c.p0) > 0.0).unwrap_or(s.c.p3)));
+    let far = hit.unwrap_or_else(|| first.map_or(v, |s| [s.c.p1, s.c.p2, s.c.p3].into_iter().find(|p| p.distance(s.c.p0) > 0.0).unwrap_or(s.c.p3)));
     (far - v).atan2()
 }
 
@@ -307,10 +446,285 @@ pub fn live_paint(shapes: &[Shape]) -> (Vec<Region>, Vec<Shape>) {
     build(shapes).unwrap_or_default()
 }
 
+/// [`live_paint`] with Gap Detection: the faces are those of `shapes` with a line across each gap
+/// [`find_gaps`] finds up to `max_gap`, so paint stops at the gaps, and the edges are those of
+/// `shapes` alone (the lines add none). Also returns the gaps.
+pub fn live_paint_with_gaps(shapes: &[Shape], max_gap: f64) -> (Vec<Region>, Vec<Shape>, Vec<[Point; 2]>) {
+    let gaps = find_gaps(shapes, max_gap);
+    if gaps.is_empty() {
+        let (faces, edges) = live_paint(shapes);
+        return (faces, edges, gaps);
+    }
+    let mut closed = shapes.to_vec();
+    let lines = PathData::new(gaps.iter().map(|g| SubPath::polyline(g, false)).collect());
+    closed.push(Shape::new(lines, FillRule::NonZero, u64::MAX));
+    let (faces, _) = live_paint(&closed);
+    let (_, edges) = live_paint(shapes);
+    (faces, edges, gaps)
+}
+
+/// How many times longer than a gap the way between its two ends along the paths must be for it to
+/// count: a loose end that crosses a path just before it (an overshoot), or a path that curls back
+/// close to its own end (a hook), leaves no gap there.
+const GAP_DETOUR: f64 = 8.0;
+
+/// How exactly [`find_gaps`] measures lengths along the paths.
+const GAP_ARC_ACCURACY: f64 = 1e-4;
+
+/// How many points along a loose end's own segment [`find_gaps`] tries.
+const GAP_SAMPLES: u32 = 64;
+
+/// One subpath's segments for [`find_gaps`], with the length along it where each starts.
+struct Track {
+    segs: Vec<PathSeg>,
+    /// The length at the start of each segment, then the whole length.
+    at: Vec<f64>,
+    closed: bool,
+    bounds: kurbo::Rect,
+}
+
+impl Track {
+    fn new(sp: &SubPath) -> Option<Self> {
+        if sp.anchors.len() < 2 || !sp.anchors.iter().all(|a| a.p.is_finite() && a.h_in.is_finite() && a.h_out.is_finite()) {
+            return None;
+        }
+        let mut bp = BezPath::new();
+        sp.to_bezpath_into(&mut bp);
+        let segs: Vec<PathSeg> = bp.segments().collect();
+        let mut at = Vec::with_capacity(segs.len() + 1);
+        let mut len = 0.0;
+        for s in &segs {
+            at.push(len);
+            len += s.arclen(GAP_ARC_ACCURACY);
+        }
+        at.push(len);
+        (!segs.is_empty()).then(|| Self { bounds: bp.bounding_box(), segs, at, closed: sp.closed })
+    }
+
+    fn len(&self) -> f64 {
+        self.at.last().copied().unwrap_or(0.0)
+    }
+
+    /// The length along the subpath to parameter `t` of segment `k`.
+    fn pos(&self, k: usize, t: f64) -> f64 {
+        let Some(s) = self.segs.get(k) else { return self.len() };
+        self.at.get(k).copied().unwrap_or(0.0) + s.subsegment(0.0..t).arclen(GAP_ARC_ACCURACY)
+    }
+
+    /// The length along the subpath between two places on it (the shorter way round a closed one).
+    fn along(&self, a: f64, b: f64) -> f64 {
+        let d = (a - b).abs();
+        if self.closed { d.min(self.len() - d) } else { d }
+    }
+}
+
+/// Do two boxes (lines' boxes included, which have no area) touch or overlap?
+fn boxes_meet(a: kurbo::Rect, b: kurbo::Rect) -> bool {
+    a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1
+}
+
+/// Where track `o`, within `reach` along it of `from`, crosses the segments `near` of track `q`:
+/// (length along `o`, length along `q`) of each crossing.
+fn crossings(o: &Track, from: f64, reach: f64, q: &Track, near: impl Iterator<Item = usize>) -> Vec<(f64, f64)> {
+    let near: Vec<(usize, &PathSeg)> = near.filter_map(|j| Some((j, q.segs.get(j)?))).collect();
+    let mut out = vec![];
+    // `first` is the first segment that ends within reach.
+    let first = o.at.partition_point(|&a| a < from - reach).saturating_sub(1);
+    for (k, s) in o.segs.iter().enumerate().skip(first) {
+        let (Some(&a0), Some(&a1)) = (o.at.get(k), o.at.get(k + 1)) else { continue };
+        if a0 > from + reach {
+            break;
+        }
+        if a1 < from - reach || !boxes_meet(s.bounding_box(), q.bounds) {
+            continue;
+        }
+        // A curve is tried as 16 chords.
+        let n = if matches!(s, PathSeg::Line(_)) { 1 } else { 16 };
+        let mut prev = s.start();
+        for i in 1..=n {
+            let (t0, t1) = (f64::from(i - 1) / f64::from(n), f64::from(i) / f64::from(n));
+            let p = s.eval(t1);
+            let chord = kurbo::Line::new(prev, p);
+            let cb = chord.bounding_box();
+            for &(j, qs) in &near {
+                if !boxes_meet(qs.bounding_box(), cb) {
+                    continue;
+                }
+                for x in qs.intersect_line(chord) {
+                    out.push((o.pos(k, t0 + x.line_t * (t1 - t0)), q.pos(j, x.segment_t)));
+                }
+            }
+            prev = p;
+        }
+    }
+    out
+}
+
+/// Most grid cells one segment is listed in by [`SegGrid`]; a longer one is tried for every point.
+const GAP_GRID_SPAN: i64 = 1024;
+
+/// The farthest cell from the grid's origin, on each axis, that [`SegGrid`] numbers a point in.
+const GAP_GRID_LIMIT: f64 = 1_048_576.0;
+
+/// The segments of [`find_gaps`]' tracks by the cells of a square grid that their bounds cover.
+struct SegGrid {
+    origin: Point,
+    cell: f64,
+    /// (track, segment) by cell.
+    cells: HashMap<(i64, i64), Vec<(usize, usize)>>,
+    /// Segments whose bounds cover more than [`GAP_GRID_SPAN`] cells, near every point.
+    wide: Vec<(usize, usize)>,
+}
+
+impl SegGrid {
+    fn new(tracks: &[Track], origin: Point, cell: f64) -> Self {
+        let mut grid = Self { origin, cell, cells: HashMap::new(), wide: vec![] };
+        for (j, t) in tracks.iter().enumerate() {
+            for (k, s) in t.segs.iter().enumerate() {
+                let b = s.bounding_box();
+                let ((x0, y0), (x1, y1)) = (grid.cell_of(Point::new(b.x0, b.y0)), grid.cell_of(Point::new(b.x1, b.y1)));
+                if (x1 - x0 + 1).saturating_mul(y1 - y0 + 1) > GAP_GRID_SPAN {
+                    grid.wide.push((j, k));
+                    continue;
+                }
+                for x in x0..=x1 {
+                    for y in y0..=y1 {
+                        grid.cells.entry((x, y)).or_default().push((j, k));
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// The cell `p` is in, counted from the origin (at most [`GAP_GRID_LIMIT`] cells away on each
+    /// axis).
+    fn cell_of(&self, p: Point) -> (i64, i64) {
+        let at = |v: f64, o: f64| ((v - o) / self.cell).floor().clamp(-GAP_GRID_LIMIT, GAP_GRID_LIMIT) as i64;
+        (at(p.x, self.origin.x), at(p.y, self.origin.y))
+    }
+
+    /// The segments whose bounds come within `r` of `p` (and some farther ones), each once, in
+    /// track order.
+    fn near(&self, p: Point, r: f64) -> Vec<(usize, usize)> {
+        let mut out = self.wide.clone();
+        let ((x0, y0), (x1, y1)) = (self.cell_of(Point::new(p.x - r, p.y - r)), self.cell_of(Point::new(p.x + r, p.y + r)));
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                out.extend(self.cells.get(&(x, y)).into_iter().flatten());
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// The point a gap from the loose end `e` of track `own` (at `from` along it) closes to: the
+/// nearest point of any path within `max_gap` of it, leaving out points the paths already join to
+/// `e` along a way less than [`GAP_DETOUR`] times as long as the gap. None when there is no such
+/// point, or when `e` lies on a path (it is no loose end).
+fn gap_from(tracks: &[Track], grid: &SegGrid, own: usize, e: Point, from: f64, max_gap: f64, eps: f64) -> Option<Point> {
+    use kurbo::ParamCurveNearest;
+    let o = tracks.get(own)?;
+    let reach = GAP_DETOUR * max_gap;
+    let mut best: Option<(f64, Point)> = None;
+    // `around` holds the segments a way of up to `reach` from `e` can cross, and `crossed` the
+    // crossings with each track.
+    let mut around: Option<Vec<(usize, usize)>> = None;
+    let mut crossed: HashMap<usize, Vec<(f64, f64)>> = HashMap::new();
+    for (j, k) in grid.near(e, max_gap) {
+        let Some(q) = tracks.get(j) else { continue };
+        let Some(s) = q.segs.get(k) else { continue };
+        let b = s.bounding_box();
+        if e.x < b.x0 - max_gap || e.x > b.x1 + max_gap || e.y < b.y0 - max_gap || e.y > b.y1 + max_gap {
+            continue;
+        }
+        let near = s.nearest(e, 1e-9);
+        let d = near.distance_sq.sqrt();
+        if d > max_gap {
+            continue;
+        }
+        let at = q.pos(k, near.t);
+        let way = if j == own {
+            o.along(from, at)
+        } else {
+            let xs = crossed.entry(j).or_insert_with(|| {
+                let segs = around.get_or_insert_with(|| grid.near(e, reach + max_gap));
+                crossings(o, from, reach, q, segs.iter().filter(|c| c.0 == j).map(|c| c.1))
+            });
+            xs.iter().map(|&(a, b)| o.along(from, a) + q.along(b, at)).fold(f64::INFINITY, f64::min)
+        };
+        if d <= eps {
+            // On another path, or on its own away from the end: the end is joined there.
+            if j != own || way > 4.0 * eps.max(GAP_ARC_ACCURACY) {
+                return None;
+            }
+            // The end's own segment: a curve that comes back round can still pass near it.
+            for i in 0..=GAP_SAMPLES {
+                let t = f64::from(i) / f64::from(GAP_SAMPLES);
+                let p = s.eval(t);
+                let d = p.distance(e);
+                if d > eps && d <= max_gap && o.along(from, q.pos(k, t)) > GAP_DETOUR * d && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, p));
+                }
+            }
+            continue;
+        }
+        if way > GAP_DETOUR * d && best.is_none_or(|b| d < b.0) {
+            best = Some((d, s.eval(near.t)));
+        }
+    }
+    best.map(|b| b.1)
+}
+
+/// The gaps Live Paint's Gap Detection closes in `shapes`: from each loose end of an open subpath
+/// (an end that lies on no path) to the nearest point of any path, its own included, at most
+/// `max_gap` away, unless the paths already join the two along a way less than [`GAP_DETOUR`] times
+/// the gap's length. Each gap is a pair of points: the loose end, then where it closes to. A gap
+/// between two loose ends that close to each other is listed once.
+pub fn find_gaps(shapes: &[Shape], max_gap: f64) -> Vec<[Point; 2]> {
+    if !(max_gap.is_finite() && max_gap > 0.0) {
+        return vec![];
+    }
+    let tracks: Vec<Track> = shapes.iter().flat_map(|s| &s.path.subpaths).filter_map(Track::new).collect();
+    let eps = (max_gap * 1e-4).max(1e-6);
+    // The grid cells are as wide as the gap, or 1/4096 of the art where that is wider.
+    let bounds = tracks.iter().map(|t| t.bounds).reduce(|a, b| a.union(b)).unwrap_or_default();
+    let grid = SegGrid::new(&tracks, bounds.origin(), max_gap.max(bounds.width().max(bounds.height()) / 4096.0));
+    let mut gaps: Vec<[Point; 2]> = vec![];
+    // `by_end` lists the gaps by the cell of their loose end.
+    let mut by_end: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    for (i, o) in tracks.iter().enumerate() {
+        let (Some(first), Some(last)) = (o.segs.first(), o.segs.last()) else { continue };
+        // An open subpath that ends where it starts encloses its area already.
+        if o.closed || first.start().distance(last.end()) <= eps {
+            continue;
+        }
+        for (e, from) in [(first.start(), 0.0), (last.end(), o.len())] {
+            let Some(to) = gap_from(&tracks, &grid, i, e, from, max_gap, eps) else { continue };
+            let (cx, cy) = grid.cell_of(to);
+            let listed = (cx - 1..=cx + 1)
+                .flat_map(|x| (cy - 1..=cy + 1).map(move |y| (x, y)))
+                .filter_map(|c| by_end.get(&c))
+                .flatten()
+                .filter_map(|&g| gaps.get(g))
+                .any(|g| g[0].distance(to) <= eps && g[1].distance(e) <= eps);
+            if !listed {
+                by_end.entry(grid.cell_of(e)).or_default().push(gaps.len());
+                gaps.push([e, to]);
+            }
+        }
+    }
+    gaps
+}
+
 /// Most segments the Shape Builder sweeps into its planar map (open paths as edges, the gaps closed
-/// paths enclose, outline edges): the map costs far more than the filled areas' arrangement, so past
-/// this only the filled areas count.
-pub const SHAPE_BUILDER_MAX_SEGMENTS: usize = 4096;
+/// paths enclose, outline edges); past this only the filled areas count. The map costs about what
+/// the filled areas' arrangement does (both near linear in the input; the cap was 4096 while
+/// finding each edge's source scanned every segment, #937), so this only bounds the time a hover
+/// can take on art far past what a drawing holds.
+pub const SHAPE_BUILDER_MAX_SEGMENTS: usize = 65_536;
 
 /// The Shape Builder's arrangement: see [`shape_builder`].
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -340,12 +754,44 @@ pub fn has_open_path(shapes: &[Shape]) -> bool {
 /// [`SHAPE_BUILDER_MAX_SEGMENTS`] segments or a map that can't be built, only the filled areas
 /// count and there are no pieces.
 pub fn shape_builder(shapes: &[Shape], edges: bool) -> BuilderArrangement {
+    shape_builder_with_gap(shapes, edges, 0.0)
+}
+
+/// Most distance (document units) a Shape Builder gap may span.
+pub const SHAPE_BUILDER_MAX_GAP: f64 = 72.0;
+
+/// Original inputs and the shared detector's temporary, unfilled bridges. Keep the originals'
+/// order and keys so only their split pieces can be returned as art.
+pub(crate) fn gap_inputs(shapes: &[Shape], gap: f64) -> Vec<Shape> {
+    let mut closed = shapes.to_vec();
+    let segments: usize = shapes.iter().flat_map(|s| &s.path.subpaths).map(|sp| sp.segment_count()).sum();
+    if segments <= SHAPE_BUILDER_MAX_SEGMENTS && gap.is_finite() && gap > 0.0 && has_open_path(shapes) {
+        let gaps = find_gaps(shapes, gap.min(SHAPE_BUILDER_MAX_GAP));
+        if !gaps.is_empty() {
+            let path = PathData::new(gaps.iter().map(|g| SubPath::polyline(g, false)).collect());
+            closed.push(Shape::new(path, FillRule::NonZero, u64::MAX));
+        }
+    }
+    closed
+}
+
+/// [`shape_builder`] with Gap Detection: open paths whose ends come within `gap` (document units)
+/// of another path are bridged for the regions they bound, so a region left open by a small gap is
+/// found. A `gap` of 0 is [`shape_builder`]. The bridges are in no region's sources and in no piece
+/// of `lines` or `edges`.
+pub fn shape_builder_with_gap(shapes: &[Shape], edges: bool, gap: f64) -> BuilderArrangement {
     let has_open = has_open_path(shapes);
     let segments: usize = shapes.iter().flat_map(|s| &s.path.subpaths).map(|sp| sp.segment_count()).sum();
     let planar = (segments <= SHAPE_BUILDER_MAX_SEGMENTS)
         .then(|| {
             let keyed: Vec<Shape> = shapes.iter().enumerate().map(|(i, s)| Shape::new(s.path.clone(), s.rule, i as u64)).collect();
-            live_paint(&keyed)
+            if has_open && gap.is_finite() && gap > 0.0 {
+                let (faces, pieces) = live_paint(&gap_inputs(&keyed, gap));
+                // Gap targets split original outlines too, but the bridges themselves aren't art.
+                (faces, pieces.into_iter().filter(|p| p.key < shapes.len() as u64).collect())
+            } else {
+                live_paint(&keyed)
+            }
         })
         .filter(|(faces, pieces)| !faces.is_empty() || !pieces.is_empty());
     let Some((faces, pieces)) = planar else {
@@ -444,6 +890,69 @@ pub fn cut_out(path: &PathData, piece: &SubPath, fill_closes: bool, tol: f64) ->
     Some(PathData::new(subpaths))
 }
 
+/// The run of `piece` (a Shape Builder edge or line piece) around the point of it nearest `at`,
+/// from the nearest of `stops` before that point to the nearest after it, open. Stops are the
+/// points within `tol` of the piece, such as the anchors of the path it lies on; an open piece's
+/// own ends bound the run where no stop comes first. None when the piece has no segments, or when
+/// it is closed and fewer than two different stops lie on it (the run would be all of it).
+pub fn run_around(piece: &SubPath, stops: &[Point], at: Point, tol: f64) -> Option<SubPath> {
+    let n = piece.segment_count();
+    if n == 0 {
+        return None;
+    }
+    let len = n as f64;
+    let (u, _) = nearest_u(piece, at)?;
+    // The stops by x, so that each segment measures only the stops within its bounds.
+    let mut by_x: Vec<Point> = stops.iter().copied().filter(|s| s.x.is_finite() && s.y.is_finite()).collect();
+    by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
+    // The parameters of the stops within `tol` of segment `j` whose nearest point on the whole
+    // piece lies on it (a ring's segments repeat past either end, `len` apart).
+    let on = |j: isize| -> Vec<f64> {
+        use kurbo::ParamCurveNearest;
+        let seg = piece.segment(j.rem_euclid(n as isize) as usize);
+        let b = kurbo::Shape::bounding_box(&seg).inflate(tol, tol);
+        let near = by_x.get(by_x.partition_point(|s| s.x < b.x0)..).unwrap_or_default();
+        near.iter()
+            .take_while(|s| s.x <= b.x1)
+            .filter(|s| s.y >= b.y0 && s.y <= b.y1)
+            .filter_map(|s| {
+                let m = seg.nearest(*s, 1e-9);
+                let d = m.distance_sq.sqrt();
+                (d <= tol && nearest_u(piece, *s).is_some_and(|(_, nearest)| d <= nearest + 1e-9)).then_some(j as f64 + m.t)
+            })
+            .collect()
+    };
+    // From the segment under `at`, the walk goes back to the nearest stop at or before it and on
+    // to the nearest stop after it; an open piece's ends bound it.
+    let k0 = (u.floor().max(0.0) as isize).min(n as isize - 1);
+    let (first, last) = if piece.closed { (k0 - n as isize, k0 + n as isize) } else { (0, n as isize - 1) };
+    let lo = (first..=k0).rev().find_map(|j| on(j).into_iter().filter(|&x| x <= u).max_by(f64::total_cmp));
+    let lo = match lo {
+        Some(lo) => lo,
+        None if !piece.closed => 0.0,
+        None => return None,
+    };
+    let after = u.max(lo + 1e-9);
+    let hi = (k0..=last).find_map(|j| on(j).into_iter().filter(|&x| x > after).min_by(f64::total_cmp));
+    let hi = match hi {
+        Some(hi) => hi,
+        None if !piece.closed => len,
+        None => return None,
+    };
+    // On a ring, a lone stop would make the run all of it.
+    if piece.closed && hi - lo >= len - 1e-9 {
+        return None;
+    }
+    // A run that passes the ring's start begins before its end and is unrolled past it.
+    let (lo, hi) = if lo < 0.0 { (lo + len, hi + len) } else { (lo, hi) };
+    let run = span(piece, lo, hi)?;
+    // The run's ends go exactly on the stops they end at.
+    let stop_at =
+        |q: Point| stops.iter().copied().filter(|s| s.distance(q) <= tol).min_by(|a, b| a.distance(q).total_cmp(&b.distance(q))).unwrap_or(q);
+    let ends = [run.anchors.first()?.p, run.anchors.last()?.p].map(stop_at);
+    Some(snap_ends(run, ends, tol))
+}
+
 /// The point of `sp` nearest `p`, as a parameter `segment + t`, with its distance.
 fn nearest_u(sp: &SubPath, p: Point) -> Option<(f64, f64)> {
     use kurbo::ParamCurveNearest;
@@ -496,8 +1005,10 @@ pub(crate) struct Map {
     edges: Vec<Edge>,
     around: Vec<Vec<usize>>,
     slot_of: Vec<usize>,
-    /// Bounded faces: their cycle of half-edges, path and area.
+    /// Bounded faces: their cycle of half-edges, path and area; and, by their bounds, which can
+    /// hold a point, so finding the face around one tests only those.
     faces: Vec<(Vec<usize>, BezPath, f64)>,
+    face_index: RectIndex<usize>,
     /// Outer boundaries of connected pieces, and the face each one is a hole in.
     holes: Vec<(Vec<usize>, BezPath)>,
     face_holes: Vec<Vec<usize>>,
@@ -579,6 +1090,36 @@ pub(crate) fn map(shapes: &[Shape]) -> Option<Map> {
     }
     let close = |a: usize, b: usize| matches!((points.get(a), points.get(b)), (Some(p), Some(q)) if p.distance(*q) <= tol);
     let mut joined: Vec<usize> = (0..points.len()).collect();
+    // Where two passes of one path cross another (an open path's way there and back, coincident
+    // outlines), the sweep can also join its two cuts, a rounding error apart, with a stub of that
+    // length: a speck of a piece, and a vertex twice over. Such stubs are no edges: their ends are
+    // one vertex. The sweep moves points by a few `eps` at most up and down its frame; along a path
+    // that runs nearly level in it (where the height a cut is found at pins its position down
+    // least) a cut can slide further, here up to a small fraction of the precision results are
+    // tidied to, below which no edge is drawn anyway. A vertex's cluster stays within those bounds
+    // as a whole: a run of short, nearly level segments (a finely flattened or traced path) is real
+    // geometry, not one stub after another, and must not collapse into one vertex.
+    let (stub_y, stub_x) = (4.0 * eps, (DEFAULT_PRECISION / 16.0).max(4.0 * eps));
+    let mut extent: Vec<kurbo::Rect> = points.iter().map(|&p| kurbo::Rect::from_points(p, p)).collect();
+    for (segs, [v0, v1]) in &pieces {
+        let Some(&p0) = points.get(*v0) else { continue };
+        if !segs.iter().flat_map(|s| [s.c.p1, s.c.p2, s.c.p3]).all(|p| (p.y - p0.y).abs() <= stub_y && (p.x - p0.x).abs() <= stub_x) {
+            continue;
+        }
+        let (a, b) = (find(&mut joined, *v0), find(&mut joined, *v1));
+        let (Some(&ra), Some(&rb)) = (extent.get(a), extent.get(b)) else { continue };
+        let both = ra.union(rb);
+        if a == b || both.width() > stub_x || both.height() > stub_y {
+            continue;
+        }
+        let (root, child) = (a.min(b), a.max(b));
+        if let Some(p) = joined.get_mut(child) {
+            *p = root;
+        }
+        if let Some(r) = extent.get_mut(root) {
+            *r = both;
+        }
+    }
     for (k, (_, [a, b])) in pieces.iter().enumerate() {
         let Some(&Some(m)) = mids.get(k) else { continue };
         let (cx, cy) = cell_of(m);
@@ -652,7 +1193,7 @@ pub(crate) fn map(shapes: &[Shape]) -> Option<Map> {
     for (v, list) in around.iter_mut().enumerate() {
         let Some(&at) = points.get(v) else { continue };
         // Half the shortest chord of the edges here: every one of them gets that far from it.
-        let r = 0.5 * list.iter().filter_map(|&h| half_segs(&edges, h).last().map(|s| s.c.p3.distance(at))).fold(f64::INFINITY, f64::min);
+        let r = 0.5 * list.iter().filter_map(|&h| far_end(&edges, h).map(|p| p.distance(at))).fold(f64::INFINITY, f64::min);
         let mut keyed: Vec<(f64, usize)> = list.iter().map(|&h| (leaving_angle(&edges, h, at, r), h)).collect();
         keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
         *list = keyed.into_iter().map(|(_, h)| h).collect();
@@ -713,14 +1254,15 @@ pub(crate) fn map(shapes: &[Shape]) -> Option<Map> {
     }
 
     // Each hole goes in the smallest face of another piece around it.
+    let face_index = RectIndex::new(faces.iter().enumerate().map(|(i, (_, bp, _))| (bp.bounding_box(), i)).collect());
     let mut face_holes: Vec<Vec<usize>> = vec![Vec::new(); faces.len()];
     for (k, (cycle, _)) in holes.iter().enumerate() {
         let Some(p) = cycle.first().and_then(|&h| origin(&edges, h)).and_then(|v| points.get(v)).copied() else { continue };
         let own = piece_of(cycle);
-        let around_it = faces
-            .iter()
-            .enumerate()
-            .filter(|(_, (fc, bp, _))| piece_of(fc) != own && bp.bounding_box().contains(p) && bp.winding(p) != 0)
+        let around_it = face_index
+            .at(p, 0.0)
+            .filter_map(|&i| faces.get(i).map(|f| (i, f)))
+            .filter(|(_, (fc, bp, _))| piece_of(fc) != own && bp.winding(p) != 0)
             .min_by(|a, b| a.1.2.total_cmp(&b.1.2))
             .map(|(i, _)| i);
         if let Some(list) = around_it.and_then(|i| face_holes.get_mut(i)) {
@@ -732,7 +1274,7 @@ pub(crate) fn map(shapes: &[Shape]) -> Option<Map> {
     let snap = 2.0 * eps;
     let mut anchors: Vec<Point> = shapes.iter().flat_map(|s| s.path.subpaths.iter().flat_map(|sp| sp.anchors.iter().map(|a| a.p))).collect();
     anchors.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
-    Some(Map { edges, around, slot_of, faces, holes, face_holes, tidy, anchors, snap })
+    Some(Map { edges, around, slot_of, faces, face_index, holes, face_holes, tidy, anchors, snap })
 }
 
 impl Map {
@@ -755,10 +1297,10 @@ impl Map {
             let q = SHEAR * p;
             // The smallest face around it: faces of a piece inside a hole lie within the face around.
             let (i, _) = self
-                .faces
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, bp, _))| bp.bounding_box().contains(q) && bp.winding(q) != 0)
+                .face_index
+                .at(q, 0.0)
+                .filter_map(|&i| self.faces.get(i).map(|f| (i, f)))
+                .filter(|(_, (_, bp, _))| bp.winding(q) != 0)
                 .min_by(|a, b| a.1.2.total_cmp(&b.1.2))?;
             *picked.get_mut(i)? = true;
         }
@@ -959,6 +1501,101 @@ mod tests {
         // Each line is cut where the others cross it: 3 + 3 + 3 pieces.
         assert_eq!(edges.len(), 9);
         assert_eq!(edges.iter().filter(|e| e.key == 2).count(), 3);
+    }
+
+    fn open(points: &[(f64, f64)], key: u64) -> Shape {
+        let pts: Vec<Point> = points.iter().map(|&(x, y)| Point::new(x, y)).collect();
+        Shape::new(PathData::single(SubPath::polyline(&pts, false)), FillRule::NonZero, key)
+    }
+
+    #[test]
+    fn gap_detection_closes_a_square_drawn_with_a_gap() {
+        // One open path round a square, its end 2 pt short of its start.
+        let s = [open(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 2.0)], 0)];
+        assert!(live_paint(&s).0.is_empty(), "paint leaks through the gap");
+        let (faces, edges, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let g = gaps[0];
+        assert!(g[0].distance(Point::new(0.0, 0.0)) < 1e-9 && g[1].distance(Point::new(0.0, 2.0)) < 1e-6, "{g:?}");
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        assert!((area(&faces[0]) - 10000.0).abs() < 1e-6, "{}", area(&faces[0]));
+        assert_eq!(edges, live_paint(&s).1, "the gap adds no edge");
+        // A gap wider than the size stays open.
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 1.5);
+        assert!(faces.is_empty() && gaps.is_empty());
+    }
+
+    #[test]
+    fn gaps_close_to_curves_and_between_paths() {
+        // A line across a circle, each end 2 pt short of it: the circle splits in two.
+        let circle = Shape::new(shapes::ellipse(Rect::new(50.0, 0.0, 150.0, 100.0)), FillRule::NonZero, 0);
+        let s = [circle, line((52.0, 50.0), (148.0, 50.0), 1)];
+        assert_eq!(live_paint(&s).0.len(), 1);
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        for g in &gaps {
+            assert!((g[0].distance(g[1]) - 2.0).abs() < 1e-6, "{g:?}");
+        }
+        assert_eq!(faces.len(), 2, "{faces:?}");
+        assert_eq!(at(&faces, 100.0, 25.0).len(), 1);
+        assert_eq!(at(&faces, 100.0, 75.0).len(), 1);
+        // Four lines round a square whose corners miss by 1 pt: the gaps are listed once each.
+        let s = [
+            line((0.0, 0.0), (99.0, 0.0), 0),
+            line((100.0, 1.0), (100.0, 99.0), 1),
+            line((99.0, 100.0), (1.0, 100.0), 2),
+            line((0.0, 99.0), (0.0, 1.0), 3),
+        ];
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 4, "{gaps:?}");
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        // One curve that comes back round to 2 pt from its start.
+        let mut bp = BezPath::new();
+        bp.move_to((0.0, 0.0));
+        bp.curve_to((100.0, 0.0), (100.0, 100.0), (0.0, 2.0));
+        let s = [Shape::new(PathData::from_bezpath(&bp), FillRule::NonZero, 0)];
+        let (faces, _, gaps) = live_paint_with_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!((gaps[0][0].distance(gaps[0][1]) - 2.0).abs() < 1e-9, "{gaps:?}");
+        assert_eq!(faces.len(), 1, "{faces:?}");
+        // A line far longer than the gap, and many lines far from each other.
+        let mut s = vec![line((0.0, 0.0), (100000.0, 0.0), 0), line((50000.0, 2.0), (50000.0, 100.0), 1)];
+        s.extend((0..2000).map(|k| {
+            let (x, y) = (f64::from(k % 50) * 40.0, 1000.0 + f64::from(k / 50) * 40.0);
+            line((x, y), (x + 10.0, y), 2)
+        }));
+        let gaps = find_gaps(&s, 3.0);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0][0].distance(Point::new(50000.0, 2.0)) < 1e-9 && gaps[0][1].distance(Point::new(50000.0, 0.0)) < 1e-9, "{gaps:?}");
+        // Paths far from the origin: one gap between two loose ends, listed once.
+        let s = [line((1e20, 0.0), (1e20, 100.0), 0), line((1e20, 102.0), (1e20, 200.0), 1)];
+        assert_eq!(find_gaps(&s, 3.0).len(), 1, "{:?}", find_gaps(&s, 3.0));
+    }
+
+    #[test]
+    fn overshoots_and_joined_ends_are_no_gaps() {
+        // Ends that cross a line just before they stop, square to it and at 30 degrees.
+        let t = 30f64.to_radians();
+        let s = [
+            line((-10.0, 0.0), (110.0, 0.0), 0),
+            line((20.0, 100.0), (20.0, -1.0), 1),
+            line((80.0 + 100.0 * t.cos(), 100.0 * t.sin()), (80.0 - t.cos(), -t.sin()), 2),
+        ];
+        assert!(find_gaps(&s, 3.0).is_empty(), "{:?}", find_gaps(&s, 3.0));
+        // An end on another path, or on its own, is joined there.
+        let s = [line((0.0, 0.0), (100.0, 0.0), 0), line((50.0, 0.0), (50.0, 100.0), 1)];
+        assert!(find_gaps(&s, 3.0).is_empty(), "{:?}", find_gaps(&s, 3.0));
+        // Another path 2 pt away does not make a gap from the joined end.
+        let s = [line((0.0, 0.0), (100.0, 0.0), 0), line((50.0, 0.0), (50.0, 100.0), 1), line((40.0, -2.0), (60.0, -2.0), 2)];
+        let gaps = find_gaps(&s, 3.0);
+        assert!(!gaps.is_empty() && gaps.iter().all(|g| g[0].distance(Point::new(50.0, 0.0)) > 1e-9), "{gaps:?}");
+        let six = [open(&[(0.0, 0.0), (0.0, 100.0), (50.0, 100.0), (50.0, 50.0), (0.0, 50.0)], 0)];
+        assert!(find_gaps(&six, 3.0).is_empty(), "{:?}", find_gaps(&six, 3.0));
+        // Sizes that are not a length find nothing.
+        let square = [open(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0), (0.0, 2.0)], 0)];
+        for size in [0.0, -3.0, f64::NAN, f64::INFINITY] {
+            assert!(find_gaps(&square, size).is_empty(), "{size}");
+        }
     }
 
     #[test]
@@ -1175,6 +1812,78 @@ mod tests {
     }
 
     #[test]
+    fn shape_builder_merges_adjacent_gap_closed_faces_without_keeping_bridges() {
+        let outline = Shape::new(
+            PathData::single(SubPath::polyline(
+                &[Point::new(0.0, 4.0), Point::new(0.0, 100.0), Point::new(100.0, 100.0), Point::new(100.0, 0.0), Point::new(0.0, 0.0)],
+                false,
+            )),
+            FillRule::NonZero,
+            0,
+        );
+        let shapes = [outline, line((50.0, 0.0), (50.0, 100.0), 1)];
+        let arr = shape_builder_with_gap(&shapes, true, 6.0);
+        assert_eq!(arr.regions.len(), 2);
+        let faces: Vec<_> = arr.regions.iter().collect();
+        let merged = crate::FaceMerger::with_gap(&shapes, 6.0).merge(&faces);
+        assert!((crate::area(&merged, FillRule::NonZero).abs() - 10000.0).abs() < 1e-6);
+        assert_eq!(merged.subpaths.len(), 1, "the shared edge disappears");
+        assert!(arr.lines.iter().chain(&arr.edges).all(|p| p.key < 2), "bridges are not art");
+        // A request over 72 pt cannot close a gap of 80 pt.
+        let large = [Shape::new(
+            PathData::single(SubPath::polyline(
+                &[Point::new(0.0, 80.0), Point::new(0.0, 200.0), Point::new(200.0, 200.0), Point::new(200.0, 0.0), Point::new(0.0, 0.0)],
+                false,
+            )),
+            FillRule::NonZero,
+            0,
+        )];
+        assert!(shape_builder_with_gap(&large, false, 1000.0).regions.is_empty());
+    }
+
+    #[test]
+    fn shape_builder_gap_detection_closes_small_gaps() {
+        // Three sides of a 100 x 100 square, the fourth open by 4: no region without Gap Detection.
+        let open = |gap: f64| {
+            let pts = [(0.0, gap), (0.0, 100.0), (100.0, 100.0), (100.0, 0.0), (0.0, 0.0)];
+            let pts: Vec<Point> = pts.iter().map(|&(x, y)| Point::new(x, y)).collect();
+            vec![Shape::new(PathData::single(SubPath::polyline(&pts, false)), FillRule::NonZero, 0)]
+        };
+        let s = open(4.0);
+        assert!(shape_builder(&s, false).regions.is_empty());
+        assert!(shape_builder_with_gap(&s, false, 3.0).regions.is_empty(), "a gap longer than the length stays open");
+        let arr = shape_builder_with_gap(&s, true, 6.0);
+        assert_eq!(arr.regions.len(), 1);
+        assert!((area(&arr.regions[0]) - 10000.0).abs() < 1e-6);
+        // The bridge is no art: the path comes back as it was, in its own pieces only.
+        assert!(arr.lines.iter().chain(&arr.edges).all(|p| p.key == 0));
+        let len: f64 = arr.lines.iter().map(|p| p.path.to_bezpath().perimeter(1e-6)).sum();
+        assert!((len - 396.0).abs() < 1e-6, "{len}");
+        // Two paths whose ends miss each other: a U and a lid 3 above it.
+        let u = Shape::new(
+            PathData::single(SubPath::polyline(
+                &[Point::new(0.0, 0.0), Point::new(0.0, 100.0), Point::new(100.0, 100.0), Point::new(100.0, 0.0)],
+                false,
+            )),
+            FillRule::NonZero,
+            0,
+        );
+        let s = [u, line((0.0, -3.0), (100.0, -3.0), 1)];
+        assert!(shape_builder_with_gap(&s, false, 2.0).regions.is_empty());
+        let arr = shape_builder_with_gap(&s, false, 3.5);
+        assert_eq!(arr.regions.len(), 1);
+        assert!((area(&arr.regions[0]) - 10300.0).abs() < 1e-6);
+        // An end close to the side of another path bridges to the nearest point on it.
+        let s = [rect(0.0, 0.0, 100.0, 100.0, 0), line((50.0, 140.0), (50.0, 104.0), 1)];
+        assert_eq!(shape_builder_with_gap(&s, false, 5.0).regions.len(), 1, "nothing is enclosed, nothing breaks");
+        // Bad gaps are no gap.
+        let s = open(4.0);
+        for gap in [f64::NAN, f64::INFINITY, -3.0] {
+            assert!(shape_builder_with_gap(&s, false, gap).regions.is_empty());
+        }
+    }
+
+    #[test]
     fn shape_builder_closed_only_or_degenerate_is_the_filled_arrangement() {
         let s = [rect(0.0, 0.0, 100.0, 100.0, 0), rect(50.0, 0.0, 150.0, 100.0, 1)];
         assert_eq!(shape_builder(&s, false), BuilderArrangement { regions: crate::regions(&s), ..Default::default() });
@@ -1261,12 +1970,217 @@ mod tests {
         assert!(shape_builder(&s, false).lines.is_empty());
     }
 
+    #[test]
+    fn a_traced_outline_of_many_segments_is_cut_by_lines() {
+        // #937: art traced to thousands of segments was past the old cap (4096), so lines stopped
+        // cutting it and the Shape Builder offered the whole shapes. A blob of 20 000 segments
+        // crossed by two long lines (far wider than any of its segments: the index of the
+        // outlines keeps those apart) splits into four regions, each line in four pieces.
+        let n = 20_000;
+        let blob: Vec<Point> = (0..n)
+            .map(|k| {
+                let t = k as f64 / n as f64 * std::f64::consts::TAU;
+                let r = 100.0 + 5.0 * (t * 37.0).sin();
+                Point::new(r * t.cos(), r * t.sin())
+            })
+            .collect();
+        let s = [
+            Shape::new(PathData::single(SubPath::polyline(&blob, true)), FillRule::NonZero, 0),
+            line((-150.0, 0.0), (150.0, 3.0), 1),
+            line((0.0, -150.0), (3.0, 150.0), 2),
+        ];
+        let BuilderArrangement { regions, lines, .. } = shape_builder(&s, false);
+        assert_eq!(regions.len(), 4, "{}", regions.len());
+        assert!(regions.iter().all(|r| r.sources == [0]));
+        let whole = crate::area(&s[0].path, FillRule::NonZero);
+        assert!((regions.iter().map(area).sum::<f64>() - whole).abs() < 1e-6 * whole);
+        assert_eq!(lines.iter().filter(|l| l.key == 1).count(), 4, "cut twice by the blob and once by the other line");
+        assert_eq!(lines.iter().filter(|l| l.key == 2).count(), 4);
+    }
+
+    #[test]
+    fn a_hatch_of_parallel_lines_is_cut_line_by_line() {
+        // Hundreds of long horizontal lines over a square, all alike in x (the weak axis of an index
+        // by x alone), and one vertical line: every strip is cut in two.
+        let n: u32 = 300;
+        let mut s = vec![rect(0.0, 0.0, 100.0, 100.0, 0)];
+        for k in 1..n {
+            let y = 100.0 * f64::from(k) / f64::from(n);
+            s.push(line((-10.0, y), (110.0, y), u64::from(k)));
+        }
+        s.push(line((50.0, -10.0), (50.0, 110.0), u64::from(n)));
+        let BuilderArrangement { regions, lines, .. } = shape_builder(&s, false);
+        assert_eq!(regions.len(), 2 * n as usize, "{}", regions.len());
+        assert!(regions.iter().all(|r| r.sources == [0]));
+        assert!((regions.iter().map(area).sum::<f64>() - 10000.0).abs() < 1e-6);
+        // Each horizontal line: a loose end outside, two pieces inside, a loose end outside.
+        assert_eq!(lines.iter().filter(|l| l.key == 1).count(), 4);
+        // The vertical line: cut by the square's sides and every hatch line.
+        assert_eq!(lines.iter().filter(|l| l.key == u64::from(n)).count(), n as usize + 2);
+    }
+
+    #[test]
+    fn rect_index_finds_every_rectangle_holding_a_point() {
+        // Narrow in x, narrow in y only, and wide both ways: each lookup matches a scan of them all.
+        let mut items = vec![(kurbo::Rect::new(0.0, 0.0, 100.0, 100.0), 0usize)];
+        for k in 1..50 {
+            let a = f64::from(k as u32) * 2.0;
+            items.push((kurbo::Rect::new(a, 0.0, a + 1.0, 100.0), k));
+            items.push((kurbo::Rect::new(0.0, a, 100.0, a + 1.0), 100 + k));
+        }
+        items.push((kurbo::Rect::new(f64::NAN, 0.0, 1.0, 1.0), 999));
+        let index = RectIndex::new(items.clone());
+        for p in [Point::new(4.5, 6.5), Point::new(50.0, 50.0), Point::new(-1.0, 3.0), Point::new(99.5, 0.5)] {
+            let mut got: Vec<usize> = index.at(p, 0.1).copied().collect();
+            got.sort_unstable();
+            let mut want: Vec<usize> = items.iter().filter(|(r, _)| r.inflate(0.1, 0.1).contains(p)).map(|(_, k)| *k).collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "{p:?}");
+        }
+        assert_eq!(RectIndex::<usize>::new(Vec::new()).at(Point::ZERO, 1.0).count(), 0);
+    }
+
+    #[test]
+    fn rect_index_reads_a_diagonal_hatch_only_near_the_point() {
+        // 2,000 parallel diagonals a tenth of a point apart: the bounds of every line left of a
+        // point hold it, so an index of the bounds alone handed half the hatch to each lookup
+        // (quadratic in the hatch, #937). Filed by pieces, a lookup gets the lines of its
+        // neighbourhood (a few cells' worth), among them every line through the point.
+        let n = 2000;
+        let items: Vec<_> = (0..n)
+            .map(|k| {
+                let d = f64::from(k) * 0.1;
+                let s = PathSeg::Line(kurbo::Line::new((d, 0.0), (d + 200.0, 200.0)));
+                (s.bounding_box(), (s, k))
+            })
+            .collect();
+        let index = RectIndex::with_footprint(items.clone(), |r, (s, _), cell| segment_footprint(r, s, cell));
+        for p in [Point::new(100.0, 100.0), Point::new(130.25, 60.0), Point::new(250.0, 150.0), Point::new(399.9, 200.0)] {
+            let got: Vec<u32> = index.at(p, 0.1).map(|(_, k)| *k).collect();
+            assert!(got.len() <= n as usize / 4, "{p:?}: {} candidates", got.len());
+            let through: Vec<u32> =
+                items.iter().filter(|(_, (s, _))| kurbo::ParamCurveNearest::nearest(s, p, 1e-9).distance_sq <= 0.01).map(|(_, (_, k))| *k).collect();
+            assert!(!through.is_empty() && through.iter().all(|k| got.contains(k)), "{p:?}: {through:?} vs {got:?}");
+        }
+        // Faces a hatch cuts a square into: thin stripes across the whole grid, each filed under
+        // its own column of cells, so a lookup reads a few of them, not the hatch.
+        let stripes: Vec<_> = (0..n).map(|k| (kurbo::Rect::new(f64::from(k) * 0.1, 0.0, f64::from(k) * 0.1 + 0.1, 200.0), k)).collect();
+        let index = RectIndex::new(stripes);
+        let got: Vec<u32> = index.at(Point::new(100.05, 50.0), 0.0).copied().collect();
+        assert_eq!(got, [1000]);
+        assert!(index.rest.is_empty());
+        // A footprint still finds a point on the item but off the grid's cells' edges, and a
+        // degenerate grid (collinear items) is divided along its length.
+        let line = PathSeg::Line(kurbo::Line::new((0.0, 0.0), (1000.0, 0.0)));
+        let items: Vec<_> = (0..10).map(|k| (line.bounding_box(), (line, k))).collect();
+        let index = RectIndex::with_footprint(items, |r, (s, _), cell| segment_footprint(r, s, cell));
+        assert_eq!(index.at(Point::new(333.3, 0.0), 0.1).count(), 10);
+        assert_eq!(index.at(Point::new(1000.0, 0.0), 0.1).count(), 10);
+        assert_eq!(index.at(Point::new(-5.0, 0.0), 0.1).count(), 0);
+    }
+
     fn poly(pts: &[(f64, f64)], closed: bool) -> SubPath {
         SubPath::polyline(&pts.iter().map(|&(x, y)| Point::new(x, y)).collect::<Vec<_>>(), closed)
     }
 
     fn ends(sp: &SubPath) -> (Point, Point) {
         (sp.anchors[0].p, sp.anchors[sp.anchors.len() - 1].p)
+    }
+
+    /// Each piece cuts out of the input it is keyed by, losing just its own length (what erasing
+    /// it does), and none is a speck.
+    fn assert_pieces_cut_out(shapes: &[Shape], arr: &BuilderArrangement) {
+        for e in arr.edges.iter().chain(&arr.lines) {
+            let len = e.path.length();
+            assert!(len > 1e-3, "a speck of a piece, keyed {}: {:?}", e.key, e.path);
+            let s = &shapes[e.key as usize];
+            let cut = cut_out(&s.path, &e.path.subpaths[0], false, 0.05).unwrap_or_else(|| panic!("{:?} not on input {}", e.path, e.key));
+            let lost = s.path.length() - cut.length();
+            assert!((lost - len).abs() <= 1e-6 * s.path.length(), "input {} lost {lost} for a piece {len} long", e.key);
+        }
+    }
+
+    #[test]
+    fn a_line_crossed_where_its_two_passes_part_is_cut_once() {
+        // The shrunk case of `pieces_cut_out_of_their_inputs`: the sweep cut the first line's way
+        // there and its way back by the third line a rounding error (1.2e-6) apart, joined by a
+        // stub. The line came back as a speck keyed by the third line and a piece running from
+        // the crossing out to (10, 70) and back to the other cut, which erasing took twice over.
+        let s = [line((10.0, 70.0), (80.0, 20.0), 0), line((10.0, 40.0), (70.0, 90.0), 0), line((20.0, 80.0), (20.0, 50.0), 0)];
+        let arr = shape_builder(&s, true);
+        assert_pieces_cut_out(&s, &arr);
+        // The first line cut by both others, the other two once each.
+        let count = |k: u64| arr.lines.iter().filter(|l| l.key == k).count();
+        assert_eq!((count(0), count(1), count(2)), (3, 2, 2), "{:?}", arr.lines);
+        let at = Point::new(20.0, 70.0 - 50.0 / 7.0);
+        for k in [0, 2] {
+            assert!(arr.lines.iter().filter(|l| l.key == k).all(|l| {
+                let (a, b) = ends(&l.path.subpaths[0]);
+                a.distance(b) > 1.0 && l.path.subpaths[0].anchors.len() == 2
+            }));
+            assert_eq!(
+                arr.lines
+                    .iter()
+                    .filter(|l| l.key == k && [ends(&l.path.subpaths[0]).0, ends(&l.path.subpaths[0]).1].iter().any(|p| p.distance(at) < 1e-9))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_tiny_level_segments_is_not_contracted_as_stubs() {
+        // 2000 segments of 1e-4 (0.2 pt in all), nearly level: each one alone is as short as a
+        // stub the sweep leaves between two cuts, but chained they are real geometry, and the
+        // stub contraction must not pull them into one vertex.
+        let pts: Vec<Point> = (0..=2000).map(|k| Point::new(f64::from(k) * 1e-4, f64::from(k) * 1e-8)).collect();
+        let run = Shape::new(PathData::single(SubPath::polyline(&pts, false)), FillRule::NonZero, 0);
+        let whole = run.path.length();
+        let s = [run, line((0.1003, -1.0), (0.1003, 1.0), 0)];
+        let arr = shape_builder(&s, false);
+        let pieces: Vec<&Shape> = arr.lines.iter().filter(|l| l.key == 0).collect();
+        assert_eq!(pieces.len(), 2, "cut once by the line: {}", pieces.len());
+        let total: f64 = pieces.iter().map(|l| l.path.length()).sum();
+        // Where the line crosses, one segment may be taken for a stub (it is as short as one),
+        // moving the cut by less than a stub's reach; the rest of the run stays.
+        assert!((total - whole).abs() <= DEFAULT_PRECISION / 16.0, "{total} of {whole}");
+        for l in &pieces {
+            let (a, b) = ends(&l.path.subpaths[0]);
+            assert!(a.distance(b) > 0.09, "a piece collapsed: {a:?} {b:?}");
+        }
+        assert_eq!(arr.lines.iter().filter(|l| l.key == 1).count(), 2);
+    }
+
+    #[test]
+    fn a_dense_hatch_at_exact_binary_steps_cuts_each_line_once_per_crossing() {
+        // Lines every 0.25 or 0.5 pt (exact in binary) cut a crossing line or a circle where two
+        // passes of each line met it a rounding error apart, adding a speck and a piece there.
+        let hatch = |n: i32, step: f64, f: &dyn Fn(f64) -> Shape| -> Vec<Shape> { (1..=n).map(|k| f(step * f64::from(k))).collect() };
+        // Horizontal lines across a diagonal: each in two pieces, the diagonal in n + 1.
+        let mut s = vec![line((-3.0, -2.0), (33.0, 31.0), 0)];
+        s.extend(hatch(119, 0.25, &|y| line((-5.0, y), (35.0, y), 0)));
+        let arr = shape_builder(&s, false);
+        assert_pieces_cut_out(&s, &arr);
+        assert_eq!(arr.lines.iter().filter(|l| l.key == 0).count(), 120);
+        assert!((1..=119).all(|k| arr.lines.iter().filter(|l| l.key == k).count() == 2));
+        assert_eq!(arr.lines.len(), 120 + 2 * 119);
+        // Sloping lines across a 45° one.
+        let mut s = vec![line((-3.0, -3.0), (33.0, 33.0), 0)];
+        s.extend(hatch(59, 0.5, &|v| line((v - 40.0, -5.0), (v + 40.0, 35.0), 0)));
+        let arr = shape_builder(&s, false);
+        assert_pieces_cut_out(&s, &arr);
+        assert_eq!(arr.lines.len(), 60 + 2 * 59, "{}", arr.lines.len());
+        // Vertical lines across a circle: n + 1 strips, each line in three pieces, the circle's
+        // outline in two per line.
+        let mut s = vec![Shape::new(shapes::ellipse(Rect::new(0.0, 0.0, 30.0, 30.0)), FillRule::NonZero, 0)];
+        s.extend(hatch(119, 0.25, &|x| line((x, -5.0), (x, 35.0), 0)));
+        let arr = shape_builder(&s, true);
+        assert_pieces_cut_out(&s, &arr);
+        assert_eq!(arr.regions.len(), 120);
+        assert!(arr.regions.iter().all(|r| r.sources == [0]));
+        assert!((1..=119).all(|k| arr.lines.iter().filter(|l| l.key == k).count() == 3));
+        assert_eq!(arr.lines.len(), 3 * 119);
+        assert_eq!(arr.edges.len(), 2 * 119);
     }
 
     #[test]
@@ -1320,6 +2234,60 @@ mod tests {
         assert_eq!(cut.subpaths.len(), 2);
         assert!(cut.subpaths.iter().all(|sp| !sp.closed));
         assert!((cut.length() - 160.0).abs() < 1e-6, "{}", cut.length());
+    }
+
+    #[test]
+    fn run_around_stops_at_the_stops_either_side() {
+        // A lone square's edge is its whole outline; with its corners as stops, a point by any side
+        // gives that side.
+        let lone = shape_builder(&[rect(0.0, 0.0, 100.0, 100.0, 0)], true);
+        let edge = &lone.edges[0].path.subpaths[0];
+        let corners = [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)].map(Point::from);
+        let side = |at: (f64, f64)| {
+            run_around(edge, &corners, Point::from(at), 1e-3)
+                .map(|sp| (sp.closed, PathData::single(sp.clone()).length(), PathData::single(sp).bounds()))
+        };
+        assert_eq!(side((50.0, 1.0)), Some((false, 100.0, Some(Rect::new(0.0, 0.0, 100.0, 0.0)))));
+        for at in [(0.5, 50.0), (99.0, 50.0), (50.0, 100.0)] {
+            let (closed, length, _) = side(at).expect("a side");
+            assert!(!closed && (length - 100.0).abs() < 1e-6, "{at:?}: {length}");
+        }
+        // Without two stops on it, the run would be all of the outline.
+        assert_eq!(run_around(edge, &corners[..1], Point::new(50.0, 0.0), 1e-3), None);
+        // An open piece's run ends at the piece's own ends where no stop comes first; (40, 5) lies
+        // off the line and does not stop the run.
+        let line = poly(&[(0.0, 0.0), (100.0, 0.0)], false);
+        let run = run_around(&line, &[Point::new(40.0, 0.0), Point::new(40.0, 5.0)], Point::new(70.0, 0.0), 1e-3).unwrap();
+        assert_eq!(ends(&run), (Point::new(40.0, 0.0), Point::new(100.0, 0.0)));
+        let run = run_around(&line, &[Point::new(40.0, 0.0)], Point::new(10.0, 0.0), 1e-3).unwrap();
+        assert_eq!(ends(&run), (Point::new(0.0, 0.0), Point::new(40.0, 0.0)));
+        // A stop counts only where it is nearest the piece: the folded line's last anchor lies
+        // 0.02 from its first side and does not stop the run there.
+        let folded = poly(&[(0.0, 0.0), (100.0, 0.0), (50.0, 0.02)], false);
+        let stops = folded.anchors.iter().map(|a| a.p).collect::<Vec<_>>();
+        let run = run_around(&folded, &stops, Point::new(25.0, 0.0), 0.05).unwrap();
+        assert_eq!(ends(&run), (Point::new(0.0, 0.0), Point::new(100.0, 0.0)));
+    }
+
+    #[test]
+    fn run_around_a_ring_of_4000_sides_measures_only_the_stops_it_reaches() {
+        // Every anchor of the ring is a stop, so each run is one side. Measuring every stop along
+        // the whole ring would take 16 million nearest-point searches a call.
+        let n = 4000;
+        let pts: Vec<(f64, f64)> = (0..n)
+            .map(|k| {
+                let a = k as f64 * std::f64::consts::TAU / n as f64;
+                (500.0 * a.cos(), 500.0 * a.sin())
+            })
+            .collect();
+        let ring = poly(&pts, true);
+        let stops: Vec<Point> = ring.anchors.iter().map(|a| a.p).collect();
+        let start = std::time::Instant::now();
+        for k in (0..n).step_by(200) {
+            let run = run_around(&ring, &stops, ring.segment(k).eval(0.5), 1e-3).expect("a side");
+            assert_eq!(ends(&run), (stops[k], stops[(k + 1) % n]), "side {k}");
+        }
+        assert!(start.elapsed().as_secs_f64() < 5.0, "20 runs took {:?}", start.elapsed());
     }
 
     /// Proptest shrank a failure of `pieces_cut_out_of_their_inputs` to this input with linesweeper

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use vectorcraft_color::gradient::{
     MIN_STOPS, duplicate_stop, insert_stop, midpoint_from_pos, midpoint_pos, move_stop, remove_stop, set_midpoint, swap_stop_colors,
 };
-use vectorcraft_color::{Color, Freeform, FreeformMode, Gradient, GradientKind, GradientPaint, GradientStop, Paint};
+use vectorcraft_color::{Color, Freeform, FreeformMode, Gradient, GradientKind, GradientMethod, GradientPaint, GradientStop, Paint};
 use vectorcraft_doc::{NodeId, StrokeGradientMode};
 
 use super::{active_paint, live_run, pstate, set_pstate};
@@ -80,6 +80,24 @@ pub(crate) fn dropped_link(app: &VectorcraftApp, params: &Value) -> Option<(Stri
     let (base, own) = d.swatch_link(name)?;
     let tint = params.get("tint").and_then(Value::as_f64).map_or(own, |t| (t / 100.0).clamp(0.0, 1.0) as f32);
     Some((base, tint))
+}
+
+/// Recolor the selected stop of the gradient behind the active proxy with `c`, as dropping the
+/// paint of `params` on the stop does (fully opaque, linked by [`dropped_link`]), or the selected
+/// point of a freeform gradient; the stop or point stays selected and keeps the color's model.
+/// Returns false, and changes nothing, when the active paint is not a gradient or no stop or point
+/// is selected.
+pub(crate) fn recolor_selected(app: &mut VectorcraftApp, c: Color, params: &Value) -> bool {
+    let Paint::Gradient(g) = active_paint(app) else { return false };
+    if g.gradient.kind == GradientKind::Freeform {
+        let Some(i) = app.session.selected_freeform_point().filter(|i| *i < shown_points(&g).points.len()) else { return false };
+        edit_point(app, "paint.freeform.setPoint", json!({ "index": i, "color": super::color_json(&c), "keepModel": true }));
+        return true;
+    }
+    let Some(i) = app.session.selected_stop().filter(|i| *i < g.gradient.stops.len()) else { return false };
+    let (v, i) = drop_color(&g.gradient, Some(i), 0.0, c, dropped_link(app, params));
+    set_stops_keeping_models(app, &v, Some(i), Live::Released);
+    true
 }
 
 /// The stops after dragging stop `i` of `origin` to `offset`: moved, or with `copy` (Alt) a copy
@@ -150,7 +168,19 @@ fn edit(app: &mut VectorcraftApp, params: Value, phase: Live) {
 /// Write `stops` to the gradient behind the active proxy (live while dragging) and, once
 /// released, select stop `select` (the panel, the stop popover and the Color panel share this).
 pub(crate) fn set_stops(app: &mut VectorcraftApp, stops: &[GradientStop], select: Option<usize>, phase: Live) {
-    edit(app, json!({ "stops": stops_json(stops) }), phase);
+    write_stops(app, json!({ "stops": stops_json(stops) }), select, phase);
+}
+
+/// [`set_stops`] with `keepModel`, for colors copied from existing paint (a swatch, a dropped
+/// color, a sample of the gradient) and for the Color panel's sliders, which work in the model
+/// picked there: the stops keep the color models given, in a CMYK document too.
+pub(crate) fn set_stops_keeping_models(app: &mut VectorcraftApp, stops: &[GradientStop], select: Option<usize>, phase: Live) {
+    write_stops(app, json!({ "stops": stops_json(stops), "keepModel": true }), select, phase);
+}
+
+/// Edit the stops with `params` (live while dragging) and, once released, select stop `select`.
+fn write_stops(app: &mut VectorcraftApp, params: Value, select: Option<usize>, phase: Live) {
+    edit(app, params, phase);
     if phase == Live::Released
         && let Some(i) = select
         && app.session.selected_stop() != Some(i)
@@ -159,20 +189,20 @@ pub(crate) fn set_stops(app: &mut VectorcraftApp, stops: &[GradientStop], select
     }
 }
 
-/// Save the gradient as a swatch.
+/// Save the gradient as a swatch; its stops keep their color models.
 fn save_to_swatches(app: &mut VectorcraftApp, g: &GradientPaint) {
-    app.run("swatch.new", super::paint_params(&Paint::Gradient(Box::new(g.clone())))).ok();
+    app.run("swatch.new", super::swatch_paint_params(&Paint::Gradient(Box::new(g.clone())))).ok();
 }
 
 /// The document's gradient swatches (groups included): name and gradient.
-fn gradient_swatches(app: &VectorcraftApp) -> Vec<(String, Gradient)> {
+fn gradient_swatches(app: &VectorcraftApp) -> Vec<(String, GradientPaint)> {
     let Some(st) = app.session.active() else { return vec![] };
     let d = &st.doc;
     d.swatches
         .iter()
         .chain(d.swatch_groups.iter().flat_map(|g| g.swatches.iter()))
         .filter_map(|s| match &s.paint {
-            Paint::Gradient(g) => Some((s.name.clone(), g.gradient.clone())),
+            Paint::Gradient(g) => Some((s.name.clone(), (**g).clone())),
             _ => None,
         })
         .collect()
@@ -257,6 +287,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         freeform_section(app, ui, &g);
         return;
     }
+    method_row(app, ui, &g, is_grad);
     // The proxy beside the angle and aspect ratio fields.
     ui.horizontal(|ui| {
         super::proxy(app, ui, 36.0);
@@ -292,9 +323,34 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     ramp(app, ui, &g.gradient, is_grad);
     ui.add_space(4.0);
     stop_fields(app, ui, &g.gradient, is_grad);
+    // Dither applies to gradient fills only: off and dimmed behind the Stroke proxy.
+    ui.add_space(4.0);
+    let fill = app.session.fill_active;
+    let dither = is_grad && fill && g.gradient.dither;
+    if widgets::check_tip(ui, tl!("Dither"), dither, is_grad && fill, tl!("Fine noise hides banding in the gradient fill")) {
+        edit(app, json!({"dither": !dither}), Live::Released);
+    }
     if !is_grad {
         widgets::dim_label(ui, tl!("Click the ramp or a type button to apply a gradient."));
     }
+}
+
+/// The Method row (Illustrator 30): how a linear or radial gradient mixes the colours between its
+/// stops, Classic or Perceptual.
+fn method_row(app: &mut VectorcraftApp, ui: &mut Ui, g: &GradientPaint, is_grad: bool) {
+    let methods = [(GradientMethod::Classic, tl!("Classic")), (GradientMethod::Perceptual, tl!("Perceptual"))];
+    let current = g.gradient.method;
+    let shown = methods.iter().find(|(m, _)| *m == current).map_or("", |(_, l)| *l);
+    ui.horizontal(|ui| {
+        widgets::dim_label(ui, tl!("Method:"));
+        let labels = methods.map(|(_, l)| l);
+        let chosen = ui.add_enabled_ui(is_grad, |ui| widgets::dropdown_names(ui, "grad-method", shown, &labels, 104.0)).inner;
+        if let Some((m, _)) = chosen.and_then(|i| methods.get(i))
+            && *m != current
+        {
+            edit(app, json!({"method": m.label().to_lowercase()}), Live::Released);
+        }
+    });
 }
 
 /// The freeform points shown: the gradient's own, else (unplaced) as many as it places, coloured
@@ -370,7 +426,7 @@ fn freeform_section(app: &mut VectorcraftApp, ui: &mut Ui, g: &GradientPaint) {
 fn thumbnail(app: &mut VectorcraftApp, ui: &mut Ui, g: &GradientPaint, is_grad: bool) {
     let t = Tokens::get(ui.ctx());
     let (r, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click_and_drag());
-    widgets::gradient_chip(ui, r, &g.gradient);
+    widgets::gradient_chip(ui, r, g);
     ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t.border), StrokeKind::Inside);
     let resp = resp.on_hover_text(tl!("Gradient Fill: click to apply, drag onto art"));
     if resp.clicked() && !is_grad {
@@ -679,7 +735,9 @@ fn ramp(app: &mut VectorcraftApp, ui: &mut Ui, g: &Gradient, is_grad: bool) {
         set_pstate(ui.ctx(), MID_SELECTED, None::<(usize, Option<NodeId>)>);
     }
     match changed {
-        Some((v, phase)) => set_stops(app, &v, select, phase),
+        // Stops added, moved or dropped on the ramp carry colors the gradient or a swatch has, or
+        // sample the gradient: they keep their models.
+        Some((v, phase)) => set_stops_keeping_models(app, &v, select, phase),
         None => {
             if let Some(i) = select.filter(|i| sel != Some(*i)) {
                 select_stop(app, Some(i));
@@ -737,6 +795,43 @@ mod tests {
         assert_eq!((v.len(), i, v[1].color, v[1].opacity), (2, 1, red, 1.0));
         let (v, i) = drop_color(&g, None, 0.3, red, None);
         assert_eq!((v.len(), i, v[1].color, v[1].offset, v[1].opacity), (3, 1, red, 0.3, 1.0));
+    }
+
+    /// In a CMYK document an RGB swatch's color applied to the selected stop or freeform point
+    /// keeps its model, as the swatch applied to a fill does.
+    #[test]
+    fn a_swatch_color_on_a_stop_or_a_point_keeps_its_model_in_a_cmyk_document() {
+        let stops = json!([{"offset": 0, "color": {"c": 0, "m": 0, "y": 0, "k": 0}}, {"offset": 1, "color": {"c": 0, "m": 0, "y": 0, "k": 1}}]);
+        let mut app = app(json!({"gradient": {"stops": stops}}));
+        app.run("file.documentColorMode", json!({"mode": "cmyk"})).unwrap();
+        let orange = Color::rgb8(255, 128, 0);
+        app.run("swatch.new", json!({"name": "Screen", "color": "#ff8000", "keepModel": true})).unwrap();
+        app.run("gradient.selectStop", json!({"index": 1})).unwrap();
+        assert!(recolor_selected(&mut app, orange, &json!({"swatch": "Screen"})));
+        let Paint::Gradient(g) = active_paint(&app) else { panic!("a gradient fill") };
+        assert_eq!(g.gradient.stops[1].color, orange);
+        app.run("paint.editGradient", json!({"kind": "freeform"})).unwrap();
+        app.run("paint.freeform.selectPoint", json!({"index": 1})).unwrap();
+        assert!(recolor_selected(&mut app, orange, &json!({"swatch": "Screen"})));
+        let Paint::Gradient(g) = active_paint(&app) else { panic!("a gradient fill") };
+        assert_eq!(g.freeform.map(|f| f.points[1].color), Some(orange));
+    }
+
+    /// In a CMYK document Add to Swatches and Save to Swatches keep the gradient's RGB stops RGB.
+    #[test]
+    fn a_gradient_saved_as_a_swatch_keeps_its_stops_models_in_a_cmyk_document() {
+        let mut app = app(json!({"color": "#000000"}));
+        app.run("file.documentColorMode", json!({"mode": "cmyk"})).unwrap();
+        let stops = json!([{"offset": 0, "color": "#ff8000"}, {"offset": 1, "color": {"c": 0, "m": 0, "y": 0, "k": 1}}]);
+        app.run("paint.setFill", json!({"gradient": {"stops": stops}, "keepModel": true})).unwrap();
+        let g = current(&app).expect("a gradient fill");
+        let colors = |g: &GradientPaint| g.gradient.stops.iter().map(|s| s.color).collect::<Vec<_>>();
+        assert_eq!(colors(&g), [Color::rgb8(255, 128, 0), Color::cmyk(0.0, 0.0, 0.0, 1.0)]);
+        save_to_swatches(&mut app, &g);
+        let Some(Paint::Gradient(saved)) = app.session.doc().unwrap().doc.swatches.last().map(|w| w.paint.clone()) else {
+            panic!("a gradient swatch")
+        };
+        assert_eq!(colors(&saved), colors(&g));
     }
 
     #[test]
@@ -900,6 +995,49 @@ mod tests {
     }
 
     #[test]
+    fn the_dither_box_dithers_the_gradient_fill_and_is_off_for_strokes() {
+        let mut app = app(json!({"gradient": {}}));
+        app.run("paint.setStroke", json!({"gradient": {}, "focus": false})).unwrap();
+        let mut p = Panel::new();
+        let texts = p.frame(&mut app, vec![], Modifiers::NONE);
+        let at = texts.iter().find(|(t, _)| t == "Dither").expect("the Dither box").1;
+        p.click(&mut app, at);
+        assert!(fill(&app).gradient.dither, "the fill's gradient is dithered");
+        p.click(&mut app, at);
+        assert!(!fill(&app).gradient.dither, "a second click clears it");
+        app.run("edit.undo", json!({})).unwrap();
+        assert!(fill(&app).gradient.dither, "one undo step per click");
+        // Behind the Stroke proxy the box is dimmed and does nothing.
+        let stroke = p.widget("stroke-proxy");
+        p.click(&mut app, stroke.right_bottom() - vec2(2.0, 2.0));
+        assert!(!app.session.fill_active);
+        let undo = app.session.doc().unwrap().history.undo.len();
+        p.click(&mut app, at);
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo, "no edit on the stroke");
+        let Paint::Gradient(st) = app.session.shown_stroke().unwrap().paint.clone() else { panic!("a gradient stroke") };
+        assert!(!st.gradient.dither);
+    }
+
+    #[test]
+    fn the_method_menu_makes_the_gradient_perceptual() {
+        let mut app = app(json!({"gradient": {}}));
+        let mut p = Panel::new();
+        let texts = p.frame(&mut app, vec![], Modifiers::NONE);
+        assert!(texts.iter().any(|(t, _)| t == "Method:"), "{texts:?}");
+        let shown = texts.iter().find(|(t, _)| t == "Classic").expect("Classic shown").1;
+        let undo = app.session.doc().unwrap().history.undo.len();
+        let texts = p.click(&mut app, shown);
+        let option = texts.iter().find(|(t, _)| t == "Perceptual").expect("the menu lists Perceptual").1;
+        p.click(&mut app, option);
+        assert_eq!(fill(&app).gradient.method, GradientMethod::Perceptual);
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+        let texts = p.frame(&mut app, vec![], Modifiers::NONE);
+        assert!(texts.iter().any(|(t, _)| t == "Perceptual"), "the menu shows the method: {texts:?}");
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(fill(&app).gradient.method, GradientMethod::Classic);
+    }
+
+    #[test]
     fn a_selected_diamond_shows_and_sets_its_midpoint_in_location() {
         let stops = json!([{"offset": 0, "color": "#ffffff", "midpoint": 0.3}, {"offset": 1, "color": "#000000"}]);
         let mut app = app(json!({"gradient": {"stops": stops}}));
@@ -992,7 +1130,7 @@ mod tests {
         // A spot swatch tile dropped on a stop links it: editing the swatch recolours the stop.
         app.run("swatch.new", json!({"name": "Ink", "color": "#cc0066", "spot": true})).unwrap();
         let ink = app.session.doc().unwrap().doc.swatch("Ink").unwrap().paint.clone();
-        egui::DragAndDrop::set_payload(&p.ctx, PanelDrag::Paint { paint: ink, params: json!({"swatch": "Ink"}), rows: None });
+        egui::DragAndDrop::set_payload(&p.ctx, PanelDrag::Paint { paint: ink, params: json!({"swatch": "Ink"}), rows: None, library: None });
         p.frame(&mut app, vec![Event::PointerMoved(a)], Modifiers::NONE);
         p.frame(
             &mut app,
@@ -1003,6 +1141,27 @@ mod tests {
         assert_eq!((st.swatch.as_deref(), st.tint, st.color.to_hex()), (Some("Ink"), 1.0, "#cc0066".to_string()));
         app.run("swatch.edit", json!({"name": "Ink", "color": "#0066cc"})).unwrap();
         assert_eq!(hexes(&app)[0], "#0066cc");
+    }
+
+    /// In a CMYK document a color dropped on the ramp of an RGB gradient keeps its model, as the
+    /// gradient's other stops do.
+    #[test]
+    fn a_color_dropped_on_the_ramp_keeps_its_model_in_a_cmyk_document() {
+        let mut app = app(json!({"gradient": {}}));
+        app.run("file.documentColorMode", json!({"mode": "cmyk"})).unwrap();
+        let rgb = json!([{"offset": 0, "color": "#ffffff"}, {"offset": 1, "color": "#000000"}]);
+        app.run("paint.setFill", json!({"gradient": {"stops": rgb}, "keepModel": true})).unwrap();
+        let mut p = Panel::new();
+        p.frame(&mut app, vec![], Modifiers::NONE);
+        let (a, b) = (p.widget(("grad-stop", 0)).center(), p.widget(("grad-stop", 1)).center());
+        let at = pos2((a.x + b.x) / 2.0, a.y - 20.0);
+        let red = Color::rgb(1.0, 0.0, 0.0);
+        egui::DragAndDrop::set_payload(&p.ctx, PanelDrag::paint(Paint::solid(red)));
+        p.frame(&mut app, vec![Event::PointerMoved(at)], Modifiers::NONE);
+        let up = Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE };
+        p.frame(&mut app, vec![up], Modifiers::NONE);
+        let stops: Vec<Color> = fill(&app).gradient.stops.iter().map(|s| s.color).collect();
+        assert_eq!(stops, [Color::WHITE, red, Color::BLACK]);
     }
 
     #[test]
@@ -1029,6 +1188,6 @@ mod tests {
         let texts = Panel::new().frame(&mut app, vec![], Modifiers::NONE);
         assert!(texts.iter().any(|(t, _)| t == "#FFFFFF"), "the stop's colour row: {texts:?}");
         stop_eyedropper(&mut app);
-        assert_eq!((app.session.tool_id(), app.session.tool_options()), ("eyedropper", json!({"stop": "gradient"})));
+        assert_eq!((app.session.tool_id(), app.session.tool_options()), ("eyedropper", json!({"stop": "gradient", "brushKeyColor": false})));
     }
 }

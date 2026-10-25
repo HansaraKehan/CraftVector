@@ -23,6 +23,10 @@ fn scale_effect_scales_distances_only() {
     scale_effect(&mut e, 2.0);
     assert_eq!((&e.params["x"], &e.params["y"], &e.params["blur"]), (&json!(6.0), &json!(8.0), &json!(10.0)));
     assert_eq!(e.params["opacity"], json!(75.0));
+    // Rasterize's Add Around Object is a distance; its resolution isn't.
+    let mut r = new_effect(RASTERIZE, &json!({"addAround": 10, "resolution": 150})).unwrap();
+    scale_effect(&mut r, 2.0);
+    assert_eq!((&r.params["addAround"], &r.params["resolution"]), (&json!(20.0), &json!(150)));
     // Outline Stroke without a weight follows its stroke's: nothing to scale.
     let mut o = Effect { id: "path.outlineStroke".into(), params: json!(null), visible: true };
     scale_effect(&mut o, 2.0);

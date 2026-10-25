@@ -107,6 +107,31 @@ fn mesh_commands_edit_mesh_envelopes() {
     assert_eq!(mesh(&s, e).0, 2);
 }
 
+/// `object.envelope.setMeshPoint` refuses an `index` that is negative or not a whole number, and
+/// Make and Reset with Mesh refuse `rows`, `cols` or `columns` that are not whole numbers; the
+/// envelope stays as it was, and 4.0 names point 4.
+#[test]
+fn mesh_envelopes_refuse_an_index_or_count_that_is_not_a_whole_number() {
+    let mut s = session();
+    let (_, e) = enveloped(&mut s, "object.envelope.makeWithMesh", json!({"rows": 2, "cols": 2}));
+    let before = node(&s, e);
+    for (index, why) in [(json!(4.5), "`index` must be a whole number"), (json!(-1), "index must be ≥ 0"), (json!(-0.5), "index must be ≥ 0")] {
+        let r = s.execute("object.envelope.setMeshPoint", &json!({"id": e.0, "index": index, "x": 0, "y": 0}));
+        assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if msg == why), "{index}: {r:?}");
+    }
+    for (key, p) in [("rows", json!({"rows": 2.5})), ("cols", json!({"cols": 1.5})), ("columns", json!({"columns": 3.25}))] {
+        let r = s.execute("object.envelope.resetWithMesh", &p);
+        assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if *msg == format!("`{key}` must be a whole number")), "{p}: {r:?}");
+    }
+    assert_eq!(node(&s, e), before, "nothing changed");
+    let b = id_of(&s.execute("shape.rectangle", &json!({"x": 400, "y": 100, "width": 100, "height": 100})).unwrap());
+    s.execute("select.set", &json!({"ids": [b.0]})).unwrap();
+    assert!(s.execute("object.envelope.makeWithMesh", &json!({"rows": 2, "cols": 2.5})).is_err());
+    assert!(matches!(node(&s, b).kind, NodeKind::Path { .. }), "not enveloped");
+    s.execute("object.envelope.setMeshPoint", &json!({"id": e.0, "index": 4.0, "x": 210, "y": 130})).unwrap();
+    assert_eq!(mesh(&s, e).2[4], Point::new(210.0, 130.0));
+}
+
 #[test]
 fn mesh_handles_turn_with_the_envelope_and_round_trip() {
     let mut s = session();

@@ -1,10 +1,11 @@
-//! Object → Expand: what to expand (Object: live shapes, type and effects; Fill: gradient fills;
+//! Object → Expand: what to expand (Object: live shapes, type and effects; Fill: gradient and pattern fills;
 //! Stroke: strokes into filled outlines) and what gradient fills become (a gradient mesh, or a
 //! number of objects). Options the selection has nothing for are disabled. OK runs
 //! `object.expand` as one undo step.
 //!
 //! Fields: `object`, `fill`, `stroke`, `gradient` (`objects` | `mesh`), `steps` (1..1000), and
-//! `__object`, `__fill`, `__stroke` (that option has something to expand: `object.expand.info`).
+//! `__object`, `__fill`, `__stroke` (that option has something to expand: `object.expand.info`) and
+//! `__gradient` (Fill has a gradient fill to expand).
 
 use serde_json::{Value, json};
 use vectorcraft_engine::cmd::expand::{DEFAULT_STEPS, MAX_STEPS};
@@ -30,6 +31,7 @@ pub fn open(app: &mut VectorcraftApp) -> Result<Value, String> {
     for (key, _) in OPTIONS {
         fields[format!("__{key}")] = info[key].clone();
     }
+    fields["__gradient"] = info["gradient"].clone();
     app.ui.dialog = Some(Dialog::new(KIND, fields));
     Ok(Value::Null)
 }
@@ -50,8 +52,7 @@ fn body(_: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
     }
     ui.add_space(10.0);
     widgets::subheader(ui, tl!("Expand Gradient To"));
-    // Only gradient fills that Fill expands care.
-    let enabled = d.bool("__fill") && d.bool("fill");
+    let enabled = gradient_to_enabled(d);
     let objects = d.str("gradient") != "mesh";
     ui.horizontal(|ui| {
         ui.add_space(12.0);
@@ -72,6 +73,11 @@ fn body(_: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
         });
     });
     false
+}
+
+/// Does Expand Gradient To apply? Only gradient fills that Fill expands care.
+fn gradient_to_enabled(d: &Dialog) -> bool {
+    d.bool("__gradient") && d.bool("fill")
 }
 
 /// `object.expand` parameters from the fields.
@@ -125,6 +131,26 @@ mod tests {
         let g = st.doc.node(st.selection.objects[0]).unwrap();
         let NodeKind::Group { children, clip: true } = &g.kind else { panic!("a clip group: {:?}", g.kind) };
         assert!(matches!(children[1].kind, NodeKind::Mesh(_)));
+    }
+
+    #[test]
+    fn expand_gradient_to_is_disabled_for_a_pattern_fill_alone() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 200})).unwrap();
+        let dot = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap()["id"].clone();
+        app.run("object.pattern.make", json!({"ids": [dot], "name": "Dots", "width": 20, "height": 20, "edit": false})).unwrap();
+        app.run("shape.rectangle", json!({"x": 20, "y": 20, "width": 100, "height": 60})).unwrap();
+        app.run("paint.setFill", json!({"swatch": "Dots"})).unwrap();
+        app.run("ui.expandDialog", json!({})).unwrap();
+        let d = app.ui.dialog.as_ref().unwrap();
+        assert!(d.bool("__fill"), "Fill expands the pattern fill");
+        assert!(!gradient_to_enabled(d), "no gradient fill for Expand Gradient To");
+        frame(&mut app);
+        // A gradient fill enables it.
+        app.ui.dialog = None;
+        app.run("paint.setFill", json!({"gradient": {"kind": "linear"}})).unwrap();
+        app.run("ui.expandDialog", json!({})).unwrap();
+        assert!(gradient_to_enabled(app.ui.dialog.as_ref().unwrap()));
     }
 
     #[test]

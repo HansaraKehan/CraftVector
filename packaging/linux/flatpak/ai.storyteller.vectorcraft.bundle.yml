@@ -24,6 +24,10 @@ finish-args:
   - --socket=fallback-x11
   # GPU access for the wgpu renderer (Vulkan, or GL as a fallback).
   - --device=dri
+  # Cursor theme: without the cursor-shape protocol (e.g. GNOME 46) winit loads the theme itself.
+  # The sandbox sets no XCURSOR_PATH and ships no cursor themes, so the pointer would turn invisible
+  # over the window. The host's themes are mounted under /run/host (#2450).
+  - --env=XCURSOR_PATH=/run/host/user-share/icons:/run/host/share/icons
   # Open/Save dialogs use the file-chooser portal (rfd), and drag-and-drop uses the document
   # portal, so broad filesystem access isn't needed. Pictures is granted for opening files by
   # path from the command line.

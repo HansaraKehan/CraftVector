@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use vectorcraft_color::{Color, Gradient, GradientKind, GradientPaint, GradientStop, Paint};
 use vectorcraft_doc::pattern::{PatternDef, pattern_paint};
 use vectorcraft_doc::text::{CharStyle, TextObject};
-use vectorcraft_doc::{Appearance, AppearanceItem, Effect, FillLayer, ImageBlob, ImageObject, Node, NodeKind, Symbol};
+use vectorcraft_doc::{Appearance, AppearanceItem, Effect, FillLayer, ImageBlob, ImageObject, Node, NodeKind, StrokeLayer, Symbol};
 use vectorcraft_geom::{Point, shapes};
 
 use super::*;
@@ -285,6 +285,7 @@ fn image_doc(effects: Vec<Effect>) -> Document {
             xf: Affine::translate((20.0, 20.0)),
             link: None,
             placement: Default::default(),
+            pixels: None,
         })),
     );
     n.appearance.effects = effects;
@@ -370,7 +371,7 @@ fn type_drawn_through_its_outlines_keeps_its_stroke_weight_when_scaled() {
 #[test]
 fn type_drawn_through_its_outlines_keeps_its_gradients_in_place() {
     let stops = vec![GradientStop::new(0.0, Color::rgb(1.0, 0.0, 0.0)), GradientStop::new(1.0, Color::rgb(0.0, 0.0, 1.0))];
-    let mut g = GradientPaint::new(Gradient { kind: GradientKind::Linear, stops });
+    let mut g = GradientPaint::new(Gradient::new(GradientKind::Linear, stops));
     g.angle = 90.0;
     let ramp = Paint::Gradient(Box::new(g));
     // On the characters, the gradient fits the layout box in text space and turns with the type.
@@ -387,7 +388,7 @@ fn type_drawn_through_its_outlines_keeps_its_gradients_in_place() {
 /// that runs left to right (0°) or bottom to top (90°).
 fn gradient_text_doc(angle: f64) -> Document {
     let stops = vec![GradientStop::new(0.0, Color::rgb(1.0, 0.0, 0.0)), GradientStop::new(1.0, Color::rgb(0.0, 0.0, 1.0))];
-    let mut g = GradientPaint::new(Gradient { kind: GradientKind::Linear, stops });
+    let mut g = GradientPaint::new(Gradient::new(GradientKind::Linear, stops));
     g.angle = angle;
     styled_text_doc(CharStyle { size: 40.0, fill: Paint::Gradient(Box::new(g)), ..Default::default() }, Affine::IDENTITY)
 }
@@ -443,7 +444,7 @@ fn a_transform_effect_that_scales_type_out_of_proportion_scales_its_radial_and_d
     let mut changed = vec![];
     // A radial gradient turns into an ellipse, and a linear one at 45° turns its isolines.
     for (kind, angle) in [(GradientKind::Radial, 0.0), (GradientKind::Linear, 45.0)] {
-        let mut g = GradientPaint::new(Gradient { kind, stops: stops.clone() });
+        let mut g = GradientPaint::new(Gradient::new(kind, stops.clone()));
         g.angle = angle;
         let d = styled_text_doc(CharStyle { size: 40.0, fill: Paint::Gradient(Box::new(g)), ..Default::default() }, Affine::IDENTITY);
         let id = d.layers[0].children().unwrap()[0].id;
@@ -593,7 +594,7 @@ fn geometry_effects_reshape_type_through_its_outlines() {
     assert!(changed > 100, "{changed} pixels changed");
     // The reshaped art is plain paths painted with the text's fill.
     let n = &d.layers[0].children().unwrap()[0];
-    let art = vectorcraft_effects::reshape(n, None).unwrap();
+    let art = vectorcraft_effects::reshape(None, n, None).unwrap();
     let (mut text, mut black) = (0, 0);
     art.walk(&mut |m| {
         text += usize::from(matches!(m.kind, NodeKind::Text(_)));
@@ -616,7 +617,7 @@ fn outline_object_draws_type_as_its_outlines_and_leaves_its_look() {
     // The type is drawn through its outlines: plain paths painted with the text's fill.
     let d = text_doc(vec![fx("path.outlineObject", json!({}))]);
     let n = &d.layers[0].children().unwrap()[0];
-    let art = vectorcraft_effects::reshape(n, None).unwrap();
+    let art = vectorcraft_effects::reshape(None, n, None).unwrap();
     let (mut text, mut black) = (0, 0);
     art.walk(&mut |m| {
         text += usize::from(matches!(m.kind, NodeKind::Text(_)));
@@ -649,7 +650,7 @@ fn outline_object_leaves_paths_and_images_as_they_are() {
     assert!(changed.iter().all(|&n| n < 10), "pixels changed: {changed:?}");
     // The image is drawn through its frame, as under any geometry effect.
     let d = image_doc(vec![fx("path.outlineObject", json!({}))]);
-    assert!(vectorcraft_effects::reshape(&d.layers[0].children().unwrap()[0], None).is_some());
+    assert!(vectorcraft_effects::reshape(None, &d.layers[0].children().unwrap()[0], None).is_some());
 }
 
 #[test]
@@ -679,6 +680,65 @@ fn a_rectangle_on_a_fill_below_type_with_outline_object_fits_the_glyphs() {
     assert_eq!(lum(img.pixel(x, glyphs.y1 as u32 + 12)), WHITE);
 }
 
+/// [`image_doc`] with a black 4 pt stroke of its own that carries the effects `row`, below the
+/// image when `below`.
+fn stroked_image_doc(row: Vec<Effect>, below: bool) -> Document {
+    let mut d = image_doc(vec![]);
+    let id = d.layers[0].children().unwrap()[0].id;
+    let mut stroke = StrokeLayer::new(Paint::solid(Color::BLACK), 4.0);
+    stroke.effects = row;
+    let ap = &mut d.node_mut(id).unwrap().appearance;
+    ap.items.push(AppearanceItem::Stroke(stroke));
+    ap.set_contents_at(usize::from(below));
+    d
+}
+
+#[test]
+fn an_images_stroke_draws_only_the_shape_convert_to_shape_or_outline_object_gives_it() {
+    // The image's frame runs from 20 to 50. Without an effect the stroke draws nothing.
+    for below in [false, true] {
+        let img = render(&stroked_image_doc(vec![], below));
+        assert_eq!((lum(img.pixel(18, 35)), img.pixel(21, 35)), (WHITE, [255, 0, 0, 255]));
+    }
+    let rectangle = fx("convertToShape.rectangle", json!({"relative": true, "extraW": 0, "extraH": 0}));
+    let outline = fx("path.outlineObject", json!({}));
+    for effect in [rectangle, outline] {
+        // Below the image only the stroke's outer half shows, above it both halves.
+        let img = render(&stroked_image_doc(vec![effect.clone()], true));
+        assert_eq!((lum(img.pixel(17, 35)), lum(img.pixel(18, 35)), img.pixel(21, 35)), (WHITE, 0, [255, 0, 0, 255]), "{}", effect.id);
+        let img = render(&stroked_image_doc(vec![effect.clone()], false));
+        assert_eq!((lum(img.pixel(18, 35)), lum(img.pixel(21, 35)), img.pixel(23, 35)), (0, 0, [255, 0, 0, 255]), "{}", effect.id);
+        // An effect before it is left out.
+        let first = fx("path.offsetPath", json!({"offset": 10}));
+        let img = render(&stroked_image_doc(vec![first, effect.clone()], true));
+        assert_eq!((lum(img.pixel(10, 35)), lum(img.pixel(18, 35))), (WHITE, 0), "{}", effect.id);
+    }
+    // An Offset Path of 2 pt after Outline Object moves the stroke 2 pt out.
+    let img = render(&stroked_image_doc(vec![fx("path.outlineObject", json!({})), fx("path.offsetPath", json!({"offset": 2}))], true));
+    assert_eq!((lum(img.pixel(15, 35)), lum(img.pixel(16, 35)), lum(img.pixel(19, 35))), (WHITE, 0, 0));
+}
+
+#[test]
+fn an_images_stroke_is_drawn_when_only_it_is_in_view() {
+    // The stroke runs 8 pt outside the frame, from 10 to 14; the view shows x 15 and less.
+    let row = vec![fx("path.outlineObject", json!({})), fx("path.offsetPath", json!({"offset": 8}))];
+    let d = stroked_image_doc(row, true);
+    let opts = RenderOptions { background: Some([255, 255, 255, 255]), ..Default::default() };
+    let img = Renderer::new().render(&d, 100, 100, Affine::translate((85.0, 0.0)), &opts);
+    assert_eq!((lum(img.pixel(96, 35)), lum(img.pixel(99, 35))), (0, WHITE));
+}
+
+#[test]
+fn rasterize_on_an_image_takes_in_its_strokes_shape() {
+    // The stroke runs 8 pt outside the frame, from 10 to 14; Rasterize at 72 ppi keeps it.
+    let row = vec![fx("path.outlineObject", json!({})), fx("path.offsetPath", json!({"offset": 8}))];
+    let mut d = stroked_image_doc(row, true);
+    let id = d.layers[0].children().unwrap()[0].id;
+    d.node_mut(id).unwrap().appearance.effects.push(fx("rasterize", json!({"useDocumentResolution": false, "resolution": 72})));
+    let img = render(&d);
+    assert_eq!((lum(img.pixel(8, 35)), lum(img.pixel(12, 35)), img.pixel(35, 35)), (WHITE, 0, [255, 0, 0, 255]));
+}
+
 #[test]
 fn a_strokes_own_glow_paints_around_that_stroke_only() {
     let mut d = Document::new(100.0, 100.0);
@@ -696,4 +756,25 @@ fn a_strokes_own_glow_paints_around_that_stroke_only() {
     let mt = render_threads(&d, 3);
     let worst = img.pixels.iter().zip(&mt.pixels).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
     assert!(worst <= 4, "max channel difference {worst}");
+}
+
+#[test]
+fn a_path_with_its_own_transform_paints_each_copy_with_its_own_gradient() {
+    use vectorcraft_color::GradientGeom;
+    let stops = vec![GradientStop::new(0.0, Color::rgb(1.0, 0.0, 0.0)), GradientStop::new(1.0, Color::rgb(0.0, 0.0, 1.0))];
+    let ramp = GradientPaint::new(Gradient::new(GradientKind::Linear, stops));
+    let geom = GradientGeom { start: Point::new(0.0, 50.0), end: Point::new(20.0, 50.0), aspect: 1.0, focal: None };
+    // Fitted to the box on each render, and placed on the object.
+    for paint in [ramp.clone(), GradientPaint { geom: Some(geom), ..ramp }] {
+        let square = shapes::rectangle(vectorcraft_geom::Rect::new(0.0, 40.0, 20.0, 60.0));
+        let mut n = Node::path(NodeId(0), square, Appearance::basic(Paint::Gradient(Box::new(paint)), Paint::None, 0.0));
+        n.appearance.effects = vec![fx("distort.transform", json!({"moveH": 40, "copies": 1}))];
+        let img = render(&doc_with(Document::new(100.0, 100.0), n));
+        let at = |x: usize| img.pixels.chunks(4).nth(50 * 100 + x).map(|p| (p[0], p[2])).unwrap_or_default();
+        // The left edge of each copy is red, its right edge blue.
+        for (left, right) in [(1, 18), (41, 58)] {
+            assert!(at(left).0 > 200 && at(left).1 < 60, "{:?} at {left}", at(left));
+            assert!(at(right).1 > 200 && at(right).0 < 60, "{:?} at {right}", at(right));
+        }
+    }
 }

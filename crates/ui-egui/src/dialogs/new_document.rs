@@ -117,16 +117,33 @@ fn sync(app: &VectorcraftApp, d: &mut Dialog) {
 
 /// Create the document; the dialog stays open when that fails (bad size, …).
 fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
-    let mut p: Map<String, Value> = PARAMS.iter().filter_map(|k| Some((k.to_string(), d.fields.get(*k)?.clone()))).collect();
-    // Recent entries such as "Custom" aren't presets file.new knows.
-    if newdoc::find(&app.session, &d.str("preset")).is_none() {
-        p.remove("preset");
-    }
+    let p = params(app, d);
     let r = app.run("file.new", Value::Object(p));
     if r.is_ok() {
         app.ui.dialog = None;
     }
     r
+}
+
+/// New Without Dialog (`file.newWithoutDialog`, Cmd+Alt+N): create the document [`open`] would
+/// offer, as its Create would, without showing the dialog. A dialog already open stays open.
+pub fn create_without_dialog(app: &mut VectorcraftApp) -> Result<Value, String> {
+    let shown = app.ui.dialog.take();
+    open(app);
+    let offered = app.ui.dialog.take();
+    app.ui.dialog = shown;
+    let p = offered.map(|d| params(app, &d)).unwrap_or_default();
+    app.run("file.new", Value::Object(p))
+}
+
+/// The `file.new` params of the fields.
+fn params(app: &VectorcraftApp, d: &Dialog) -> Map<String, Value> {
+    let mut p: Map<String, Value> = PARAMS.iter().filter_map(|k| Some((k.to_string(), d.fields.get(*k)?.clone()))).collect();
+    // Recent entries such as "Custom" aren't presets file.new knows.
+    if newdoc::find(&app.session, &d.str("preset")).is_none() {
+        p.remove("preset");
+    }
+    p
 }
 
 /// The units the size fields show.
@@ -241,10 +258,12 @@ fn presets(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             let (w, h, preset, units) = (d.f64("width", 0.0), d.f64("height", 0.0), d.str("preset"), unit(d));
             for s in &list {
-                // The cards show the chosen orientation (square sizes have none) and the units chosen
-                // in Preset Details; choosing one keeps both.
+                // The built-in presets' cards show the chosen orientation (square sizes have none)
+                // and the units chosen in Preset Details; choosing one keeps both. Recent and Saved
+                // show each entry as it was made, so a portrait and a landscape A3 are two cards
+                // (#2860).
                 let mut s = DocSettings { units, ..s.clone() };
-                if (w > h && s.height > s.width) || (h > w && s.width > s.height) {
+                if cat > 1 && ((w > h && s.height > s.width) || (h > w && s.width > s.height)) {
                     std::mem::swap(&mut s.width, &mut s.height);
                 }
                 let selected = d.fields.contains_key(APPLIED) && s.name == preset && s.width == w && s.height == h;
@@ -634,6 +653,56 @@ mod tests {
 
     fn field(app: &VectorcraftApp, k: &str) -> serde_json::Value {
         app.ui.dialog.as_ref().unwrap().fields.get(k).cloned().unwrap_or_default()
+    }
+
+    /// Recent shows each entry as it was made: a portrait and a landscape A3 are two cards of
+    /// their own orientations, and only the chosen one is selected (#2860).
+    #[test]
+    fn recent_cards_keep_the_orientation_they_were_made_in() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        let a3 = vectorcraft_engine::cmd::newdoc::find(&app.session, "A3").unwrap();
+        let landscape = vectorcraft_engine::cmd::newdoc::DocSettings { width: a3.height, height: a3.width, ..a3.clone() };
+        app.session.prefs.recent_new_docs = vec![landscape, a3];
+        app.run("file.newDialog", json!({})).unwrap();
+        assert_eq!(field(&app, "category"), json!("Recent"));
+        // Frames half a second apart on one context: the first lays the dialog out, and its fade
+        // in is over by the last.
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut time = 0.0;
+        let mut run = |app: &mut VectorcraftApp| {
+            time += 0.5;
+            let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1000.0)));
+            let raw = egui::RawInput { screen_rect, time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| crate::dialogs::show(app, ui.ctx()));
+            out.textures_delta.clear();
+            out
+        };
+        run(&mut app);
+        run(&mut app);
+        let out = run(&mut app);
+        fn walk(s: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            match s {
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                s => out.push(s.clone()),
+            }
+        }
+        let mut shapes = vec![];
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut shapes));
+        // The page thumbnails (white, 60 on their long side) and the selected card's outline.
+        let thumbs: Vec<egui::Vec2> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) if r.fill == egui::Color32::WHITE && (r.rect.width().max(r.rect.height()) - 60.0).abs() < 0.01 => {
+                    Some(r.rect.size())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!((thumbs.iter().filter(|s| s.x > s.y).count(), thumbs.iter().filter(|s| s.y > s.x).count()), (1, 1), "{thumbs:?}");
+        let selected =
+            shapes.iter().filter(|s| matches!(s, egui::Shape::Rect(r) if r.stroke.width == 2.0 && r.rect.size() == egui::vec2(146.0, 150.0))).count();
+        assert_eq!(selected, 1, "one card chosen");
     }
 
     /// A double-click on a preset card creates the document from it (#663); a click only chooses it.

@@ -475,7 +475,7 @@ impl Tool for PuppetWarpTool {
         } else if Self::pin_at(cx, &c.set, p).is_some() {
             Cursor::Move
         } else if c.set.rest_of(p).is_some() {
-            Cursor::PenAdd
+            Cursor::PuppetPin
         } else {
             // Off the mesh: no pin goes there.
             Cursor::NotAllowed
@@ -733,6 +733,7 @@ mod tests {
     #[test]
     fn a_click_off_the_mesh_places_no_pin_and_says_so() {
         let mut r = Rig::new();
+        assert_eq!(r.cursor(130.0, 170.0, Mods::default()), Cursor::PuppetPin, "on the mesh, away from the pins");
         r.click(130.0, 170.0, Mods::default());
         assert_eq!(r.cursor(400.0, 400.0, Mods::default()), Cursor::NotAllowed);
         assert!(r.click(400.0, 400.0, Mods::default()).is_empty());

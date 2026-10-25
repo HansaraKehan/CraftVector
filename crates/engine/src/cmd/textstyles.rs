@@ -58,7 +58,7 @@ macro_rules! style_cmds {
                 concat!($p, ".new"),
                 concat!("New ", $what, " Style"),
                 &["Window", "Type", $menu],
-                "{name?, attrs?: {…} (default: selected text), id?, start?: byte, end?: byte} → {name}; a nonempty character range samples its first selected character; start alone keeps insertion affinity; paragraph styles sample start",
+                "{name? (trimmed, as rename trims `to`), attrs?: {…} (default: selected text), id?, start?: byte, end?: byte} → {name}; a nonempty character range samples its first selected character; start alone keeps insertion affinity; paragraph styles sample start",
                 |s, p| new(s, p, $kind),
                 true,
             ),
@@ -133,11 +133,60 @@ fn to_attrs<T: Serialize>(v: &T) -> Map<String, Value> {
     m
 }
 
-/// Captured character styles set Auto leading explicitly. A missing style attribute instead
-/// leaves the text's existing leading alone, unlike a run's omitted Auto value.
-fn char_attrs(v: &CharStyle) -> Map<String, Value> {
+/// Every character attribute of `v` as a JSON map, without the style name: those the run's JSON
+/// leaves out at their defaults (Auto leading and kerning, no OpenType features, Roman baseline
+/// alignment…) are written out. A style captured from text sets them all; an attribute missing
+/// from a style instead leaves the text's own value alone.
+pub fn char_attrs(v: &CharStyle) -> Map<String, Value> {
     let mut m = to_attrs(v);
-    m.insert("leading".into(), json!(v.leading));
+    for (k, x) in [
+        ("font_version", json!(v.font_version)),
+        ("fontAxes", json!(v.font_axes)),
+        ("leading", json!(v.leading)),
+        ("kerning", json!(v.kerning)),
+        ("features", json!(v.features)),
+        ("overprint_fill", json!(v.overprint_fill)),
+        ("overprint_stroke", json!(v.overprint_stroke)),
+        ("stroke_cap", json!(v.stroke_cap)),
+        ("stroke_join", json!(v.stroke_join)),
+        ("stroke_miter_limit", json!(v.stroke_miter_limit)),
+        ("stroke_dash", json!(v.stroke_dash)),
+        ("stroke_align", json!(v.stroke_align)),
+        ("position", json!(v.position)),
+        ("small_caps", json!(v.small_caps)),
+        ("charAlign", json!(v.char_align)),
+        ("charDirection", json!(v.char_direction)),
+        ("proportionalMetrics", json!(v.proportional_metrics)),
+        ("tateChuYoko", json!(v.tate_chu_yoko)),
+        ("noBreak", json!(v.no_break)),
+        ("digits", json!(v.digits)),
+    ] {
+        m.insert(k.into(), x);
+    }
+    m
+}
+
+/// Every paragraph attribute of `v` as a JSON map, without the style name: those the paragraph's
+/// JSON leaves out at their defaults (the Hyphenation and Justification options, the Every-line Composer, no tab
+/// stops, no list, Auto direction…) are written out, as [`char_attrs`] does for characters.
+pub fn para_attrs(v: &ParaStyle) -> Map<String, Value> {
+    let mut m = to_attrs(v);
+    for (k, x) in [
+        ("hyphenation", json!(v.hyphenation)),
+        ("justification", json!(v.justification)),
+        ("composer", json!(v.composer)),
+        ("tabs", json!(v.tabs)),
+        ("list", json!(v.list)),
+        ("mojikumi", json!(v.mojikumi)),
+        ("direction", json!(v.direction)),
+        ("leading_model", json!(v.leading_model)),
+        ("burasagari", json!(v.burasagari)),
+        ("kinsoku", json!(v.kinsoku)),
+        ("roman_hanging", json!(v.roman_hanging)),
+        ("kashida", json!(v.kashida)),
+    ] {
+        m.insert(k.into(), x);
+    }
     m
 }
 
@@ -187,13 +236,19 @@ fn with_attrs<T: Serialize + DeserializeOwned>(base: &T, attrs: &Map<String, Val
 }
 
 /// `cur` after its style changed from `old` to `new`: attributes still equal to the old style's
-/// value (or not set by it) take the new value; overrides stay. Unchanged if the style doesn't
-/// round-trip through JSON.
-fn restyle<T: Serialize + DeserializeOwned + Clone>(cur: &T, old: &Map<String, Value>, new: &Map<String, Value>) -> T {
-    let Some(mut m) = to_map(cur) else { return cur.clone() };
-    // Runs omit Auto leading from JSON; it still matches a style's explicit null.
-    if old.get("leading") == Some(&Value::Null) {
-        m.entry("leading").or_insert(Value::Null);
+/// value (or not set by it) take the new value; overrides stay. `attrs` lists every attribute of
+/// `cur` ([`char_attrs`], [`para_attrs`]), so one at its default matches a style that sets the
+/// default. Unchanged if the style doesn't round-trip through JSON.
+fn restyle<T: Serialize + DeserializeOwned + Clone>(
+    cur: &T,
+    attrs: fn(&T) -> Map<String, Value>,
+    old: &Map<String, Value>,
+    new: &Map<String, Value>,
+) -> T {
+    let Some(full) = to_map(cur) else { return cur.clone() };
+    let mut m = attrs(cur);
+    if let Some(name) = full.get("style_name") {
+        m.insert("style_name".into(), name.clone());
     }
     for (k, v) in new {
         if old.get(k).is_none_or(|o| m.get(k) == Some(o)) {
@@ -201,6 +256,21 @@ fn restyle<T: Serialize + DeserializeOwned + Clone>(cur: &T, old: &Map<String, V
         }
     }
     serde_json::from_value(Value::Object(m)).unwrap_or_else(|_| cur.clone())
+}
+
+/// `st`, written over `before` by a character style's `attrs`: when its font or style changed,
+/// it keeps none of the old one's versions or Variable Font settings unless the style sets them.
+fn font_change(before: &CharStyle, mut st: CharStyle, attrs: &Map<String, Value>) -> CharStyle {
+    if st.font_family == before.font_family && st.font_style == before.font_style {
+        return st;
+    }
+    if st.font_version.as_ref().is_some_and(|v| attrs.get("font_version") != Some(&json!(v))) {
+        st.font_version = None;
+    }
+    if !st.font_axes.is_empty() && attrs.get("fontAxes") != Some(&json!(st.font_axes)) {
+        st.font_axes.clear();
+    }
+    st
 }
 
 /// Every text object id in the document.
@@ -246,7 +316,7 @@ fn update_users(d: &mut Document, kind: Kind, name: &str, old: &Map<String, Valu
             Kind::Char => {
                 for r in &mut t.runs {
                     if r.style.style_name == target {
-                        r.style = restyle(&r.style, old, new);
+                        r.style = font_change(&r.style, restyle(&r.style, char_attrs, old, new), new);
                         changed = true;
                     }
                 }
@@ -254,7 +324,7 @@ fn update_users(d: &mut Document, kind: Kind, name: &str, old: &Map<String, Valu
             Kind::Para => {
                 for pa in t.para_styles_mut() {
                     if pa.style_name == target {
-                        *pa = restyle(pa, old, new);
+                        *pa = restyle(pa, para_attrs, old, new);
                         changed = true;
                     }
                 }
@@ -276,17 +346,17 @@ fn selection_attrs(s: &Session, p: &Value, kind: Kind) -> Result<Option<Map<Stri
         None => text_targets(s, &json!({}), "").ok().and_then(|v| v.first().copied()),
     };
     let Some(NodeKind::Text(t)) = id.and_then(|i| d.node(i)).map(|n| &n.kind) else { return Ok(None) };
-    let at = p.get("start").and_then(Value::as_u64).map_or(0, |v| usize::try_from(v).unwrap_or(usize::MAX));
+    let at = p.get("start").and_then(Value::as_u64).map_or(0, index);
     Ok(Some(match kind {
         Kind::Char => {
-            let style = match p.get("end").and_then(Value::as_u64).map(|v| usize::try_from(v).unwrap_or(usize::MAX)) {
+            let style = match p.get("end").and_then(Value::as_u64).map(index) {
                 Some(end) => vectorcraft_text::edit::insertion_style(&t.runs, at.min(end), at.max(end)),
                 None => vectorcraft_text::edit::style_at(&t.runs, at),
             };
             char_attrs(&style)
         }
         // The paragraph at `start`.
-        Kind::Para => to_attrs(t.para_at(t.paragraphs_in(at, at).start)),
+        Kind::Para => para_attrs(t.para_at(t.paragraphs_in(at, at).start)),
     }))
 }
 
@@ -314,7 +384,7 @@ fn attrs_param(p: &Value, kind: Kind, verb: &str) -> Result<Option<Map<String, V
             let c = kind.cmd(verb);
             let full = match kind {
                 Kind::Char => char_attrs(&with_attrs(&CharStyle::default(), m, &c)?),
-                Kind::Para => to_attrs(&with_attrs(&ParaStyle::default(), m, &c)?),
+                Kind::Para => para_attrs(&with_attrs(&ParaStyle::default(), m, &c)?),
             };
             Ok(Some(m.keys().filter_map(|k| full.get(k).map(|v| (k.clone(), v.clone()))).collect()))
         }
@@ -368,14 +438,17 @@ fn new(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
     let d = &s.doc()?.doc;
     let base = if kind == Kind::Char { "Character Style" } else { "Paragraph Style" };
     let name = match str_param(p, "name") {
-        Some(n) => n.to_string(),
+        Some(n) => n.trim().to_string(),
         None => (1..).map(|i| format!("{base} {i}")).find(|n| kind.attrs(d, n).is_none()).unwrap_or_else(|| base.to_string()),
     };
-    if name.trim().is_empty() || kind.attrs(d, &name).is_some() {
+    if name.is_empty() {
+        return Err(bad(&c, "give the style a name"));
+    }
+    if kind.attrs(d, &name).is_some() {
         return Err(bad(&c, format!("a style named `{name}` already exists")));
     }
     let n2 = name.clone();
-    s.edit(&format!("New {base}"), |d, _| {
+    s.edit(if kind == Kind::Char { "New Character Style" } else { "New Paragraph Style" }, |d, _| {
         kind.defs_mut(d).push(TextStyleDef { name: n2, attrs });
         Ok(())
     })?;
@@ -400,7 +473,7 @@ fn apply(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
     // Characters: Normal then the style over the defaults (clear) or over the current attributes.
     let char_fn = |cur: &CharStyle| -> Result<CharStyle> {
         let base = if clear { with_attrs(&CharStyle::default(), &normal, &c)? } else { cur.clone() };
-        let mut st = with_attrs(&base, &attrs, &c)?;
+        let mut st = font_change(&base, with_attrs(&base, &attrs, &c)?, &attrs);
         st.style_name = style_name.clone();
         Ok(st)
     };
@@ -411,18 +484,15 @@ fn apply(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
         Ok(st)
     };
     let count = ids.len();
-    s.edit(&format!("Apply {name}"), |d, _| {
+    s.edit_named("Apply {name}", &name, name == kind.normal(), |d, _| {
         for id in &ids {
             let Some(t) = text_mut(d, *id) else { continue };
             match kind {
                 Kind::Char => {
                     let len = vectorcraft_text::edit::runs_len(&t.runs);
-                    let (a, b) = match range {
-                        Some(_) => {
-                            let g = |k: &str, def: usize| p.get(k).and_then(Value::as_u64).map_or(def, |v| (v as usize).min(len));
-                            (g("start", 0), g("end", len))
-                        }
-                        None => (0, len),
+                    let (a, b) = match (range, text_range) {
+                        (Some(_), Some(r)) => r.bytes(t),
+                        _ => (0, len),
                     };
                     let mut err = None;
                     vectorcraft_text::edit::style_range(&mut t.runs, a.min(b), a.max(b), |st| match char_fn(st) {
@@ -461,7 +531,7 @@ fn redefine_to(s: &mut Session, kind: Kind, name: &str, new_attrs: Map<String, V
     let d = &s.doc()?.doc;
     let old = kind.attrs(d, name).ok_or_else(|| bad(&kind.cmd(verb), format!("no style `{name}`")))?;
     let name = name.to_string();
-    s.edit(&format!("Redefine {name}"), |d, _| {
+    s.edit_named("Redefine {name}", &name, name == kind.normal(), |d, _| {
         match kind.defs_mut(d).iter_mut().find(|s| s.name == name) {
             Some(def) => def.attrs = new_attrs.clone(),
             None => kind.defs_mut(d).push(TextStyleDef { name: name.clone(), attrs: new_attrs.clone() }),
@@ -488,10 +558,12 @@ fn duplicate(s: &mut Session, p: &Value, kind: Kind) -> Result<Value> {
     let name = name_param(p, kind, "duplicate")?.to_string();
     let d = &s.doc()?.doc;
     let attrs = kind.attrs(d, &name).ok_or_else(|| bad(&kind.cmd("duplicate"), format!("no style `{name}`")))?;
+    // `new` trims the name, so the copy is named from the trimmed one.
+    let stem = name.trim();
     let copy = (1..)
-        .map(|i| if i == 1 { format!("{name} copy") } else { format!("{name} copy {i}") })
+        .map(|i| if i == 1 { format!("{stem} copy") } else { format!("{stem} copy {i}") })
         .find(|n| kind.attrs(d, n).is_none())
-        .unwrap_or_else(|| format!("{name} copy"));
+        .unwrap_or_else(|| format!("{stem} copy"));
     new(s, &json!({ "name": copy, "attrs": attrs }), kind)
 }
 
@@ -595,6 +667,37 @@ mod tests {
         assert_eq!(list["styles"][1]["uses"], 1);
     }
 
+    /// Applying and redefining a style record a step named from a template with the style's name
+    /// in it (`HistoryEntry::named`), and undo and redo keep it. The Normal styles' names are
+    /// marked as names VectorCraft gives. A new style's step has a name of its own.
+    #[test]
+    fn style_steps_are_named_from_a_template() {
+        let (mut s, id) = session_with_text("Hello");
+        let last = |s: &Session| {
+            let e = s.doc().unwrap().history.undo.last().unwrap();
+            (e.label.clone(), e.named().map(|n| (n.template, n.name.clone(), n.built_in)))
+        };
+        let named = |template, name: &str, built_in| Some((template, name.to_string(), built_in));
+        s.execute("charStyle.new", &json!({"name": "Body"})).unwrap();
+        assert_eq!(last(&s), ("New Character Style".into(), None));
+        s.execute("charStyle.apply", &json!({"name": "Body", "id": id})).unwrap();
+        assert_eq!(last(&s), ("Apply Body".into(), named("Apply {name}", "Body", false)));
+        s.execute("edit.undo", &json!({})).unwrap();
+        let redo = s.doc().unwrap().history.redo.last().unwrap().named().cloned();
+        assert_eq!(redo.map(|n| n.label()).as_deref(), Some("Apply Body"));
+        s.execute("edit.redo", &json!({})).unwrap();
+        assert_eq!(last(&s), ("Apply Body".into(), named("Apply {name}", "Body", false)));
+        s.execute("charStyle.apply", &json!({"name": NORMAL_CHAR, "id": id})).unwrap();
+        assert_eq!(last(&s), (format!("Apply {NORMAL_CHAR}"), named("Apply {name}", NORMAL_CHAR, true)));
+        s.execute("paraStyle.new", &json!({"name": "Lead"})).unwrap();
+        assert_eq!(last(&s), ("New Paragraph Style".into(), None));
+        s.execute("paraStyle.setAttrs", &json!({"name": "Lead", "attrs": {"direction": "rightToLeft"}})).unwrap();
+        assert_eq!(last(&s), ("Redefine Lead".into(), named("Redefine {name}", "Lead", false)));
+        // A step renamed since it was recorded is no longer named from the template.
+        s.doc_mut().unwrap().history.undo.last_mut().unwrap().label = "Typing".into();
+        assert_eq!(last(&s), ("Typing".into(), None));
+    }
+
     #[test]
     fn new_from_selection_rename_delete_and_undo() {
         let (mut s, id) = session_with_text("Title");
@@ -622,6 +725,29 @@ mod tests {
         s.execute("charStyle.apply", &json!({"name": "Pink"})).unwrap();
         let fill = serde_json::to_value(&runs(&s, id)[0].style.fill).unwrap();
         assert_eq!(s.doc().unwrap().doc.char_styles.iter().find(|d| d.name == "Pink").unwrap().attrs["fill"], fill);
+    }
+
+    /// New Character Style and New Paragraph Style trim the name they are given, as a rename
+    /// trims `to`; the trimmed name is the one compared with the styles there are.
+    #[test]
+    fn new_styles_trim_their_names_as_a_rename_does() {
+        let (mut s, _) = session_with_text("Body text");
+        for p in ["charStyle", "paraStyle"] {
+            assert_eq!(s.execute(&format!("{p}.new"), &json!({"name": "  Body \t"})).unwrap()["name"], "Body", "{p}");
+            let list = s.execute(&format!("{p}.list"), &json!({})).unwrap();
+            let names: Vec<&str> = list["styles"].as_array().unwrap().iter().filter_map(|x| x["name"].as_str()).collect();
+            assert_eq!(names[1..], ["Body"], "{p}");
+            let e = s.execute(&format!("{p}.new"), &json!({"name": " Body"})).unwrap_err().to_string();
+            assert!(e.contains("a style named `Body` already exists"), "{p}: {e}");
+            let e = s.execute(&format!("{p}.new"), &json!({"name": " \t "})).unwrap_err().to_string();
+            assert!(e.contains("give the style a name"), "{p}: {e}");
+            assert_eq!(s.execute(&format!("{p}.duplicate"), &json!({"name": "Body"})).unwrap()["name"], "Body copy", "{p}");
+        }
+        // A style whose name has spaces around it, as a saved file can hold, is copied under the
+        // trimmed name, numbered past the copies there are.
+        std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc).char_styles.push(TextStyleDef { name: " Old ".into(), attrs: Map::new() });
+        s.execute("charStyle.new", &json!({"name": "Old copy"})).unwrap();
+        assert_eq!(s.execute("charStyle.duplicate", &json!({"name": " Old "})).unwrap()["name"], "Old copy 2");
     }
 
     /// #1001: attributes their JSON leaves out at the defaults (Auto leading and kerning, no
@@ -706,6 +832,146 @@ mod tests {
             assert!(!s.doc().unwrap().doc.char_styles[0].attrs.contains_key("leading"));
             assert_eq!(ids.map(|id| runs(&s, id)[0].style.leading), [Some(28.0), None, Some(42.0)]);
         }
+    }
+
+    /// The attribute names a style of type `T` can set, without the style name.
+    fn settable<T: DeserializeOwned>() -> std::collections::BTreeSet<String> {
+        attr_names::<T>().into_iter().filter(|&n| n != "style_name").map(String::from).collect()
+    }
+
+    /// New and Redefine capture every paragraph attribute. A paragraph style redefined from a
+    /// paragraph at the defaults gives its paragraphs the defaults back where they had the old
+    /// definition's values, and `setAttrs` with a default value does too; local overrides, and
+    /// attributes `setAttrs` leaves out, stay.
+    #[test]
+    fn para_style_redefined_to_the_defaults_updates_its_paragraphs() {
+        use vectorcraft_doc::{Composer, HyphenationOptions};
+        let (mut s, source) = session_with_text("Source");
+        let [linked, local] =
+            ["Linked", "Local"].map(|text| s.execute("text.create", &json!({"x": 10, "y": 90, "text": text})).unwrap()["id"].as_u64().unwrap());
+        let ids = [source, linked, local];
+        let para = |s: &Session, id: u64| match &s.doc().unwrap().doc.node(NodeId(id)).unwrap().kind {
+            NodeKind::Text(t) => t.para_at(0).clone(),
+            _ => panic!("not text"),
+        };
+        let limits = |s: &Session| ids.map(|id| para(s, id).hyphenation.hyphen_limit);
+        let composers = |s: &Session| ids.map(|id| para(s, id).composer);
+        let defined = |s: &Session, i: usize| s.doc().unwrap().doc.para_styles[i].attrs.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        s.execute("text.setFormat", &json!({"ids": ids, "hyphenLimit": 2, "composer": "singleLine"})).unwrap();
+        s.execute("paraStyle.new", &json!({"name": "Body", "id": source})).unwrap();
+        s.execute("paraStyle.apply", &json!({"name": "Body", "ids": ids})).unwrap();
+        s.execute("text.setFormat", &json!({"ids": [local], "hyphenLimit": 4})).unwrap();
+        s.execute("text.setFormat", &json!({"ids": [source], "hyphenLimit": 0, "composer": "everyLine"})).unwrap();
+        s.execute("paraStyle.redefine", &json!({"name": "Body", "id": source})).unwrap();
+        assert_eq!((limits(&s), composers(&s)), ([0, 0, 4], [Composer::EveryLine; 3]));
+        assert_eq!(para(&s, linked).hyphenation, HyphenationOptions::default());
+        assert!(ids.iter().all(|&id| para(&s, id).style_name.as_deref() == Some("Body")));
+        assert_eq!(defined(&s, 0), settable::<ParaStyle>(), "Redefine captures every attribute");
+        s.execute("paraStyle.new", &json!({"name": "Copy", "id": local})).unwrap();
+        assert_eq!(defined(&s, 1), settable::<ParaStyle>(), "New captures every attribute");
+        // Style options: a default value reaches the users too; an attribute left out stays as it is.
+        s.execute("paraStyle.setAttrs", &json!({"name": "Body", "attrs": {"hyphenation": {"hyphen_limit": 3}, "composer": "singleLine"}})).unwrap();
+        assert_eq!((limits(&s), composers(&s)), ([3, 3, 4], [Composer::SingleLine; 3]));
+        s.execute("paraStyle.setAttrs", &json!({"name": "Body", "attrs": {"composer": "everyLine"}})).unwrap();
+        assert_eq!((limits(&s), composers(&s)), ([3, 3, 4], [Composer::EveryLine; 3]));
+        assert_eq!(Value::Object(s.doc().unwrap().doc.para_styles[0].attrs.clone()), json!({"composer": "everyLine"}));
+    }
+
+    /// The same for character styles: Auto kerning and the Roman baseline alignment, which the
+    /// run's JSON leaves out, are captured and reach the style's users.
+    #[test]
+    fn char_style_redefined_to_the_defaults_updates_its_text() {
+        use vectorcraft_doc::CharAlign;
+        let (mut s, source) = session_with_text("Source");
+        let [linked, local] =
+            ["Linked", "Local"].map(|text| s.execute("text.create", &json!({"x": 10, "y": 90, "text": text})).unwrap()["id"].as_u64().unwrap());
+        let ids = [source, linked, local];
+        let kerning = |s: &Session| ids.map(|id| runs(s, id)[0].style.kerning);
+        let aligns = |s: &Session| ids.map(|id| runs(s, id)[0].style.char_align);
+        let defined = |s: &Session, i: usize| s.doc().unwrap().doc.char_styles[i].attrs.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        s.execute("text.setFormat", &json!({"ids": ids, "kerning": 40, "charAlign": "emBoxCenter"})).unwrap();
+        s.execute("charStyle.new", &json!({"name": "Body", "id": source})).unwrap();
+        s.execute("charStyle.apply", &json!({"name": "Body", "ids": ids})).unwrap();
+        s.execute("text.setFormat", &json!({"ids": [local], "kerning": 60})).unwrap();
+        s.execute("text.setFormat", &json!({"ids": [source], "kerning": "auto", "charAlign": "romanBaseline"})).unwrap();
+        s.execute("charStyle.redefine", &json!({"name": "Body", "id": source})).unwrap();
+        assert_eq!((kerning(&s), aligns(&s)), ([None, None, Some(60.0)], [CharAlign::RomanBaseline; 3]));
+        assert_eq!(defined(&s, 0), settable::<CharStyle>(), "Redefine captures every attribute");
+        s.execute("charStyle.new", &json!({"name": "Copy", "id": local})).unwrap();
+        assert_eq!(defined(&s, 1), settable::<CharStyle>(), "New captures every attribute");
+        s.execute("charStyle.setAttrs", &json!({"name": "Body", "attrs": {"kerning": 10, "charAlign": "emBoxTop"}})).unwrap();
+        assert_eq!((kerning(&s), aligns(&s)), ([Some(10.0), Some(10.0), Some(60.0)], [CharAlign::EmBoxTop; 3]));
+        s.execute("charStyle.setAttrs", &json!({"name": "Body", "attrs": {"charAlign": "romanBaseline"}})).unwrap();
+        assert_eq!((kerning(&s), aligns(&s)), ([Some(10.0), Some(10.0), Some(60.0)], [CharAlign::RomanBaseline; 3]));
+        assert_eq!(Value::Object(s.doc().unwrap().doc.char_styles[0].attrs.clone()), json!({"charAlign": "romanBaseline"}));
+    }
+
+    /// A style captured from type without Variable Font settings sets none explicitly (`{}`):
+    /// applying it clears type's settings, and redefining it from type whose settings were reset
+    /// resets the type that uses it.
+    #[test]
+    fn variable_font_settings_are_captured_explicitly() {
+        let _fonts = crate::adding_fonts();
+        use vectorcraft_text::test_fonts::{TWO_AXIS_FAMILY, two_axis_font};
+        vectorcraft_text::FontDb::global().add_font(two_axis_font().unwrap());
+        let (mut s, source) = session_with_text("Source");
+        let linked = s.execute("text.create", &json!({"x": 10, "y": 90, "text": "Linked"})).unwrap()["id"].as_u64().unwrap();
+        let ids = [source, linked];
+        s.execute("text.setStyle", &json!({"ids": ids, "font": TWO_AXIS_FAMILY})).unwrap();
+        s.execute("charStyle.new", &json!({"name": "Body", "id": source})).unwrap();
+        assert_eq!(s.doc().unwrap().doc.char_styles[0].attrs.get("fontAxes"), Some(&json!({})));
+        s.execute("text.setFormat", &json!({"ids": [linked], "fontAxes": {"wght": 650}})).unwrap();
+        s.execute("charStyle.apply", &json!({"name": "Body", "ids": ids})).unwrap();
+        let wght = |s: &Session| ids.map(|id| runs(s, id)[0].style.font_axes.get("wght").copied());
+        assert_eq!(wght(&s), [None, None], "applying the style clears the settings");
+        for (set, want) in [(json!(650), Some(650.0)), (json!(null), None)] {
+            s.execute("text.setFormat", &json!({"ids": [source], "fontAxes": {"wght": set}})).unwrap();
+            s.execute("charStyle.redefine", &json!({"name": "Body", "id": source})).unwrap();
+            assert_eq!(wght(&s), [want, want], "redefined from {set}");
+        }
+    }
+
+    /// A style that changes the font, applied or redefined, leaves none of the old font's
+    /// version and Variable Font settings, unless the style sets them.
+    #[test]
+    fn another_font_from_a_style_clears_the_old_fonts_version_and_settings() {
+        let _fonts = crate::adding_fonts();
+        use vectorcraft_text::test_fonts::{TWO_AXIS_FAMILY, two_axis_font};
+        vectorcraft_text::FontDb::global().add_font(two_axis_font().unwrap());
+        let (mut s, id) = session_with_text("Source");
+        let set_variable = |s: &mut Session| {
+            s.execute("text.setStyle", &json!({"ids": [id], "font": TWO_AXIS_FAMILY})).unwrap();
+            s.execute("text.setFormat", &json!({"ids": [id], "fontAxes": {"wght": 650}})).unwrap();
+            s.edit("version", |d, _| {
+                if let Some(t) = text_mut(d, NodeId(id)) {
+                    t.runs.iter_mut().for_each(|r| r.style.font_version = Some("Version 2.000".into()));
+                }
+                Ok(())
+            })
+            .unwrap();
+        };
+        let font = |s: &Session| {
+            let st = runs(s, id)[0].style.clone();
+            (st.font_family, st.font_version, st.font_axes.get("wght").copied())
+        };
+        set_variable(&mut s);
+        s.execute("charStyle.new", &json!({"name": "Plain", "attrs": {"font_family": "Inter"}})).unwrap();
+        s.execute("charStyle.new", &json!({"name": "Same", "attrs": {"size": 20}})).unwrap();
+        s.execute("charStyle.apply", &json!({"name": "Same", "id": id})).unwrap();
+        assert_eq!(font(&s), (TWO_AXIS_FAMILY.to_string(), Some("Version 2.000".to_string()), Some(650.0)), "the same font keeps them");
+        s.execute("charStyle.apply", &json!({"name": "Plain", "id": id})).unwrap();
+        assert_eq!(font(&s), ("Inter".to_string(), None, None));
+        // A style that sets the settings keeps its own.
+        s.execute("charStyle.new", &json!({"name": "Heavy", "attrs": {"font_family": TWO_AXIS_FAMILY, "fontAxes": {"wght": 600}}})).unwrap();
+        s.execute("charStyle.apply", &json!({"name": "Heavy", "id": id})).unwrap();
+        assert_eq!(font(&s), (TWO_AXIS_FAMILY.to_string(), None, Some(600.0)));
+        // Redefined to another font: its users' settings and versions go too.
+        s.execute("charStyle.new", &json!({"name": "Sans", "attrs": {"font_family": TWO_AXIS_FAMILY}})).unwrap();
+        s.execute("charStyle.apply", &json!({"name": "Sans", "id": id})).unwrap();
+        set_variable(&mut s);
+        assert_eq!(runs(&s, id)[0].style.style_name.as_deref(), Some("Sans"));
+        s.execute("charStyle.setAttrs", &json!({"name": "Sans", "attrs": {"font_family": "Inter"}})).unwrap();
+        assert_eq!(font(&s), ("Inter".to_string(), None, None));
     }
 
     #[test]

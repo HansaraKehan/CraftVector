@@ -161,6 +161,7 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, cols: usize, floating: Option<egu
         );
     }
     crate::floating::drag_tools(app, ui.ctx(), &hresp.union(gresp.clone()), bounds, floating);
+    hresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!("Toggle single/double column")));
     if hresp.on_hover_text(tl!("Toggle single/double column")).clicked()
         // It only fails on bad params, which this never sends; show it all the same.
         && let Err(e) = app.run("window.toolbarColumns", json!({ "double": cols == 1 }))
@@ -168,6 +169,7 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, cols: usize, floating: Option<egu
         app.ui.status = e;
     }
     let grip_tip = if floating.is_some() { tl!("Drag to the window's left edge to dock") } else { tl!("Drag to float the toolbar") };
+    gresp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), grip_tip));
     gresp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(grip_tip);
     // The tools and the controls under them scroll in a window too short for them.
     widgets::strip_scroll(ui, "toolbar", |ui| {
@@ -260,6 +262,7 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, cols: usize, floating: Option<egu
                     } else if resp.clicked() {
                         app.select_tool(shown.id);
                     }
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), is_active, tip(shown)));
                     resp.on_hover_text(tip(shown));
                 }
             });
@@ -323,8 +326,9 @@ fn flyout_press(ui: &Ui, resp: &egui::Response, rect: egui::Rect) -> Option<Flyo
 /// Options; the Print Tiling tool's resets the print tiling. As in the reference app, the Hand
 /// tool's fits the artboard in the window, the Zoom tool's shows it at 100%, the Rotate, Scale,
 /// Reflect and Shear tools' are their Object › Transform dialogs, the selection tools' are the
-/// Move dialog, and the Pencil, Paintbrush, Smooth, Blob Brush and Eraser tools' are their Tool
-/// Options.
+/// Move dialog, and the Pencil, Paintbrush, Smooth, Blob Brush, Eraser and Shape Builder tools' are
+/// their Tool Options, as are the Line Segment, Arc, Rectangular Grid and Polar Grid tools'
+/// ([`crate::dialogs::shapes::open_options`]).
 pub fn open_options(app: &mut VectorcraftApp, tool: &str) -> Result<serde_json::Value, String> {
     match tool {
         "dimension" => crate::dialogs::dimension::open(app),
@@ -355,6 +359,10 @@ pub fn open_options(app: &mut VectorcraftApp, tool: &str) -> Result<serde_json::
             crate::dialogs::perspective_options::open(app);
             Ok(json!({ "dialog": crate::dialogs::perspective_options::KIND }))
         }
+        "shapeBuilder" => Ok(crate::dialogs::shape_builder_options::open(app)),
+        // The Line Segment, Arc and grid tools: their Tool Options, the options of their next
+        // drag and click.
+        _ if crate::dialogs::shapes::OPTION_TOOLS.contains(&tool) => crate::dialogs::shapes::open_options(app, tool),
         // The Flare tool: its options, which draw the next flare (OK draws none).
         "flare" => Ok(crate::dialogs::flare_options::open(app, None)),
         // A double click on the Print Tiling tool puts the pages back where the placement puts them.
@@ -363,6 +371,8 @@ pub fn open_options(app: &mut VectorcraftApp, tool: &str) -> Result<serde_json::
         _ if vectorcraft_tools::settings::LIQUIFY.contains(&tool) => crate::dialogs::liquify::open(app, tool),
         // The freehand tools: their Tool Options (Fidelity, fill, the tolerances, the brush size).
         _ if crate::dialogs::freehand::TOOLS.contains(&tool) => crate::dialogs::freehand::open(app, tool),
+        // The Live Paint Selection tool: its Tool Options (what a click selects, the highlight).
+        "livePaintSelection" => crate::dialogs::live_paint_selection::open(app),
         // The Symbolism tools: the brush they share.
         _ if vectorcraft_tools::settings::SYMBOLISM.contains(&tool) => Ok(crate::dialogs::symbolism_options::open(app, tool)),
         // The graph tools: Graph Type for the selected graph.
@@ -373,8 +383,8 @@ pub fn open_options(app: &mut VectorcraftApp, tool: &str) -> Result<serde_json::
 }
 
 /// The active tool's options in the Control bar: Mirror & Cut's axis and the side it keeps, Puppet
-/// Warp's mesh and pins, the Artboard tool's Move and Scale Artwork with Artboard (set through
-/// `tool.setOption`).
+/// Warp's mesh and pins (set through `tool.setOption`). The Artboard tool's options are drawn by
+/// [`crate::panels::artboards::control_bar`].
 pub fn control_bar_options(app: &mut VectorcraftApp, ui: &mut Ui) {
     if app.session.tool_id() == "dimension" {
         return crate::dialogs::dimension::controls(app, ui);
@@ -390,11 +400,6 @@ pub fn control_bar_options(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     if app.session.tool_id() == vectorcraft_tools::cropimage::ID {
         return crop_options(app, ui);
-    }
-    if app.session.tool_id() == "artboard" {
-        crate::panels::artboards::art_options(app, ui);
-        ui.separator();
-        return;
     }
     if app.session.tool_id() != "mirrorCut" {
         return;
@@ -471,9 +476,10 @@ fn bottom_controls(app: &mut VectorcraftApp, ui: &mut Ui, t: &Tokens, cols: usiz
                 let (r, resp) = ui.allocate_exact_size(vec2(chip, chip), Sense::click());
                 match cmd {
                     "paint.lastColor" => widgets::paint_chip(ui, r, &Paint::solid(app.session.last_solid)),
-                    "paint.lastGradient" => widgets::gradient_chip(ui, r, &app.session.last_gradient.gradient),
+                    "paint.lastGradient" => widgets::gradient_chip(ui, r, &app.session.last_gradient),
                     _ => widgets::paint_chip(ui, r, &Paint::None),
                 }
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!(tip)));
                 if resp.on_hover_text(tl!(tip)).clicked() {
                     clicked = Some(cmd);
                 }
@@ -600,6 +606,7 @@ fn flyout_body(ui: &mut Ui, t: &Tokens, active: &str, tools: &[String], floating
             let x = egui::Rect::from_min_size(bar.min, vec2(BAR, CLOSE));
             let xr = ui.interact(x, egui::Id::new(("tool-flyout-close", key)), Sense::click());
             icons::paint(ui, "x", x.shrink2(vec2(1.0, 3.0)), if xr.hovered() { t.text_strong } else { t.text });
+            xr.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!("Put back in the toolbar")));
             out.close = xr.on_hover_text(tl!("Put back in the toolbar")).clicked();
             egui::Rect::from_min_max(bar.min + vec2(0.0, CLOSE), bar.max)
         } else {
@@ -611,11 +618,12 @@ fn flyout_body(ui: &mut Ui, t: &Tokens, active: &str, tools: &[String], floating
             let x = grip.center().x - 2.0 + k as f32 * 2.0;
             ui.painter().line_segment([pos2(x, grip.center().y - half), pos2(x, grip.center().y + half)], Stroke::new(0.6, t.text_disabled));
         }
+        let tip = if floating { tl!("Drag to move") } else { tl!("Drag to float as a toolbar") };
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tip));
         let resp = if resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             resp
         } else {
-            let tip = if floating { tl!("Drag to move") } else { tl!("Drag to float as a toolbar") };
             resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip)
         };
         out.bar = Some(resp);
@@ -647,6 +655,7 @@ fn tool_rows(ui: &mut Ui, t: &Tokens, active: &str, tools: &[String]) -> Option<
         if let Some(sc) = shortcut {
             ui.painter().galley(pos2(r.right() - ROW_END - sc.size().x, r.center().y - sc.size().y / 2.0), sc, color);
         }
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), is_active, tip(tool)));
         if resp.clicked() {
             chosen = Some(tool.id);
         }
@@ -700,6 +709,7 @@ fn tool_strip(ui: &mut Ui, t: &Tokens, active: &str, tools: &[String]) -> Option
         }
         let ir = egui::Rect::from_center_size(r.center(), vec2(18.0, 18.0));
         icons::paint(ui, icons::tool_icon(tool.icon), ir, if active == tool.id { t.text_strong } else { t.icon });
+        resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active == tool.id, tip(tool)));
         if resp.on_hover_text(tip(tool)).clicked() {
             chosen = Some(tool.id);
         }
@@ -840,10 +850,12 @@ fn puppet_warp_options(app: &mut VectorcraftApp, ui: &mut Ui) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use egui::accesskit::{Role, Toggled};
     use egui::{Event, PointerButton, Pos2};
     use vectorcraft_engine::Session;
 
     use super::*;
+    use crate::widgets::accessibility_tests::{role_and_state, tree};
 
     /// One headless frame of the toolbar; returns the tool buttons' rects, top to bottom.
     fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, time: f64, events: Vec<Event>) -> Vec<egui::Rect> {
@@ -929,6 +941,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// Screen readers name each tool button by its tool tip and say which tool is active, and name
+    /// the title bar's column toggle and grip and the paint buttons under the tools.
+    #[test]
+    fn screen_readers_name_the_tool_buttons_and_the_active_tool() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.select_tool("pen");
+        let tree = tree(|ui| show(&mut app, ui));
+        let name = |id| tool_info(id).map(tip).unwrap_or_default();
+        assert_eq!(role_and_state(&tree, &name("pen")), (Role::Button, Some(Toggled::True)));
+        assert_eq!(role_and_state(&tree, &name("selection")), (Role::Button, Some(Toggled::False)));
+        for label in ["Toggle single/double column", "Drag to float the toolbar", "Color (,)", "Gradient (.)", "None (/)"] {
+            assert_eq!(role_and_state(&tree, label), (Role::Button, None), "{label}");
+        }
+    }
+
     /// #812: double-clicking the Artboard tool opens Artboard Options of the active artboard, a
     /// graph tool Graph Type for the selected graph, and the Magic Wand tool its panel.
     #[test]
@@ -990,6 +1018,125 @@ pub(crate) mod tests {
         let o = app.session.prefs.eyedropper;
         assert!(o.pick_up.appearance.transparency && !o.apply.appearance.transparency && o.apply.appearance.fill.color);
         assert!(app.run("tool.options", json!({"tool": "lasso"})).is_err());
+    }
+
+    #[test]
+    fn polygon_and_star_canvas_counts_persist_without_new_toolbar_dialogs() {
+        for (tool, key, count) in [("polygon", "sides", 3), ("star", "points", 7)] {
+            let mut app = VectorcraftApp::new(Session::new(), Default::default());
+            app.run("file.new", json!({"width":300,"height":300})).unwrap();
+            app.select_tool(tool);
+            assert!(open_options(&mut app, tool).is_err(), "upstream toolbar opening behavior stays unchanged");
+            assert!(app.ui.dialog.is_none());
+            let objects =
+                |app: &VectorcraftApp| app.session.active().unwrap().doc.layers.iter().map(|l| l.children().map_or(0, |c| c.len())).sum::<usize>();
+            crate::dialogs::open_tool_dialog(&mut app, tool, json!({"x":120,"y":130}));
+            let d = app.ui.dialog.as_mut().unwrap();
+            assert!(d.fields.contains_key(if tool == "polygon" { "radius" } else { "radius1" }));
+            d.fields.insert(key.into(), json!(count));
+            crate::dialogs::confirm(&mut app).unwrap();
+            assert_eq!(objects(&app), 1, "deliberate exact-size placement");
+            assert_eq!(app.session.tool_options()[key], count);
+            for round in 0..3 {
+                if round == 2 {
+                    app.select_tool("ellipse");
+                    app.select_tool(tool);
+                }
+                let view = app.view_info();
+                for (kind, x, y) in [
+                    (vectorcraft_tools::PointerKind::Down, 50.0, 50.0),
+                    (vectorcraft_tools::PointerKind::Drag, 90.0, 90.0),
+                    (vectorcraft_tools::PointerKind::Up, 90.0, 90.0),
+                ] {
+                    app.session.pointer(&vectorcraft_tools::PointerEvent::new(kind, x, y), view).unwrap();
+                }
+                assert_eq!(objects(&app), round + 2);
+                let st = app.session.active().unwrap();
+                let node = st.doc.node(*st.selection.objects.first().unwrap()).unwrap();
+                assert_eq!(node.path_data().unwrap().anchor_count(), if tool == "polygon" { 3 } else { 14 });
+            }
+            crate::dialogs::open_tool_dialog(&mut app, tool, json!({"x":140,"y":150}));
+            let d = app.ui.dialog.as_mut().unwrap();
+            assert_eq!(d.fields[key], count, "reopening uses the chosen count");
+            d.fields.insert(key.into(), json!(9));
+            crate::dialogs::cancel(&mut app);
+            assert_eq!(objects(&app), 4);
+            assert_eq!(app.session.tool_options()[key], count, "Cancel keeps the count");
+        }
+    }
+
+    /// #2691: a double-click on the Line Segment, Arc, Rectangular Grid or Polar Grid tool opens
+    /// its Tool Options (the Rectangular Grid and Arc help pages, step 3). Cancel leaves the next
+    /// drag as it was; OK draws nothing and the next drag, and a click's dialog, use the options.
+    #[test]
+    fn double_clicking_the_line_arc_and_grid_tools_opens_their_tool_options() {
+        // (tool, the option changed, its new value, the drag's command, the param it shows in)
+        let cases = [
+            ("lineSegment", "fillLine", json!(true), "shape.line", "fill"),
+            ("arc", "slope", json!(-30.0), "shape.arc", "slope"),
+            ("rectangularGrid", "rows", json!(2), "shape.rectangularGrid", "rows"),
+            ("polarGrid", "radial", json!(3), "shape.polarGrid", "radial"),
+        ];
+        let objects =
+            |app: &VectorcraftApp| app.session.active().unwrap().doc.layers.iter().map(|l| l.children().map_or(0, |c| c.len())).sum::<usize>();
+        let drag = |app: &mut VectorcraftApp| {
+            let view = app.view_info();
+            for (kind, x, y) in [
+                (vectorcraft_tools::PointerKind::Down, 50.0, 50.0),
+                (vectorcraft_tools::PointerKind::Drag, 150.0, 120.0),
+                (vectorcraft_tools::PointerKind::Up, 150.0, 120.0),
+            ] {
+                app.session.pointer(&vectorcraft_tools::PointerEvent::new(kind, x, y), view).unwrap();
+            }
+            app.session.journal.last().cloned().expect("the drag's command")
+        };
+        for (tool, key, value, cmd, param) in cases {
+            let mut app = VectorcraftApp::new(Session::new(), Default::default());
+            app.ui.toolbar_advanced = true;
+            app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+            app.select_tool(tool);
+            let index = slots(&app).iter().position(|(_, tools)| tools.contains(&tool)).expect("a toolbar slot");
+            let ctx = egui::Context::default();
+            let at = frame_in(&mut app, &ctx, 0.0, vec![], 2000.0)[index].center();
+            let b = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+            frame_in(&mut app, &ctx, 1.0, vec![Event::PointerMoved(at), b(true), b(false), b(true), b(false)], 2000.0);
+            let d = app.ui.dialog.clone().unwrap_or_else(|| panic!("{tool}: Tool Options"));
+            assert_eq!((d.kind.as_str(), d.bool("__toolOptions")), (tool, true));
+            assert!(!d.fields.contains_key("x"), "{tool}: no click to draw at");
+            let text = crate::tests_labels::painted_text(&mut app, |app, ui| crate::dialogs::show(app, ui.ctx()));
+            let title = match tool {
+                "lineSegment" => "Line Segment Tool Options",
+                "arc" => "Arc Segment Tool Options",
+                "rectangularGrid" => "Rectangular Grid Tool Options",
+                _ => "Polar Grid Tool Options",
+            };
+            assert!(text.contains(title) && !text.contains("Reference:"), "{tool}: {text}");
+            let d = app.ui.dialog.as_mut().unwrap();
+            d.fields.insert(key.into(), value.clone());
+            crate::dialogs::cancel(&mut app);
+            let (c, p) = drag(&mut app);
+            assert_eq!(c, cmd);
+            assert_ne!(p.get(param), Some(&value), "{tool}: Cancel changes nothing");
+            assert_eq!(objects(&app), 1);
+            app.run("tool.options", json!({ "tool": tool })).unwrap();
+            let d = app.ui.dialog.as_mut().unwrap();
+            d.fields.insert(key.into(), value.clone());
+            if tool.ends_with("Grid") {
+                d.fields.insert("width".into(), json!("150 pt"));
+            }
+            crate::dialogs::confirm(&mut app).unwrap();
+            assert!(app.ui.dialog.is_none());
+            assert_eq!(objects(&app), 1, "{tool}: OK draws nothing");
+            let (c, p) = drag(&mut app);
+            assert_eq!((c.as_str(), &p[param]), (cmd, &value), "{tool}: the next drag uses the option");
+            // A click's dialog opens at them too, a grid at its Default Size.
+            crate::dialogs::open_tool_dialog(&mut app, tool, json!({"x": 100, "y": 100}));
+            let d = app.ui.dialog.as_ref().unwrap();
+            assert_eq!(d.fields[key], value, "{tool}");
+            if tool.ends_with("Grid") {
+                assert_eq!(d.f64("width", 0.0), 150.0);
+            }
+        }
     }
 
     #[test]
@@ -1563,5 +1710,32 @@ pub(crate) mod tests {
         assert!(!hovered_texts(&mut app, &ctx, 20.0, star).contains(&tip), "off: no tool tip");
         app.session.prefs.show_tool_tips = true;
         assert!(hovered_texts(&mut app, &ctx, 30.0, star).contains(&tip), "on again");
+    }
+
+    /// Screen readers name a flyout's rows and a floating strip's buttons by their tools' tool tips,
+    /// with the active tool's pressed, and name the strip's close box and both tear-off bars.
+    #[test]
+    fn screen_readers_name_a_flyouts_rows_and_a_floating_strips_buttons() {
+        let name = |id| tool_info(id).map(tip).unwrap_or_default();
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        let group: Vec<String> = ["rectangle", "roundedRectangle", "ellipse"].map(String::from).to_vec();
+        let flyout = tree(|ui| {
+            app.ui.flyout = Some(0);
+            ui.data_mut(|d| d.insert_temp(egui::Id::new("flyout-tools"), group.clone()));
+            show(&mut app, ui);
+        });
+        assert_eq!(role_and_state(&flyout, &name("roundedRectangle")), (Role::Button, Some(Toggled::False)));
+        assert_eq!(role_and_state(&flyout, &name("ellipse")), (Role::Button, Some(Toggled::False)));
+        assert_eq!(role_and_state(&flyout, "Drag to float as a toolbar"), (Role::Button, None));
+        app.ui.flyout = None;
+        app.select_tool("star");
+        let tools: Vec<String> = ["polygon", "star"].map(String::from).to_vec();
+        app.ui.floating_flyouts.push(crate::state::FloatingFlyout { tools, pos: [150.0, 600.0] });
+        let strip = tree(|ui| show(&mut app, ui));
+        assert_eq!(role_and_state(&strip, &name("polygon")), (Role::Button, Some(Toggled::False)));
+        assert_eq!(role_and_state(&strip, &name("star")), (Role::Button, Some(Toggled::True)));
+        assert_eq!(role_and_state(&strip, "Put back in the toolbar"), (Role::Button, None));
+        assert_eq!(role_and_state(&strip, "Drag to move"), (Role::Button, None));
     }
 }

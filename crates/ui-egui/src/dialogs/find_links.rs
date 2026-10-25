@@ -279,7 +279,8 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
                                 touched.push(json!(i));
                             }
                         }
-                        if files.is_empty() && !state.is_empty() {
+                        // A failed search (a folder it refuses) didn't look: `progress` says why.
+                        if files.is_empty() && !state.is_empty() && state != "failed" {
                             widgets::dim_label(ui, if searching { tl!("Searching…") } else { tl!("Not found") });
                         }
                         ui.add_space(3.0);

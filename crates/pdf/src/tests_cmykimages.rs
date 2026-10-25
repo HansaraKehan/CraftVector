@@ -306,7 +306,15 @@ fn all_images(d: &Document) -> Vec<&ImageBlob> {
 fn image_doc(blob: ImageBlob, w: u32, h: u32) -> Document {
     let mut d = Document::new_with_mode(100.0, 100.0, ColorMode::Cmyk);
     d.images.insert("img".into(), blob);
-    let image = ImageObject { key: "img".into(), width: w, height: h, xf: Affine::scale(40.0 / w as f64), link: None, placement: Default::default() };
+    let image = ImageObject {
+        key: "img".into(),
+        width: w,
+        height: h,
+        xf: Affine::scale(40.0 / w as f64),
+        link: None,
+        placement: Default::default(),
+        pixels: None,
+    };
     let n = Node::new(d.alloc_id(), NodeKind::Image(Box::new(image)));
     let l = d.layers[0].id;
     d.insert(Some(l), 0, n).unwrap();
@@ -340,7 +348,7 @@ fn the_output_settings_convert_cmyk_images_and_compression_recompresses_them_in_
     assert_ne!(converted, flat(ink, 16));
     let source = cms::active();
     let dest = cms::Cms::new(&cms::ColorSettings { cmyk: DEVICE_CMYK.into(), ..source.settings().clone() }).unwrap();
-    let want = dest.lab_to_cmyk(source.cmyk_to_lab(ink.map(|v| v as f32 / 255.0)), source.settings().intent).map(|v| (v * 255.0).round() as u8);
+    let want = dest.lab_to_cmyk(source.cmyk_display_lab(ink.map(|v| v as f32 / 255.0)), source.settings().intent).map(|v| (v * 255.0).round() as u8);
     assert!(close(&converted[..4], &want, 3), "{converted:?} vs {want:?}");
     // To RGB: the colour shown on screen.
     let (w, blob, _) = first(json!({"output": {"conversion": "destination", "destination": SRGB}}));
@@ -366,4 +374,111 @@ fn the_output_settings_convert_cmyk_images_and_compression_recompresses_them_in_
     let (w, blob, _) = first(json!({"standard": "pdfX1a", "output": {"destination": GENERIC_CMYK}}));
     assert_eq!(w.space, "DeviceCMYK");
     assert_eq!(blob.cmyk().unwrap().data, flat(ink, 16));
+}
+
+/// A Press Quality export of a 2 × 2 CMYK image masked by PNG `mask` on its own pixel grid
+/// (`clip`, `invert`): the file, and the decoded soft mask of each CMYK image (`None`: it has none).
+fn export_masked(mask: Vec<u8>, clip: bool, invert: bool) -> (Vec<u8>, Vec<Option<Vec<u8>>>) {
+    let ink = [0u8, 102, 255, 0];
+    let mut d = Document::new_with_mode(100.0, 100.0, ColorMode::Cmyk);
+    d.images.insert("img".into(), ImageBlob::cmyk_tiff(&Inks::new(2, 2, flat(ink, 4)).unwrap()).unwrap());
+    d.images.insert("alpha".into(), ImageBlob::new("image/png", mask));
+    let image = |key: &str| {
+        NodeKind::Image(Box::new(ImageObject {
+            key: key.into(),
+            width: 2,
+            height: 2,
+            xf: Affine::scale(20.0),
+            link: None,
+            placement: Default::default(),
+            pixels: None,
+        }))
+    };
+    let mut mask = vectorcraft_doc::OpacityMask::new(Node::new(d.alloc_id(), image("alpha")), clip);
+    mask.invert = invert;
+    let n = Node::new(d.alloc_id(), image("img")).with_mask(Some(Box::new(mask)));
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, n).unwrap();
+    let press = builtin_presets().into_iter().find(|p| p.name == "Press Quality").unwrap().settings;
+    let out = export_with_report(&d, &PdfOptions { settings: press, created: Some(1_700_000_000), ..Default::default() }).unwrap();
+    let file = Pdf::new(Arc::new(out.bytes.clone())).unwrap();
+    let smasks = file
+        .objects()
+        .into_iter()
+        .filter_map(|o| match o {
+            Object::Stream(s) if s.dict().get::<Name<'_>>(b"ColorSpace").is_some_and(|n| n.as_ref() == b"DeviceCMYK") => Some(s),
+            _ => None,
+        })
+        .map(|s| s.dict().get::<Stream<'_>>(b"SMask").map(|m| m.decoded().unwrap().into_owned()))
+        .collect();
+    (out.bytes, smasks)
+}
+
+fn png(img: impl Into<image::DynamicImage>) -> Vec<u8> {
+    let mut out = Vec::new();
+    img.into().write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+    out
+}
+
+/// A CMYK image whose opacity mask is a grey image on its own pixel grid (an image's soft mask
+/// as it opens) is written with the mask as its `/SMask`, as an RGBA image is: CoreGraphics draws
+/// CMYK images through luminosity soft masks on black boxes (#2159).
+#[test]
+fn a_cmyk_image_masked_by_a_grey_image_of_its_grid_writes_it_as_its_smask() {
+    let (bytes, smasks) = export_masked(png(image::GrayImage::from_raw(2, 2, vec![255, 128, 0, 64]).unwrap()), true, false);
+    assert_eq!(smasks, [Some(vec![255, 128, 0, 64])], "the CMYK image, its alpha the mask's greys");
+    assert!(!String::from_utf8_lossy(&bytes).contains("/S/Luminosity"), "no luminosity soft mask");
+    assert!(written(&bytes).iter().any(|w| w.space == "DeviceCMYK"), "the inks stay CMYK");
+    // A mask that doesn't clip shows white where its image is transparent: lum · a + 255 · (1 − a).
+    let la = image::GrayAlphaImage::from_raw(2, 2, vec![200, 128, 0, 0, 100, 255, 255, 64]).unwrap();
+    let (_, smasks) = export_masked(png(la), false, false);
+    assert_eq!(smasks, [Some(vec![227, 255, 100, 255])]);
+    // An inverted mask stays a luminosity soft mask.
+    let (bytes, smasks) = export_masked(png(image::GrayImage::from_raw(2, 2, vec![255, 128, 0, 64]).unwrap()), true, true);
+    assert_eq!(smasks, [None]);
+    assert!(String::from_utf8_lossy(&bytes).contains("/S/Luminosity"), "a luminosity soft mask");
+}
+
+/// #2950: Press Quality converts to the document's profile with its numbers kept, so in a CMYK
+/// document an RGB image comes out CMYK, as the press needs; with no conversion (the default
+/// preset) it stays RGB, as before.
+#[test]
+fn press_quality_writes_an_rgb_image_in_a_cmyk_document_as_cmyk() {
+    let rgb = image::RgbImage::from_fn(4, 4, |x, y| image::Rgb([(x * 60) as u8, (y * 60) as u8, 128]));
+    let blob = ImageBlob { mime: "image/png".into(), bytes: Arc::new(png(rgb)), proxy: None };
+    let d = image_doc(blob, 4, 4);
+    let press = builtin_presets().into_iter().find(|p| p.name == "Press Quality").unwrap().settings;
+    assert_eq!(press.output.conversion, ColorConversion::PreserveNumbers);
+    let options = PdfOptions { settings: press, created: Some(1_700_000_000), ..Default::default() };
+    let w = written(&export_with_report(&d, &options).unwrap().bytes);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert_eq!((w[0].space.as_str(), w[0].icc_n), ("DeviceCMYK", None), "Press Quality");
+    let w = written(&export_with_report(&d, &opts(json!({}))).unwrap().bytes);
+    assert_eq!(w[0].space, "DeviceRGB", "no conversion");
+}
+
+/// #3012 review: in an RGB document Press Quality converts to Document CMYK too, the CMYK
+/// profile in effect: a CMYK image keeps its inks (not converted to RGB), and an RGB image comes
+/// out CMYK.
+#[test]
+fn press_quality_writes_cmyk_in_an_rgb_document_too() {
+    let press = || PdfOptions { settings: builtin_preset("Press Quality").unwrap().settings, created: Some(1_700_000_000), ..Default::default() };
+    assert_eq!(press().settings.output.destination, DOCUMENT_CMYK);
+    let ink = [0u8, 102, 255, 0];
+    let tiff = ImageBlob::cmyk_tiff(&Inks::new(4, 4, flat(ink, 16)).unwrap()).unwrap();
+    let rgb = image::RgbImage::from_fn(4, 4, |x, y| image::Rgb([(x * 60) as u8, (y * 60) as u8, 128]));
+    let png_blob = ImageBlob { mime: "image/png".into(), bytes: Arc::new(png(rgb)), proxy: None };
+    for (what, blob) in [("CMYK image", tiff), ("RGB image", png_blob)] {
+        let mut d = image_doc(blob, 4, 4);
+        d.color_mode = ColorMode::Rgb;
+        let out = export_with_report(&d, &press()).unwrap();
+        let w = written(&out.bytes);
+        assert_eq!(w.len(), 1, "{what}: {w:?}");
+        assert_eq!(w[0].space, "DeviceCMYK", "{what} in an RGB document");
+        // Preserve Numbers: the CMYK image comes back with the inks it had.
+        if what == "CMYK image" {
+            let back = import(&out.bytes).unwrap();
+            assert_eq!(all_images(&back)[0].cmyk().unwrap().data, flat(ink, 16), "{what} inks");
+        }
+    }
 }

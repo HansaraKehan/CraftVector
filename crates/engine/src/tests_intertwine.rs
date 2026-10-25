@@ -151,6 +151,67 @@ fn release_gives_the_objects_back_as_they_were() {
     assert!(red(&render(&s), 50, 30));
 }
 
+/// #2540: Object › Expand turns the group into a plain group of what it draws (the rings, then the
+/// part of A drawn over B as a clip group) in one undo step, looking the same; Ungroup then takes
+/// it apart.
+#[test]
+fn expand_turns_the_group_into_plain_art_that_ungroups() {
+    let mut s = session();
+    let (g, a, b) = intertwined(&mut s);
+    arrange(&mut s, json!({"at": [50, 30]}));
+    assert_eq!(s.execute("object.expand.info", &json!({})).unwrap()["object"], json!(true));
+    let undo = s.doc().unwrap().history.undo.len();
+    s.execute("object.expand", &json!({"fill": false, "stroke": false})).unwrap();
+    let n = s.doc().unwrap().doc.node(g).unwrap().clone();
+    let NodeKind::Group { children, clip: false } = &n.kind else { panic!("a group: {}", n.kind_label()) };
+    assert_eq!(children.len(), 3, "the rings, then the part of A drawn over B");
+    assert_eq!((children[0].id, children[1].id), (a, b), "the rings keep their ids and order");
+    assert!(matches!(children[2].kind, NodeKind::Group { clip: true, .. }));
+    assert!(children.iter().all(|c| c.extras().intertwine.is_none()), "no area is left over");
+    let mut ids = vec![];
+    n.walk(&mut |c| ids.push(c.id));
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert!(unique.len() == ids.len() && !ids.contains(&NodeId(0)), "the generated art has ids of its own: {ids:?}");
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+    assert_eq!(s.doc().unwrap().selection.objects.to_vec(), [g]);
+    assert_eq!(s.execute("object.expand.info", &json!({})).unwrap()["object"], json!(false), "nothing live is left");
+    let r = render(&s);
+    assert!(red(&r, 50, 30) && blue(&r, 50, 70), "it looks as it did");
+    // Plain art: Ungroup takes it apart.
+    s.execute("object.ungroup", &json!({})).unwrap();
+    assert!(s.doc().unwrap().doc.node(g).is_none());
+    assert_eq!(s.doc().unwrap().selection.objects.len(), 3);
+    let r = render(&s);
+    assert!(red(&r, 50, 30) && blue(&r, 50, 70));
+    // Undo brings the Intertwine group back.
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(matches!(s.doc().unwrap().doc.node(g).unwrap().kind, NodeKind::Intertwine { .. }));
+}
+
+/// Expand reaches an Intertwine group inside a selected group, and with every option on also
+/// outlines the strokes of the rings and of the part drawn over the other one.
+#[test]
+fn expand_reaches_intertwine_groups_in_groups_and_outlines_their_strokes() {
+    let mut s = session();
+    let (g, ..) = intertwined(&mut s);
+    arrange(&mut s, json!({"at": [50, 30]}));
+    let c = id_of(&s.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 5, "height": 5})).unwrap());
+    select(&mut s, &[g, c]);
+    let outer = id_of(&s.execute("object.group", &json!({})).unwrap());
+    s.execute("object.expand", &json!({})).unwrap();
+    let (mut intertwines, mut strokes) = (0, 0);
+    s.doc().unwrap().doc.node(outer).unwrap().walk(&mut |n| {
+        intertwines += usize::from(matches!(n.kind, NodeKind::Intertwine { .. }));
+        strokes += usize::from(!n.appearance.stroke_paint().is_none());
+    });
+    assert_eq!((intertwines, strokes), (0, 0));
+    let r = render(&s);
+    assert!(red(&r, 50, 30) && blue(&r, 50, 70), "it looks as it did");
+    let info = s.execute("object.expand.info", &json!({})).unwrap();
+    assert_eq!((&info["object"], &info["stroke"]), (&json!(false), &json!(false)), "nothing is left to expand");
+}
+
 #[test]
 fn the_arranged_areas_move_with_the_group() {
     let mut s = session();

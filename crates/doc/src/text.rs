@@ -32,6 +32,11 @@ pub struct CharStyle {
     /// wouldn't pick (an imported file's type matched to it); None = the one they pick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_version: Option<String>,
+    /// Variation axis settings of a variable font (Character panel › Variable Font), by axis tag
+    /// (`wght`, `wdth`), in the axis's own units. They replace the named instance's setting of
+    /// each axis they name; the other axes keep the style's settings. Empty: the style as it is.
+    #[serde(default, rename = "fontAxes", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub font_axes: std::collections::BTreeMap<String, f64>,
     /// Size in points.
     pub size: f64,
     /// Leading in points; None = Auto (120% of size).
@@ -99,15 +104,33 @@ pub struct CharStyle {
     /// their line line up with it.
     #[serde(default, rename = "charAlign", skip_serializing_if = "crate::skip::is_default")]
     pub char_align: CharAlign,
+    /// Character Direction (Character panel menu, Middle Eastern options): these characters are
+    /// set left to right or right to left inside their paragraph, each stretch of them a Unicode
+    /// bidi embedding (UAX #9 LRE or RLE); None = Default, the direction the bidi algorithm gives
+    /// them.
+    #[serde(default, rename = "charDirection", skip_serializing_if = "Option::is_none")]
+    pub char_direction: Option<ParaDirection>,
     /// Proportional Metrics (Character panel menu, East Asian options): full-width glyphs take the
     /// font's own proportional widths, OpenType `palt` (#966); in vertical type upright glyphs take
     /// its proportional heights, `vpal`.
     #[serde(default, rename = "proportionalMetrics", skip_serializing_if = "crate::skip::is_default")]
     pub proportional_metrics: bool,
+    /// Tate-chu-yoko (Character panel menu, East Asian options): in vertical type these characters
+    /// stand side by side across one em of the column. Horizontal type keeps the mark and does not
+    /// move them. Two or three half-width digits do this without the mark.
+    /// <https://helpx.adobe.com/illustrator/using/formatting-asian-characters.html>
+    #[serde(default, rename = "tateChuYoko", skip_serializing_if = "crate::skip::is_default")]
+    pub tate_chu_yoko: bool,
     /// Digits (Character panel menu, Middle Eastern options): the numeral system the digits of
     /// these characters are drawn in, whatever digits were typed.
     #[serde(default, skip_serializing_if = "crate::skip::is_default")]
     pub digits: Digits,
+    /// No Break (Character panel menu): these characters are not broken across lines, including
+    /// at a space or a hyphenation point inside the run. A run longer than the line stays together
+    /// and can overflow it.
+    /// <https://helpx.adobe.com/illustrator/using/hyphenation-line-breaks.html>
+    #[serde(default, rename = "noBreak", skip_serializing_if = "crate::skip::is_default")]
+    pub no_break: bool,
 }
 
 /// The numeral system digits are drawn in ([`CharStyle::digits`]): as typed, or every digit of
@@ -174,6 +197,18 @@ pub struct ScriptMetrics {
 
 impl ScriptMetrics {
     pub const DEFAULT: Self = Self { size: 58.3, position: 33.3 };
+    /// Returns these proportions with the size kept to 1 to 500% and the position kept to -500 to
+    /// 500%, the ranges `document.setup` takes for `superscript` and `subscript`. A value outside
+    /// its range becomes the nearer end.
+    pub fn in_range(self) -> Self {
+        Self { size: self.size.clamp(1.0, 500.0), position: self.position.clamp(-500.0, 500.0) }
+    }
+}
+
+/// Returns a small caps size kept to 1 to 200%, the range `document.setup` takes for
+/// `smallCapsSize`. A size outside it becomes the nearer end.
+fn small_caps_in_range(size: f64) -> f64 {
+    size.clamp(1.0, 200.0)
 }
 
 impl Default for ScriptMetrics {
@@ -210,6 +245,14 @@ impl CharPosition {
             CharPosition::Subscript(_) => "subscript",
         }
     }
+    /// Returns this position with its proportions kept by [`ScriptMetrics::in_range`].
+    pub fn in_range(self) -> Self {
+        match self {
+            CharPosition::Normal => CharPosition::Normal,
+            CharPosition::Superscript(m) => CharPosition::Superscript(m.in_range()),
+            CharPosition::Subscript(m) => CharPosition::Subscript(m.in_range()),
+        }
+    }
 }
 
 fn ten() -> f64 {
@@ -224,6 +267,9 @@ fn regular() -> String {
 fn hundred() -> f64 {
     100.0
 }
+fn yes() -> bool {
+    true
+}
 
 impl Default for CharStyle {
     fn default() -> Self {
@@ -231,6 +277,7 @@ impl Default for CharStyle {
             font_family: "Source Sans 3".into(),
             font_style: "Regular".into(),
             font_version: None,
+            font_axes: std::collections::BTreeMap::new(),
             size: 12.0,
             leading: None,
             tracking: 0.0,
@@ -256,9 +303,12 @@ impl Default for CharStyle {
             stroke_align: StrokeAlign::Center,
             position: CharPosition::Normal,
             char_align: CharAlign::RomanBaseline,
+            char_direction: None,
             proportional_metrics: false,
+            tate_chu_yoko: false,
             small_caps: None,
             digits: Digits::Default,
+            no_break: false,
         }
     }
 }
@@ -266,6 +316,20 @@ impl Default for CharStyle {
 impl CharStyle {
     pub fn effective_leading(&self) -> f64 {
         self.leading.unwrap_or(self.size * 1.2)
+    }
+    /// Keeps the size, leading, baseline shift and horizontal and vertical scales in range: a size
+    /// or scale of 0 or less becomes the default new type takes (12 pt, 100%), a negative leading
+    /// becomes Auto, and a value past [`crate::MAX_COORD`] (a baseline shift past it either way)
+    /// becomes the nearer end. A leading of 0, which legacy `.ai` import stores, stays, and a
+    /// baseline shift that is not a number becomes 0.
+    pub fn keep_dimensions_in_range(&mut self) {
+        let default = Self::default();
+        let within = |v: f64, or: f64| if v > 0.0 { v.min(crate::MAX_COORD) } else { or };
+        self.size = within(self.size, default.size);
+        self.h_scale = within(self.h_scale, default.h_scale);
+        self.v_scale = within(self.v_scale, default.v_scale);
+        self.leading = self.leading.filter(|l| *l >= 0.0).map(|l| l.min(crate::MAX_COORD));
+        self.baseline_shift = if self.baseline_shift.is_nan() { 0.0 } else { self.baseline_shift.clamp(-crate::MAX_COORD, crate::MAX_COORD) };
     }
     /// Do the characters draw a stroke (a paint and a positive weight)?
     pub fn has_stroke(&self) -> bool {
@@ -327,6 +391,60 @@ impl CharStyle {
     pub fn basic_appearance(&self) -> Appearance {
         Appearance { items: vec![AppearanceItem::Fill(self.fill_layer()), AppearanceItem::Stroke(self.stroke_layer())], ..Default::default() }
     }
+    /// Keeps the superscript or subscript proportions in range with [`CharPosition::in_range`] and
+    /// keeps the small caps size to 1 to 200%, the range `document.setup` takes for `smallCapsSize`.
+    pub fn keep_scripts_in_range(&mut self) {
+        self.position = self.position.in_range();
+        self.small_caps = self.small_caps.map(small_caps_in_range);
+    }
+}
+
+impl crate::Document {
+    /// Keeps the superscript, subscript and small caps proportions to the ranges `document.setup`
+    /// takes ([`CharStyle::keep_scripts_in_range`]) in the type of the layers, symbols, graph
+    /// designs, pattern swatches and the pattern definition that pattern editing's Cancel puts
+    /// back (opacity-mask art included), in graphs' label styles and in the character styles. It
+    /// recurses through the art: call it on a document no deeper than [`crate::depth::MAX_DEPTH`].
+    pub fn keep_scripts_in_range(&mut self) {
+        let mut fix = |n: &mut crate::Node| {
+            if let crate::NodeKind::Text(t) = &mut n.kind {
+                for r in &mut t.runs {
+                    r.style.keep_scripts_in_range();
+                }
+            }
+            if let Some(g) = n.extras_if_any().and_then(|e| e.graph.as_deref_mut()) {
+                let l = &mut g.label_styles;
+                for st in [&mut l.values, &mut l.categories, &mut l.legend].into_iter().flatten() {
+                    st.keep_scripts_in_range();
+                }
+            }
+        };
+        let roots = self
+            .layers
+            .iter_mut()
+            .chain(self.symbols.iter_mut().map(|s| &mut s.art))
+            .chain(self.graph_designs.iter_mut().map(|g| &mut g.art))
+            .chain(self.patterns.iter_mut().flat_map(|p| p.art.iter_mut()))
+            .chain(self.pattern_edit.iter_mut().filter_map(|pe| pe.original.as_mut()).flat_map(|p| p.art.iter_mut()));
+        for root in roots {
+            crate::placed_document::each_mut(std::sync::Arc::make_mut(root), &mut fix);
+        }
+        // Character styles store the attributes they set by their serialized names.
+        for def in self.char_styles.iter_mut() {
+            if let Some(v) = def.attrs.get_mut("position")
+                && let Ok(p) = serde_json::from_value::<CharPosition>(v.clone())
+                && p.in_range() != p
+            {
+                *v = serde_json::to_value(p.in_range()).unwrap_or(serde_json::Value::Null);
+            }
+            if let Some(v) = def.attrs.get_mut("small_caps")
+                && let Some(size) = v.as_f64()
+                && small_caps_in_range(size) != size
+            {
+                *v = small_caps_in_range(size).into();
+            }
+        }
+    }
 }
 
 /// Tab stop alignment (Tabs panel).
@@ -362,6 +480,206 @@ fn default_align_on() -> char {
 
 /// Distance between default tab stops when no explicit stop applies (½ inch).
 pub const DEFAULT_TAB_INTERVAL: f64 = 36.0;
+
+/// The bullet of a bulleted list ([`ParaList::bullet`]): the Paragraph panel's Bullets presets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Bullet {
+    /// A filled dot (•).
+    #[default]
+    Dot,
+    /// A dash (–).
+    Dash,
+    /// A hollow circle (◦).
+    Circle,
+    /// A filled square (▪).
+    Square,
+}
+
+impl Bullet {
+    /// The character the layout draws for the bullet.
+    pub fn character(self) -> char {
+        match self {
+            Bullet::Dot => '\u{2022}',
+            Bullet::Dash => '\u{2013}',
+            Bullet::Circle => '\u{25E6}',
+            Bullet::Square => '\u{25AA}',
+        }
+    }
+}
+
+/// How a numbered list writes its numbers ([`ParaList::number`]): the Paragraph panel's Numbered
+/// List presets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NumberStyle {
+    /// 1, 2, 3…
+    #[default]
+    Arabic,
+    /// A, B, C… Z, AA, BB…
+    UpperLetters,
+    /// a, b, c… z, aa, bb…
+    LowerLetters,
+    /// I, II, III, IV…
+    UpperRoman,
+    /// i, ii, iii, iv…
+    LowerRoman,
+    /// 01, 02… 99, 100…
+    TwoDigits,
+    /// 001, 002… 999, 1000…
+    ThreeDigits,
+}
+
+/// Past this number, roman numerals and letters are written in Arabic digits.
+const MAX_LETTERS_OR_ROMAN: u32 = 3999;
+
+impl NumberStyle {
+    /// Every style, in the order the Numbered List presets list them.
+    pub const ALL: [NumberStyle; 7] = [
+        NumberStyle::Arabic,
+        NumberStyle::UpperLetters,
+        NumberStyle::LowerLetters,
+        NumberStyle::UpperRoman,
+        NumberStyle::LowerRoman,
+        NumberStyle::TwoDigits,
+        NumberStyle::ThreeDigits,
+    ];
+
+    /// Number `n` (1 or more) written in this style, without a separator. Letters run A to Z, then
+    /// AA to ZZ, then AAA and so on; roman numerals use the subtractive forms (IV, IX, XL, XC, CD,
+    /// CM); both are written in Arabic digits past 3999. Two and three digits pad with zeros and
+    /// keep every digit of a longer number.
+    pub fn format(self, n: u32) -> String {
+        let letters_or_roman =
+            matches!(self, NumberStyle::UpperLetters | NumberStyle::LowerLetters | NumberStyle::UpperRoman | NumberStyle::LowerRoman);
+        if n == 0 || (letters_or_roman && n > MAX_LETTERS_OR_ROMAN) {
+            return n.to_string();
+        }
+        match self {
+            NumberStyle::Arabic => n.to_string(),
+            NumberStyle::TwoDigits => format!("{n:02}"),
+            NumberStyle::ThreeDigits => format!("{n:03}"),
+            NumberStyle::UpperLetters => letters(n),
+            NumberStyle::LowerLetters => letters(n).to_lowercase(),
+            NumberStyle::UpperRoman => roman(n),
+            NumberStyle::LowerRoman => roman(n).to_lowercase(),
+        }
+    }
+}
+
+/// `n` (1 or more) in capital letters: A to Z, then each letter twice, three times and so on.
+fn letters(n: u32) -> String {
+    let n = n - 1;
+    let letter = char::from(b'A' + (n % 26) as u8);
+    std::iter::repeat_n(letter, (n / 26 + 1) as usize).collect()
+}
+
+/// `n` (1 to 3999) in capital roman numerals.
+fn roman(mut n: u32) -> String {
+    const DIGITS: [(u32, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut s = String::new();
+    for (value, digits) in DIGITS {
+        while n >= value {
+            s.push_str(digits);
+            n -= value;
+        }
+    }
+    s
+}
+
+/// The list a paragraph is in (Paragraph panel › Bullets and Numbered List). The layout draws the
+/// list's marker before the paragraph's first line, in the font, size and color of the paragraph's
+/// first character without its baseline shift, rotation, superscript or subscript, tracking, manual
+/// kerning, tate-chu-yoko, underline and strikethrough ([`Self::marker_style`]), and the text after
+/// it starts at the next tab stop, the left indent counting as a stop. The marker is not a
+/// character of the text, and an empty paragraph has none. A saved list reads the fields it leaves
+/// out as their defaults, and a build ignores the fields it doesn't know.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParaList {
+    /// The bullet each paragraph of a bulleted list starts with. A numbered list keeps it for
+    /// when the list is made bulleted again.
+    pub bullet: Bullet,
+    /// A numbered list's number style. A bulleted list has none, and the file saves it only for a
+    /// numbered list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<NumberStyle>,
+}
+
+impl ParaList {
+    /// A bulleted list with `bullet`.
+    pub fn bulleted(bullet: Bullet) -> Self {
+        Self { bullet, number: None }
+    }
+
+    /// A numbered list with `style`.
+    pub fn numbered(style: NumberStyle) -> Self {
+        Self { bullet: Bullet::default(), number: Some(style) }
+    }
+
+    /// The characters of the marker the layout draws before the paragraph: the bullet, or for a
+    /// numbered list number `n` in its style followed by a period.
+    pub fn marker(&self, n: u32) -> String {
+        match self.number {
+            Some(style) => format!("{}.", style.format(n)),
+            None => self.bullet.character().to_string(),
+        }
+    }
+
+    /// The marker of the next paragraph of a story, whose list is `list` (None: in no list) and
+    /// which holds no text when `empty`, with `count` the numbered paragraphs counted before it.
+    /// A paragraph in no list sets the count back to 0 and has no marker; an empty paragraph has
+    /// none and leaves the count as it is; a bulleted paragraph has its bullet and leaves the
+    /// count as it is; a numbered paragraph adds one to the count and is numbered with it.
+    pub fn next_marker(list: Option<ParaList>, empty: bool, count: &mut u32) -> Option<String> {
+        let Some(list) = list else {
+            *count = 0;
+            return None;
+        };
+        if empty {
+            return None;
+        }
+        if list.number.is_some() {
+            *count = count.saturating_add(1);
+        }
+        Some(list.marker(*count))
+    }
+
+    /// The style the marker is set in: `first` (the style of the paragraph's first character)
+    /// without its baseline shift, rotation, superscript or subscript, tracking, manual kerning,
+    /// tate-chu-yoko, underline and strikethrough.
+    pub fn marker_style(first: &CharStyle) -> CharStyle {
+        CharStyle {
+            baseline_shift: 0.0,
+            rotation: 0.0,
+            position: CharPosition::Normal,
+            tracking: 0.0,
+            kerning: None,
+            tate_chu_yoko: false,
+            underline: false,
+            strikethrough: false,
+            ..first.clone()
+        }
+    }
+}
+
+/// The left and first-line indents (pt) a list gives a paragraph whose indents are both 0: the
+/// marker hangs in the first line's 18 pt before the text.
+pub const LIST_HANGING_INDENT: f64 = 18.0;
 
 /// Paragraph composer (Paragraph panel menu): how lines are broken.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,6 +730,127 @@ impl Default for HyphenationOptions {
     }
 }
 
+/// How a justified line holding a single word is set ([`JustificationOptions::single_word`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SingleWordJustify {
+    /// Spread across the line, between its letters.
+    #[default]
+    FullJustify,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+}
+
+/// A paragraph's justification options (Paragraph panel menu › Justification…), in percent.
+///
+/// Each spacing has a Minimum, a Desired and a Maximum value (`[min, desired, max]`). Desired
+/// applies to every line of the paragraph, justified or not: word spaces are that share of the
+/// font's word space, each letter is followed by that share of a word space, and glyphs are that
+/// wide. Justified lines may vary them between Minimum and Maximum to fill the measure. Saved only
+/// when they differ from the defaults: word spacing 80/100/133, letter spacing 0/0/0, glyph
+/// scaling 100/100/100, Auto Leading 120 and Full Justify.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JustificationOptions {
+    /// Word Spacing, percent of the font's word space (0..1000).
+    pub word_spacing: [f64; 3],
+    /// Letter Spacing, percent of the font's word space added after each letter (-100..500).
+    pub letter_spacing: [f64; 3],
+    /// Glyph Scaling, percent of the glyphs' width (50..200).
+    pub glyph_scaling: [f64; 3],
+    /// Auto Leading: the leading of characters whose leading is Auto, in percent of their size
+    /// (0..500).
+    pub auto_leading: f64,
+    /// Single Word Justification: how a justified line holding one word is set.
+    pub single_word: SingleWordJustify,
+}
+
+impl JustificationOptions {
+    /// Word Spacing's range (percent).
+    pub const WORD_SPACING: (f64, f64) = (0.0, 1000.0);
+    /// Letter Spacing's range (percent).
+    pub const LETTER_SPACING: (f64, f64) = (-100.0, 500.0);
+    /// Glyph Scaling's range (percent).
+    pub const GLYPH_SCALING: (f64, f64) = (50.0, 200.0);
+    /// Auto Leading's range (percent).
+    pub const AUTO_LEADING: (f64, f64) = (0.0, 500.0);
+
+    /// Are Desired word spacing, letter spacing and glyph scaling the defaults (nothing to change
+    /// in a line's natural widths)?
+    pub fn desired_is_default(&self) -> bool {
+        let d = Self::default();
+        self.word_spacing[1] == d.word_spacing[1] && self.letter_spacing[1] == d.letter_spacing[1] && self.glyph_scaling[1] == d.glyph_scaling[1]
+    }
+
+    /// Keeps options read from a file to what `text.setFormat` can set: a value that is not a
+    /// finite number becomes its default, every value is clamped to its range, and a Minimum,
+    /// Desired and Maximum out of order go back to their defaults together.
+    pub fn keep_in_range(&mut self) {
+        let d = Self::default();
+        for (v, dv, (lo, hi)) in [
+            (&mut self.word_spacing, d.word_spacing, Self::WORD_SPACING),
+            (&mut self.letter_spacing, d.letter_spacing, Self::LETTER_SPACING),
+            (&mut self.glyph_scaling, d.glyph_scaling, Self::GLYPH_SCALING),
+        ] {
+            for (x, dx) in v.iter_mut().zip(dv) {
+                *x = if x.is_finite() { x.clamp(lo, hi) } else { dx };
+            }
+            if !(v[0] <= v[1] && v[1] <= v[2]) {
+                *v = dv;
+            }
+        }
+        let (lo, hi) = Self::AUTO_LEADING;
+        self.auto_leading = if self.auto_leading.is_finite() { self.auto_leading.clamp(lo, hi) } else { d.auto_leading };
+    }
+
+    /// A paragraph's leading for characters of `size` whose leading is Auto.
+    pub fn auto_leading_for(&self, size: f64) -> f64 {
+        size * self.auto_leading / 100.0
+    }
+}
+
+impl Default for JustificationOptions {
+    fn default() -> Self {
+        Self {
+            word_spacing: [80.0, 100.0, 133.0],
+            letter_spacing: [0.0, 0.0, 0.0],
+            glyph_scaling: [100.0, 100.0, 100.0],
+            auto_leading: 120.0,
+            single_word: SingleWordJustify::FullJustify,
+        }
+    }
+}
+
+/// Insert Kashidas (Paragraph panel): how long the kashidas are that lengthen the Arabic words of
+/// a justified paragraph's lines. A kashida is a tatweel (U+0640) drawn between a word's last pair
+/// of joined letters, at most one in each word. Short, Medium and Long kashidas are at most a quarter
+/// of an em, half an em and an em long; a Stylistic kashida is a row of whole tatweels as the font
+/// draws them, at most an em long.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Kashida {
+    /// No kashidas: justified lines widen their word spaces.
+    #[default]
+    None,
+    Short,
+    Medium,
+    Long,
+    Stylistic,
+}
+
+impl Kashida {
+    /// The longest kashida, in ems of the letter that follows it in the text; 0 for None.
+    pub fn max_em(self) -> f64 {
+        match self {
+            Kashida::None => 0.0,
+            Kashida::Short => 0.25,
+            Kashida::Medium => 0.5,
+            Kashida::Long | Kashida::Stylistic => 1.0,
+        }
+    }
+}
+
 /// Paragraph attributes (the Paragraph panel).
 ///
 /// Saved through [`ParaStyleFile`], which keeps files with text openable by builds from before
@@ -428,10 +867,16 @@ pub struct ParaStyle {
     pub hyphenate: bool,
     /// The limits automatic hyphenation keeps to (Paragraph panel menu › Hyphenation…).
     pub hyphenation: HyphenationOptions,
+    /// Word and letter spacing, glyph scaling, Auto Leading and Single Word Justification
+    /// (Paragraph panel menu › Justification…).
+    pub justification: JustificationOptions,
     /// Line breaking: Single-line or Every-line Composer.
     pub composer: Composer,
     /// Tab stops (Tabs panel), sorted by position.
     pub tabs: Vec<TabStop>,
+    /// Bullets (Paragraph panel): the list the paragraph is in; None for a paragraph that is not
+    /// in a list.
+    pub list: Option<ParaList>,
     /// Paragraph style (Paragraph Styles panel) these attributes come from; None = Normal.
     pub style_name: Option<String>,
     /// Japanese composition: the spacing of punctuation (Paragraph panel › Mojikumi). Type made
@@ -452,6 +897,42 @@ pub struct ParaStyle {
     /// Kinsoku (Paragraph panel › Kinsoku Set): which Japanese characters may not start or end a
     /// line.
     pub kinsoku: Kinsoku,
+    /// Roman Hanging Punctuation (Paragraph panel menu): quotation marks, hyphens, full stops and
+    /// commas starting or ending a line hang outside the margin, and asterisks, tildes, ellipses,
+    /// dashes, colons and semicolons hang by half. East Asian punctuation hangs by burasagari.
+    pub roman_hanging: bool,
+    /// Insert Kashidas (Paragraph panel): justified lines lengthen their Arabic words with
+    /// kashidas before they widen their word spaces.
+    pub kashida: Kashida,
+}
+
+impl ParaStyle {
+    /// Keeps the indents and the space before and after to -[`crate::MAX_COORD`] to
+    /// [`crate::MAX_COORD`], and the tab stop positions to 0 to 100,000 pt, the range
+    /// `text.tabs.set` takes. A value outside its range becomes the nearer end, and one that is
+    /// not a number becomes 0.
+    pub fn keep_spacing_in_range(&mut self) {
+        let within = |v: f64, lo: f64, hi: f64| if v.is_nan() { 0.0 } else { v.clamp(lo, hi) };
+        for v in [&mut self.left_indent, &mut self.right_indent, &mut self.first_line_indent, &mut self.space_before, &mut self.space_after] {
+            *v = within(*v, -crate::MAX_COORD, crate::MAX_COORD);
+        }
+        for t in &mut self.tabs {
+            t.position = within(t.position, 0.0, 100_000.0);
+        }
+    }
+
+    /// The leading of characters styled `st` in this paragraph, as the layout sets it: their own
+    /// leading, or for Auto leading the paragraph's Justification › Auto Leading share of their
+    /// size (exactly [`CharStyle::effective_leading`] at the default 120%, or when the share is
+    /// not a finite number).
+    pub fn effective_leading(&self, st: &CharStyle) -> f64 {
+        let auto = self.justification.auto_leading;
+        if st.leading.is_some() || auto == JustificationOptions::default().auto_leading {
+            return st.effective_leading();
+        }
+        let l = self.justification.auto_leading_for(st.size);
+        if l.is_finite() { l } else { st.effective_leading() }
+    }
 }
 
 /// [`ParaStyle`] as saved. [`Justify::Auto`] is written as the alignment it has in the paragraph
@@ -477,10 +958,14 @@ struct ParaStyleFile {
     hyphenate: bool,
     #[serde(default, skip_serializing_if = "crate::skip::is_default")]
     hyphenation: HyphenationOptions,
+    #[serde(default, skip_serializing_if = "crate::skip::is_default")]
+    justification: JustificationOptions,
     #[serde(default, skip_serializing_if = "Composer::is_default")]
     composer: Composer,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tabs: Vec<TabStop>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    list: Option<ParaList>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     style_name: Option<String>,
     #[serde(default, skip_serializing_if = "Mojikumi::is_none")]
@@ -493,6 +978,10 @@ struct ParaStyleFile {
     burasagari: Burasagari,
     #[serde(default, skip_serializing_if = "crate::skip::is_default")]
     kinsoku: Kinsoku,
+    #[serde(default, skip_serializing_if = "crate::skip::is_default")]
+    roman_hanging: bool,
+    #[serde(default, skip_serializing_if = "crate::skip::is_default")]
+    kashida: Kashida,
 }
 
 impl From<ParaStyle> for ParaStyleFile {
@@ -511,14 +1000,18 @@ impl From<ParaStyle> for ParaStyleFile {
             space_after,
             hyphenate,
             hyphenation,
+            justification,
             composer,
             tabs,
+            list,
             style_name,
             mojikumi,
             direction,
             leading_model,
             burasagari,
             kinsoku,
+            roman_hanging,
+            kashida,
             ..
         } = p;
         Self {
@@ -531,14 +1024,18 @@ impl From<ParaStyle> for ParaStyleFile {
             space_after,
             hyphenate,
             hyphenation,
+            justification,
             composer,
             tabs,
+            list,
             style_name,
             mojikumi,
             direction,
             leading_model,
             burasagari,
             kinsoku,
+            roman_hanging,
+            kashida,
         }
     }
 }
@@ -546,6 +1043,8 @@ impl From<ParaStyle> for ParaStyleFile {
 impl From<ParaStyleFile> for ParaStyle {
     fn from(f: ParaStyleFile) -> Self {
         let justify = if f.justify_auto { Justify::Auto } else { f.justify };
+        let mut justification = f.justification;
+        justification.keep_in_range();
         let ParaStyleFile {
             left_indent,
             right_indent,
@@ -556,12 +1055,15 @@ impl From<ParaStyleFile> for ParaStyle {
             hyphenation,
             composer,
             tabs,
+            list,
             style_name,
             mojikumi,
             direction,
             leading_model,
             burasagari,
             kinsoku,
+            roman_hanging,
+            kashida,
             ..
         } = f;
         Self {
@@ -573,19 +1075,24 @@ impl From<ParaStyleFile> for ParaStyle {
             space_after,
             hyphenate,
             hyphenation,
+            justification,
             composer,
             tabs,
+            list,
             style_name,
             mojikumi,
             direction,
             leading_model,
             burasagari,
             kinsoku,
+            roman_hanging,
+            kashida,
         }
     }
 }
 
-/// A paragraph's base direction ([`ParaStyle::direction`]).
+/// A paragraph's base direction ([`ParaStyle::direction`]), or the direction characters are set
+/// in ([`CharStyle::char_direction`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ParaDirection {
@@ -965,6 +1472,10 @@ fn one() -> f64 {
     1.0
 }
 
+fn fifty() -> f64 {
+    50.0
+}
+
 impl InlineArt {
     pub fn new(symbol: impl Into<String>) -> Self {
         Self { symbol: symbol.into(), scale: 1.0, baseline_shift: 0.0, bounds: None }
@@ -1030,6 +1541,68 @@ fn reverse_from_end(path: &mut PathData) {
     }
 }
 
+/// Where ruby (furigana) text sits: above its base text in horizontal type, right of it in
+/// vertical type (the Japanese convention), or below (left in vertical type).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RubyPosition {
+    #[default]
+    Above,
+    Below,
+}
+
+/// How ruby text lines up over its base text when the two are different widths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RubyAlign {
+    /// Centred over the base text.
+    #[default]
+    Center,
+    /// Starting at the base text's start (left in horizontal type, top in vertical).
+    Start,
+    /// Ending at the base text's end (right in horizontal type, bottom in vertical).
+    End,
+}
+
+/// Ruby (furigana, phonetic guide): a reading set over a range of the text.
+///
+/// `start`/`end` are byte offsets into [`TextObject::plain_text`] (the same space as
+/// [`crate::TextObject`] commands' `start`/`end`). The base text itself stays the text;
+/// emptying the reading removes the ruby. New ruby is half the base text's size, centred, and
+/// allowed to overhang neighbouring characters when the reading is longer than its base.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RubySpan {
+    /// Byte offset of the first base character in the plain text.
+    pub start: usize,
+    /// Byte offset just past the last base character.
+    pub end: usize,
+    /// The reading, set in the base characters' font (its size comes from `size_percent`).
+    pub text: String,
+    #[serde(default)]
+    pub position: RubyPosition,
+    #[serde(default)]
+    pub align: RubyAlign,
+    /// Ruby size as a percentage of the base text's size, 1–100 (50 = half, the usual).
+    #[serde(default = "fifty")]
+    pub size_percent: f64,
+    /// Let a reading wider than its base hang over the neighbouring characters instead of being
+    /// squeezed to the base's width.
+    #[serde(default = "yes")]
+    pub overhang: bool,
+}
+
+impl RubySpan {
+    /// Ruby over `start..end` with reading `text`, at the defaults (half size, centred, overhanging).
+    pub fn new(start: usize, end: usize, text: impl Into<String>) -> Self {
+        Self { start, end, text: text.into(), position: RubyPosition::Above, align: RubyAlign::Center, size_percent: 50.0, overhang: true }
+    }
+    /// `size_percent` made finite and usable: 1–100% (untrusted input).
+    pub fn safe_size_percent(&self) -> f64 {
+        if self.size_percent.is_finite() { self.size_percent.clamp(1.0, 100.0) } else { 50.0 }
+    }
+}
+
 /// A text object. `runs` split into paragraphs at `\n`.
 ///
 /// Paragraph attributes: `para` is paragraph 0's (and, while `paras` is empty, every
@@ -1045,11 +1618,21 @@ pub struct TextObject {
     /// Maps text space (origin = first baseline start for point type) to the document.
     pub xf: Affine,
     pub runs: Vec<TextRun>,
+    /// Ruby (furigana / phonetic guide) over byte ranges of the plain text; empty = none. Kept on
+    /// the object, so the runs (and their styles) stay the text itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ruby: Vec<RubySpan>,
     #[serde(default)]
     pub para: ParaStyle,
     /// Per-paragraph attributes (see the type's docs); empty = every paragraph uses `para`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paras: Vec<ParaStyle>,
+    /// Threaded text: the first paragraph continues from the frame before this one in its thread,
+    /// so its first line here has no first-line indent and no list marker. The engine sets it for
+    /// every frame of a thread when the story flows through them and when a file opens, and clears
+    /// it on a frame that leaves its thread and on a copy. Not saved.
+    #[serde(skip)]
+    pub first_para_continues: bool,
     /// Area Type Options (area type only).
     #[serde(default, skip_serializing_if = "crate::skip::is_default")]
     pub area: AreaOptions,
@@ -1067,6 +1650,30 @@ pub struct TextObject {
     /// Wrap objects above this area type, resolved by the engine after each edit (text space).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wrap: Vec<WrapShape>,
+    /// Type › Optical Margin Alignment: in every paragraph, Latin punctuation and the slanted
+    /// sides of letters such as A and W at a line's start or end hang outside the margin there
+    /// (point and area type, and type on a path at its brackets; see the layout's `optical_hangs`).
+    /// Off for new type and for documents from before it, and saved only when on.
+    #[serde(default, rename = "opticalMarginAlignment", skip_serializing_if = "crate::skip::is_default")]
+    pub optical_margin: bool,
+    /// Character panel menu › System Layout, copied from the document: when on, each character
+    /// that takes space advances by a whole number of points. Off by default, and saved only when
+    /// on. The document setting is [`crate::DocSetup::system_layout`].
+    #[serde(default, rename = "systemLayout", skip_serializing_if = "crate::skip::is_default")]
+    pub system_layout: bool,
+    /// Character panel menu › Fractional Widths: spacing between characters uses fractions of a
+    /// point. On for new type and for documents from before it, and saved only when off. Off, each
+    /// character that takes any space advances by a whole number of points, at least one, so small
+    /// type does not run together. The setting is the whole type object, not a range of characters.
+    /// <https://helpx.adobe.com/illustrator/desktop/design-with-text/edit-format-text/turn-fractional-character-widths-off-or-on.html>
+    #[serde(default = "yes", rename = "fractionalWidths", skip_serializing_if = "crate::skip::is_true")]
+    pub fractional_widths: bool,
+    /// Threaded text: the numbered list paragraphs the story's earlier frames count before this
+    /// frame's first paragraph ([`ParaList::next_marker`]), so one count runs through the story.
+    /// The engine sets it whenever it re-flows a thread. Type that is not threaded has 0, and the
+    /// file saves the count only when it is not 0.
+    #[serde(default, rename = "listCount", skip_serializing_if = "crate::skip::is_default")]
+    pub list_count: u32,
     /// Cached layout bounds in text space, filled in by the layout engine (not serialized).
     #[serde(skip)]
     pub cached_bounds: Option<Rect>,
@@ -1119,25 +1726,109 @@ impl TextObject {
         Some(style)
     }
 
+    /// Bakes the object's scale ([`style_scale`]) into character attributes and removes that
+    /// scale from `xf`, so panels show document-point sizes without a separate transform factor.
+    /// Returns `false` when there is nothing to bake (identity scale or an unrepresentable
+    /// transform).
+    pub fn scale_text_attributes(&mut self) -> bool {
+        let Some(scale) = self.style_scale() else { return false };
+        if (scale.points - 1.0).abs() <= 1e-12 && (scale.horizontal - 1.0).abs() <= 1e-12 {
+            return false;
+        }
+        let [a, b, c, d, _, _] = self.xf.as_coeffs();
+        let (sx, sy) = (a.hypot(b), c.hypot(d));
+        if sx <= 1e-12 || sy <= 1e-12 {
+            return false;
+        }
+        let mut baked = Vec::with_capacity(self.runs.len());
+        for run in &self.runs {
+            let Some(eff) = self.effective_char_style(&run.style) else { return false };
+            baked.push(eff);
+        }
+        for (run, style) in self.runs.iter_mut().zip(baked) {
+            run.style = style;
+        }
+        // Character strokes are drawn in text space: widen them by the vertical scale we remove.
+        self.scale_char_strokes(1.0 / sy);
+        self.xf *= Affine::scale_non_uniform(1.0 / sx, 1.0 / sy);
+        self.cached_bounds = None;
+        self.cached_baselines.clear();
+        true
+    }
+
     pub fn point(origin: Point, text: &str, style: CharStyle) -> Self {
         Self {
             vertical: false,
             kind: TextKind::Point,
             xf: Affine::translate(origin.to_vec2()),
             runs: vec![TextRun::new(text, style)],
+            ruby: Vec::new(),
             para: ParaStyle::default(),
             paras: Vec::new(),
+            first_para_continues: false,
             area: AreaOptions::default(),
             path_effect: PathEffect::default(),
             path_align: PathAlign::default(),
             path_spacing: 0.0,
             wrap: Vec::new(),
+            optical_margin: false,
+            system_layout: false,
+            fractional_widths: true,
+            list_count: 0,
             cached_bounds: None,
             cached_baselines: Vec::new(),
         }
     }
     pub fn plain_text(&self) -> String {
         self.runs.iter().map(|r| r.text.as_str()).collect()
+    }
+    /// Clamp the ruby spans to the plain text, drop empty/empty-reading ones and sort them.
+    ///
+    /// Called after loading and editing text: ranges from a file or an edit are untrusted, and a
+    /// range past the text or an inverted one would lay out nothing (or panic in a silly place).
+    pub fn normalize_ruby(&mut self) {
+        let len: usize = self.runs.iter().map(|r| r.text.len()).sum();
+        for r in &mut self.ruby {
+            r.start = r.start.min(len);
+            r.end = r.end.min(len);
+            if r.start > r.end {
+                std::mem::swap(&mut r.start, &mut r.end);
+            }
+            r.text = r.text.trim().to_string();
+        }
+        self.ruby.retain(|r| r.start < r.end && !r.text.is_empty());
+        self.ruby.sort_by_key(|r| (r.start, r.end));
+    }
+    /// The ruby span covering byte `byte` of the plain text, if any.
+    pub fn ruby_at(&self, byte: usize) -> Option<&RubySpan> {
+        self.ruby.iter().find(|r| r.start <= byte && byte < r.end)
+    }
+    /// Ruby spans touching the plain-text byte range `start..end`, with their ranges ordered.
+    pub fn ruby_in(&self, start: usize, end: usize) -> impl Iterator<Item = &RubySpan> {
+        let (a, b) = (start.min(end), start.max(end));
+        self.ruby.iter().filter(move |r| r.start < b && a < r.end)
+    }
+    /// Keep the ruby spans over the text after replacing plain-text bytes `start..end` with
+    /// `inserted` bytes of text: spans after the edit move with the text, ones the edit runs into
+    /// keep their start and end up where the replaced part ended. Call it after every edit of the
+    /// runs (`vectorcraft_text::edit`), then [`Self::normalize_ruby`] has the last word.
+    pub fn ruby_after_replace(&mut self, start: usize, end: usize, inserted: usize) {
+        let (start, end) = (start.min(end), start.max(end));
+        let delta = inserted as i64 - (end.saturating_sub(start)) as i64;
+        let shift = |v: usize| -> usize { (v as i64 + delta).max(0) as usize };
+        for r in &mut self.ruby {
+            if r.end <= start {
+                continue;
+            }
+            if r.start >= end {
+                r.start = shift(r.start);
+                r.end = shift(r.end);
+            } else {
+                r.start = r.start.min(start);
+                r.end = shift(r.end).max(r.start);
+            }
+        }
+        self.normalize_ruby();
     }
     /// Number of paragraphs (`\n`-separated; empty text has one).
     pub fn paragraph_count(&self) -> usize {
@@ -1255,6 +1946,21 @@ impl TextObject {
             TextKind::Point => Some(self.xf.transform_rect_bbox(self.cached_bounds.unwrap_or_else(|| self.estimate_bounds()))),
         }
     }
+    /// How far the characters' strokes paint past their glyphs, in document space: they scale
+    /// with the type.
+    pub fn char_stroke_outset(&self) -> f64 {
+        let k = crate::node::Scaling::factor(self.xf).unwrap_or(1.0);
+        self.runs.iter().map(|r| r.style.stroke_outset()).fold(0.0, f64::max) * k
+    }
+    /// How far the characters' strokes can paint past their glyphs, their miter spikes and square
+    /// caps included ([`StrokeLayer::reach`]), in document space: what a change of the type must
+    /// redraw. They stretch with the type, so this is as far as its transform takes them on either
+    /// axis. The visual bounds take [`Self::char_stroke_outset`].
+    pub fn char_stroke_reach(&self) -> f64 {
+        let reach = self.runs.iter().filter(|r| r.style.has_stroke()).map(|r| r.style.stroke_layer().reach()).fold(0.0, f64::max);
+        let [a, b, c, d, ..] = self.xf.as_coeffs();
+        reach * (a.abs() + c.abs()).max(b.abs() + d.abs())
+    }
     pub fn transform(&mut self, a: Affine) {
         self.xf = a * self.xf;
     }
@@ -1348,11 +2054,153 @@ impl TextObject {
         });
         self.cached_baselines.iter().copied().chain(first)
     }
+    /// Keeps every run's size, leading, baseline shift and scales in range
+    /// ([`CharStyle::keep_dimensions_in_range`]) and every paragraph's indents, spacing and tab
+    /// stops ([`ParaStyle::keep_spacing_in_range`]).
+    pub fn keep_type_values_in_range(&mut self) {
+        for r in &mut self.runs {
+            r.style.keep_dimensions_in_range();
+        }
+        for p in self.para_styles_mut() {
+            p.keep_spacing_in_range();
+        }
+    }
+}
+
+impl crate::Document {
+    /// Keeps the character dimensions, indents, paragraph spacing and tab stops in range
+    /// ([`TextObject::keep_type_values_in_range`]) in the type of the layers, symbols, graph
+    /// designs, pattern swatches and the pattern definition that pattern editing's Cancel puts
+    /// back (opacity-mask art included), and the same attributes of the character and paragraph
+    /// styles. It recurses through the art: call it on a document no deeper than
+    /// [`crate::depth::MAX_DEPTH`].
+    pub fn keep_type_values_in_range(&mut self) {
+        let mut fix = |n: &mut crate::Node| {
+            if let crate::NodeKind::Text(t) = &mut n.kind {
+                t.keep_type_values_in_range();
+            }
+        };
+        let roots = self
+            .layers
+            .iter_mut()
+            .chain(self.symbols.iter_mut().map(|s| &mut s.art))
+            .chain(self.graph_designs.iter_mut().map(|g| &mut g.art))
+            .chain(self.patterns.iter_mut().flat_map(|p| p.art.iter_mut()))
+            .chain(self.pattern_edit.iter_mut().filter_map(|pe| pe.original.as_mut()).flat_map(|p| p.art.iter_mut()));
+        for root in roots {
+            crate::placed_document::each_mut(std::sync::Arc::make_mut(root), &mut fix);
+        }
+        // Styles store the attributes they set by their serialized names (a number, or null for
+        // Auto leading); a number is rewritten only when it changes.
+        for def in self.char_styles.iter_mut() {
+            let num = |k: &str| def.attrs.get(k).and_then(serde_json::Value::as_f64);
+            let mut st = CharStyle { leading: num("leading"), ..CharStyle::default() };
+            st.size = num("size").unwrap_or(st.size);
+            st.h_scale = num("h_scale").unwrap_or(st.h_scale);
+            st.v_scale = num("v_scale").unwrap_or(st.v_scale);
+            st.baseline_shift = num("baseline_shift").unwrap_or(st.baseline_shift);
+            st.keep_dimensions_in_range();
+            let kept = [
+                ("size", Some(st.size)),
+                ("h_scale", Some(st.h_scale)),
+                ("v_scale", Some(st.v_scale)),
+                ("baseline_shift", Some(st.baseline_shift)),
+                ("leading", st.leading),
+            ];
+            for (k, v) in kept {
+                if let Some(old) = def.attrs.get_mut(k)
+                    && old.is_number()
+                    && old.as_f64() != v
+                {
+                    *old = v.into();
+                }
+            }
+        }
+        for def in self.para_styles.iter_mut() {
+            for k in ["left_indent", "right_indent", "first_line_indent", "space_before", "space_after"] {
+                if let Some(v) = def.attrs.get_mut(k)
+                    && let Some(x) = v.as_f64()
+                    && x.abs() > crate::MAX_COORD
+                {
+                    *v = x.clamp(-crate::MAX_COORD, crate::MAX_COORD).into();
+                }
+            }
+            for t in def.attrs.get_mut("tabs").and_then(serde_json::Value::as_array_mut).into_iter().flatten() {
+                if let Some(v) = t.get_mut("position")
+                    && let Some(x) = v.as_f64()
+                    && !(0.0..=100_000.0).contains(&x)
+                {
+                    *v = x.clamp(0.0, 100_000.0).into();
+                }
+            }
+        }
+    }
+
+    /// Clamps the ruby spans of the type in the layers, symbols, graph designs, pattern swatches
+    /// and the pattern definition that pattern editing's Cancel puts back (opacity-mask art
+    /// included) to their text ([`TextObject::normalize_ruby`]). Loaded files and edits carry
+    /// ranges from outside: a range past the text, an inverted one or an empty reading would lay
+    /// out nothing. It recurses through the art: call it on a document no deeper than
+    /// [`crate::depth::MAX_DEPTH`].
+    pub fn fix_ruby(&mut self) {
+        let mut fix = |n: &mut crate::Node| {
+            if let crate::NodeKind::Text(t) = &mut n.kind {
+                t.normalize_ruby();
+            }
+        };
+        let roots = self
+            .layers
+            .iter_mut()
+            .chain(self.symbols.iter_mut().map(|s| &mut s.art))
+            .chain(self.graph_designs.iter_mut().map(|g| &mut g.art))
+            .chain(self.patterns.iter_mut().flat_map(|p| p.art.iter_mut()))
+            .chain(self.pattern_edit.iter_mut().filter_map(|pe| pe.original.as_mut()).flat_map(|p| p.art.iter_mut()));
+        for root in roots {
+            crate::placed_document::each_mut(std::sync::Arc::make_mut(root), &mut fix);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Character Direction is saved only when set, and styles written before it existed read as
+    /// Default.
+    #[test]
+    fn character_direction_is_saved_only_when_set() {
+        let st = CharStyle::default();
+        assert_eq!(st.char_direction, None);
+        assert!(serde_json::to_value(&st).unwrap().get("charDirection").is_none());
+        for (d, key) in [(ParaDirection::LeftToRight, "leftToRight"), (ParaDirection::RightToLeft, "rightToLeft")] {
+            let set = CharStyle { char_direction: Some(d), ..CharStyle::default() };
+            assert_eq!(serde_json::to_value(&set).unwrap()["charDirection"], key);
+            assert_eq!(serde_json::from_value::<CharStyle>(serde_json::to_value(&set).unwrap()).unwrap(), set);
+        }
+        let old = serde_json::to_value(&st).unwrap();
+        assert_eq!(serde_json::from_value::<CharStyle>(old).unwrap().char_direction, None);
+    }
+
+    /// Ruby saves with the type and a file saved before it (no `ruby` key) reads with none.
+    #[test]
+    fn ruby_is_saved_and_missing_ruby_reads_as_none() {
+        let mut t = TextObject::point(Point::ZERO, "漢字", CharStyle::default());
+        t.ruby = vec![RubySpan { size_percent: 40.0, overhang: false, ..RubySpan::new(0, 6, "かんじ") }];
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("かんじ"));
+        let back: TextObject = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ruby, t.ruby);
+        assert!((back.ruby[0].size_percent - 40.0).abs() < 1e-9 && !back.ruby[0].overhang);
+        // Old files have no `ruby` key: none.
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("ruby");
+        assert!(serde_json::from_value::<TextObject>(old).unwrap().ruby.is_empty());
+        // A damaged file's range past the text and its empty reading are clamped away.
+        let mut damaged = t.clone();
+        damaged.ruby = vec![RubySpan::new(0, 10_000, "かんじ"), RubySpan::new(3, 2, " "), RubySpan::new(0, 3, "")];
+        damaged.normalize_ruby();
+        assert_eq!((damaged.ruby[0].start, damaged.ruby[0].end), (0, 6));
+    }
 
     /// Digits map every digit of the three sets into the chosen one, leave the rest alone, and
     /// are saved only when set.
@@ -1375,6 +2223,94 @@ mod tests {
         let old = serde_json::to_value(&st).unwrap();
         assert_eq!(serde_json::from_value::<CharStyle>(old).unwrap().digits, Digits::Default);
         assert_eq!(serde_json::from_value::<CharStyle>(serde_json::to_value(&farsi).unwrap()).unwrap(), farsi);
+    }
+
+    /// Auto leading follows the paragraph's Auto Leading; a set leading doesn't.
+    #[test]
+    fn paragraph_effective_leading_follows_auto_leading() {
+        let st = CharStyle { size: 10.0, leading: None, ..CharStyle::default() };
+        let mut para = ParaStyle::default();
+        assert_eq!(para.effective_leading(&st), st.effective_leading(), "default 120%");
+        para.justification.auto_leading = 200.0;
+        assert_eq!(para.effective_leading(&st), 20.0);
+        para.justification.auto_leading = 0.0;
+        assert_eq!(para.effective_leading(&st), 0.0);
+        let set = CharStyle { leading: Some(14.0), ..st.clone() };
+        assert_eq!(para.effective_leading(&set), 14.0);
+        para.justification.auto_leading = f64::NAN;
+        assert_eq!(para.effective_leading(&st), st.effective_leading(), "not a number");
+    }
+
+    /// A file can't feed layout justification values `text.setFormat` would refuse: each is
+    /// clamped to its range, one that isn't finite takes its default, and a Minimum, Desired and
+    /// Maximum out of order go back to their defaults.
+    #[test]
+    fn justification_options_read_from_a_file_stay_in_range() {
+        let d = JustificationOptions::default();
+        let read: ParaStyle = serde_json::from_value(serde_json::json!({
+            "justification": {
+                "word_spacing": [-5.0, 1e300, 1e308], "letter_spacing": [10.0, 5.0, 20.0],
+                "glyph_scaling": [1.0, 100.0, 9e9], "auto_leading": -1e12
+            }
+        }))
+        .unwrap();
+        let j = read.justification;
+        assert_eq!(j.word_spacing, [0.0, 1000.0, 1000.0]);
+        assert_eq!(j.letter_spacing, d.letter_spacing, "out of order");
+        assert_eq!(j.glyph_scaling, [50.0, 100.0, 200.0]);
+        assert_eq!(j.auto_leading, 0.0);
+        let mut j = JustificationOptions {
+            word_spacing: [f64::NAN, 100.0, f64::INFINITY],
+            letter_spacing: [-1.0, 0.0, f64::NEG_INFINITY],
+            auto_leading: f64::NAN,
+            ..d.clone()
+        };
+        j.keep_in_range();
+        assert_eq!((j.word_spacing, j.letter_spacing, j.auto_leading), (d.word_spacing, [-1.0, 0.0, 0.0], d.auto_leading));
+        let mut same = d.clone();
+        same.keep_in_range();
+        assert_eq!(same, d);
+    }
+
+    /// Numbered lists: each number style writes its numbers and rolls over (letters after Z,
+    /// roman numerals in subtractive forms, zero-padded numbers past their digits), the marker adds
+    /// a period, and the count runs through list paragraphs, skips empty and bulleted ones and
+    /// starts again after a paragraph in no list. A list from before number styles reads as
+    /// bulleted, and a bulleted list saves no number style.
+    #[test]
+    fn number_styles_write_their_numbers_and_roll_over() {
+        let numbers = |style: NumberStyle, ns: &[u32]| ns.iter().map(|&n| style.format(n)).collect::<Vec<_>>();
+        assert_eq!(numbers(NumberStyle::Arabic, &[1, 9, 10, 123]), ["1", "9", "10", "123"]);
+        assert_eq!(
+            numbers(NumberStyle::UpperLetters, &[1, 2, 26, 27, 28, 52, 53, 3999, 4000]),
+            ["A", "B", "Z", "AA", "BB", "ZZ", "AAA", &"U".repeat(154), "4000"]
+        );
+        assert_eq!(numbers(NumberStyle::LowerLetters, &[1, 26, 27]), ["a", "z", "aa"]);
+        assert_eq!(
+            numbers(NumberStyle::UpperRoman, &[1, 2, 3, 4, 5, 9, 14, 40, 90, 400, 1994, 3999, 4000]),
+            ["I", "II", "III", "IV", "V", "IX", "XIV", "XL", "XC", "CD", "MCMXCIV", "MMMCMXCIX", "4000"]
+        );
+        assert_eq!(numbers(NumberStyle::LowerRoman, &[1, 4, 9, 12]), ["i", "iv", "ix", "xii"]);
+        assert_eq!(numbers(NumberStyle::TwoDigits, &[1, 9, 10, 99, 100]), ["01", "09", "10", "99", "100"]);
+        assert_eq!(numbers(NumberStyle::ThreeDigits, &[1, 10, 999, 1000]), ["001", "010", "999", "1000"]);
+        assert_eq!(ParaList::numbered(NumberStyle::UpperRoman).marker(4), "IV.");
+        assert_eq!(ParaList::bulleted(Bullet::Square).marker(4), "\u{25AA}");
+        let (num, dot) = (Some(ParaList::numbered(NumberStyle::Arabic)), Some(ParaList::bulleted(Bullet::Dot)));
+        let mut count = 0;
+        let markers: Vec<Option<String>> = [(num, false), (num, true), (dot, false), (num, false), (None, false), (num, false)]
+            .iter()
+            .map(|&(l, empty)| ParaList::next_marker(l, empty, &mut count))
+            .collect();
+        assert_eq!(markers, [Some("1.".into()), None, Some("\u{2022}".into()), Some("2.".into()), None, Some("1.".into())]);
+        assert_eq!(count, 1);
+        let read = |v: serde_json::Value| serde_json::from_value::<ParaList>(v).unwrap();
+        assert_eq!(read(serde_json::json!({"bullet": "dash"})), ParaList::bulleted(Bullet::Dash));
+        assert_eq!(read(serde_json::json!({"number": "threeDigits"})), ParaList::numbered(NumberStyle::ThreeDigits));
+        assert_eq!(serde_json::to_value(ParaList::bulleted(Bullet::Dash)).unwrap(), serde_json::json!({"bullet": "dash"}));
+        assert_eq!(
+            serde_json::to_value(ParaList::numbered(NumberStyle::LowerRoman)).unwrap(),
+            serde_json::json!({"bullet": "dot", "number": "lowerRoman"})
+        );
     }
 
     #[test]

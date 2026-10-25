@@ -52,6 +52,20 @@ fn pages_place_the_artboard_on_the_trim_box() {
     }
 }
 
+#[test]
+fn a_print_preset_lays_out_its_settings_with_settings_over_them() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 200, "artboards": 4})).unwrap();
+    s.execute("print.setup", &json!({"settings": {"media": "a4"}})).unwrap();
+    s.execute("print.presets.save", &json!({"name": "Sheet", "settings": {"artboards": "range", "range": "4"}})).unwrap();
+    let v = s.execute("print.preview", &json!({"preset": "Sheet", "settings": {"artboards": "range", "range": "3"}})).unwrap();
+    assert_eq!((v["pages"].clone(), v["sheets"][0]["artboard"].clone()), (json!(1), json!(2)), "{v}");
+    assert_eq!(v["settings"]["media"], "letter", "the preset's paper, not the document's");
+    let v = s.execute("print.preview", &json!({"preset": "Sheet"})).unwrap();
+    assert_eq!((v["pages"].clone(), v["sheets"][0]["artboard"].clone()), (json!(1), json!(3)));
+    assert_eq!(s.doc().unwrap().doc.print_setup.as_ref().unwrap()["media"], "a4", "the preview keeps nothing");
+}
+
 /// Point type at (`x`, `y`) in `family` → its id.
 fn type_in(s: &mut Session, x: f64, y: f64, family: &str) -> u64 {
     s.execute("text.create", &json!({"x": x, "y": y, "text": "Ab", "font": family, "style": "Regular"})).unwrap()["id"].as_u64().unwrap()

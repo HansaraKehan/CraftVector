@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
 
 use serde_json::{Value, json};
-use vectorcraft_engine::cmd::clipboard::{BITMAP, EMF, EPS, Flavour, PASTE_ORDER, PDF, SVG, TEXT, looks_like_svg, names_a_picture};
+use vectorcraft_engine::cmd::clipboard::{AI, BITMAP, EMF, EPS, Flavour, PASTE_ORDER, PDF, SVG, TEXT, looks_like_svg, names_a_picture};
 
 use crate::VectorcraftApp;
 use crate::background::{self, Writer};
@@ -59,6 +59,7 @@ pub(crate) fn import_command(f: &Flavour, center: Option<[f64; 2]>) -> (&'static
         }
         SVG => ("clipboard.importSvg", json!({ "dataBase64": b64(), "center": center })),
         PDF => ("clipboard.importPdf", json!({ "dataBase64": b64(), "center": center })),
+        AI => ("clipboard.importPdf", json!({ "dataBase64": b64(), "editingData": true, "center": center })),
         EPS => ("clipboard.importEps", json!({ "dataBase64": b64(), "center": center })),
         EMF => ("clipboard.importEmf", json!({ "dataBase64": b64(), "center": center })),
         mime => ("clipboard.importImage", json!({ "dataBase64": b64(), "mime": mime, "center": center })),
@@ -74,7 +75,8 @@ impl VectorcraftApp {
     /// ([`Self::drop_formats_after_egui_copy`]), drops the formats not written yet. While the
     /// latest Copy or Cut's formats wait to be written, Paste takes the internal clipboard, and
     /// while a text field or type has the keyboard the app waits for them
-    /// ([`Self::write_formats_before_text_input`]).
+    /// ([`Self::write_formats_before_text_input`]). Once they are written, the status bar shows
+    /// the first of the PNG's and PDF's warnings.
     pub(crate) fn publish_clipboard(&mut self) {
         if self.services.system_clipboard.is_none() {
             if self.session.prefs.copy_as_svg {
@@ -92,7 +94,7 @@ impl VectorcraftApp {
             // These formats are not made when a later Copy or Cut, or a copy through egui, dropped them.
             if latest.load(Ordering::SeqCst) == n {
                 // The receiver is gone only when the job was dropped unapplied.
-                let _ = tx.send(clip.flavours(svg, pdf));
+                let _ = tx.send(clip.flavours_with_warnings(svg, pdf));
             }
             Ok(Value::Null)
         };
@@ -102,16 +104,27 @@ impl VectorcraftApp {
                 return Ok(Value::Null);
             }
             publishing.pending = false;
-            let flavours = r.and_then(|_| made.try_recv().map_err(|e| e.to_string()));
-            let written = flavours.and_then(|f| app.services.system_clipboard.as_mut().map_or(Ok(()), |cb| cb.write(&f)));
-            if let Err(e) = written {
-                app.ui.status = format!("Couldn't copy to the system clipboard: {e}");
+            let formats = r.and_then(|_| made.try_recv().map_err(|e| e.to_string()));
+            let written = formats.and_then(|(f, warnings)| {
+                app.services.system_clipboard.as_mut().map_or(Ok(()), |cb| cb.write(&f))?;
+                Ok(warnings)
+            });
+            match written {
+                Err(e) => app.ui.status = format!("Couldn't copy to the system clipboard: {e}"),
+                // Show the first of the PNG's and PDF's warnings (an image that couldn't be decoded,
+                // type in the fallback font).
+                Ok(warnings) => {
+                    if let Some(first) = warnings.into_iter().next() {
+                        app.ui.status = first;
+                    }
+                }
             }
             Ok(Value::Null)
         };
         // Only the formats of other copies (jobs without a label) may be ahead of these on the worker.
         let free = self.background.jobs.iter().all(|j| j.label.is_empty());
-        // No label: the status bar doesn't show the job, and the status stays as it is.
+        // No label: the status bar doesn't show the job, and only a failure or a warning changes
+        // the status.
         if let Err(e) = background::run(self, free, String::new(), None, work, then) {
             self.ui.status = e;
         }

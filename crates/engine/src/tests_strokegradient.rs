@@ -124,6 +124,18 @@ fn outline_stroke_and_expand_keep_the_picture() {
 }
 
 #[test]
+fn outline_stroke_keeps_the_effect_of_a_stroke_with_a_gradient_along_it() {
+    let (mut s, _) = setup("along");
+    let stroke = doc(&s).node(s.doc().unwrap().selection.objects[0]).unwrap().appearance.items.len() - 1;
+    run(&mut s, "effect.apply", json!({"effect": "stylize.dropShadow", "item": stroke}));
+    let ids = run(&mut s, "object.path.outlineStroke", json!({}))["ids"].clone();
+    let n = doc(&s).node(NodeId(ids[0].as_u64().unwrap())).unwrap().clone();
+    let mut shadowed = false;
+    n.walk(&mut |c| shadowed |= matches!(c.kind, NodeKind::Group { clip: true, .. }) && !c.appearance.effects.is_empty());
+    assert!(shadowed, "the stroke's drop shadow is on its outline's clip group");
+}
+
+#[test]
 fn svg_and_pdf_write_the_same_gradient_as_slices_with_a_warning() {
     for mode in ["along", "across"] {
         let (s, _) = setup(mode);

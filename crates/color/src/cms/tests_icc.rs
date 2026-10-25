@@ -22,7 +22,8 @@ fn cmyk_profiles_convert_like_the_cms() {
         assert_eq!(parse(&bytes).color_space, moxcms::DataColorSpace::Cmyk);
         let p = IccProfile::from_bytes(None, &bytes).unwrap();
         assert_eq!((p.name.as_str(), p.kind), (name, ProfileKind::Cmyk));
-        let cms = Cms::new(&ColorSettings { cmyk: name.into(), ..Default::default() }).unwrap();
+        // The encoded profile converts without black-point compensation, so compare without it.
+        let cms = Cms::new(&ColorSettings { cmyk: name.into(), bpc: false, ..Default::default() }).unwrap();
         for cmyk in [[0.0; 4], [1.0, 0.0, 0.0, 0.0], [0.2, 0.7, 0.1, 0.3], [0.0, 0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 0.0]] {
             let want = cms.cmyk_to_srgb(cmyk, false);
             let got = p.to_srgb(&cmyk, Intent::RelativeColorimetric).unwrap();
@@ -112,11 +113,11 @@ fn black_point_compensation_maps_the_darkest_ink_to_rgb_black() {
     assert_eq!(abs(true), abs(false));
 }
 
-/// #1584: the profiles written here (built-in RGB spaces) have every tag on a 4-byte boundary and
-/// a size that is a multiple of 4 (ICC.1 §7.1.2), and still read back as the same space.
+/// #1584: every built-in profile (RGB, CMYK and gray) has each tag on a 4-byte boundary and a size
+/// that is a multiple of 4 (ICC.1 §7.1.2), and still reads back as the same space.
 #[test]
-fn written_profiles_align_their_tags() {
-    for name in [super::SRGB, super::DISPLAY_P3, super::WIDE_GAMUT_RGB, super::PROPHOTO_RGB] {
+fn builtin_profiles_align_their_sizes_and_tags() {
+    for name in BUILTIN_RGB.into_iter().chain(BUILTIN_CMYK).chain([GRAY]) {
         let icc = super::icc_bytes(name).unwrap();
         let be = |at: usize| u32::from_be_bytes([icc[at], icc[at + 1], icc[at + 2], icc[at + 3]]) as usize;
         assert_eq!(be(0), icc.len(), "{name}: header size");
@@ -133,4 +134,49 @@ fn written_profiles_align_their_tags() {
             assert_eq!((back.red_colorant, back.green_colorant, back.blue_colorant), (orig.red_colorant, orig.green_colorant, orig.blue_colorant));
         }
     }
+}
+
+/// #2707: the CMYK profiles written here carry every tag ICC.1 requires of an output profile (the
+/// tables of all three intents and the gamut tag): Windows rejects one without them, and Photos
+/// then can't show a CMYK TIFF that embeds it.
+#[test]
+fn cmyk_profiles_have_the_tags_of_an_output_profile() {
+    for name in BUILTIN_CMYK {
+        let icc = icc_bytes(name).unwrap();
+        let be = |at: usize| u32::from_be_bytes([icc[at], icc[at + 1], icc[at + 2], icc[at + 3]]) as usize;
+        let tags: Vec<&[u8]> = (0..be(128)).map(|i| &icc[132 + 12 * i..136 + 12 * i]).collect();
+        for want in [b"desc", b"cprt", b"wtpt", b"A2B0", b"A2B1", b"A2B2", b"B2A0", b"B2A1", b"B2A2", b"gamt"] {
+            assert!(tags.contains(&&want[..]), "{name}: no {}", String::from_utf8_lossy(want));
+        }
+        let p = parse(&icc);
+        assert!(p.lut_a_to_b_saturation.is_some() && p.lut_b_to_a_saturation.is_some() && p.gamut.is_some(), "{name}");
+    }
+}
+
+/// A profile whose localized-name records all point at one long string is refused before moxcms
+/// copies each of them; a few short names pass.
+#[test]
+fn aliased_localized_names_are_refused() {
+    let profile = |records: u32, length: u32| {
+        let mut b = vec![0u8; 128];
+        b.extend(1u32.to_be_bytes());
+        let tag_at = 128 + 4 + 12;
+        let size = 16 + 12 * records + length;
+        b.extend(b"desc");
+        b.extend((tag_at as u32).to_be_bytes());
+        b.extend(size.to_be_bytes());
+        b.extend(b"mluc");
+        b.extend([0; 4]);
+        b.extend(records.to_be_bytes());
+        b.extend(12u32.to_be_bytes());
+        for _ in 0..records {
+            b.extend(b"enUS");
+            b.extend(length.to_be_bytes());
+            b.extend((16 + 12 * records).to_be_bytes());
+        }
+        b.extend(vec![0u8; length as usize]);
+        b
+    };
+    assert!(super::icc::localized_text_fits(&profile(3, 64)));
+    assert!(!super::icc::localized_text_fits(&profile(4096, 64 << 10)));
 }

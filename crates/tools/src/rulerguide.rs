@@ -1,7 +1,9 @@
 //! Ruler guides on the canvas. Dragged out of a ruler with any tool ([`NewGuide`]), a guide is
 //! made where it is released over the canvas: with the Artboard tool, an artboard guide of the
 //! active artboard. For the selection tools ([`GuideEdit`]), a press on a guide selects it (Shift
-//! adds it to the selected guides or, released without a drag, takes it out); dragging moves the
+//! adds it to the selected guides or, released without a drag, takes it out; a click on a guide
+//! selected with objects makes it the key object Align lines them up on, `select.key`, and a
+//! click on the key guide again cancels it); dragging moves the
 //! selected guides (Alt copies them), and a marquee selects the guides it crosses along with the
 //! art ([`marquee_select`]). A dragged guide snaps ([`GuideSnap`]): with Shift to the
 //! ruler's ticks, else to whole pixels, the grid, with Smart Guides the art's and the artboards'
@@ -92,6 +94,9 @@ struct Drag {
     began: bool,
     /// Shift-pressed on a selected guide: released without a drag, it leaves the selection.
     deselect: bool,
+    /// Pressed (no Shift) on a guide selected with objects: released without a drag, it becomes
+    /// the key object Align lines them up on, or stops being it when it was.
+    key: bool,
 }
 
 /// Snapping for a dragged ruler guide, its targets gathered when the drag begins.
@@ -125,7 +130,7 @@ impl GuideSnap {
     fn snap(&mut self, cx: &ToolContext, vertical: bool, v: f64, shift: bool) -> f64 {
         self.snapped.clear();
         if shift {
-            let origin = cx.doc.ruler_origin_or_zero();
+            let origin = cx.ruler_origin;
             let origin = if vertical { origin.x } else { origin.y };
             return origin + cx.unit.snap_to_ruler_tick(v - origin, cx.zoom);
         }
@@ -145,7 +150,7 @@ impl GuideSnap {
     fn overlays(&self, cx: &ToolContext, vertical: bool, at: f64, pointer: Point) -> Vec<Overlay> {
         let mut o = self.snapped.clone();
         if cx.measurement_labels {
-            let origin = cx.doc.ruler_origin_or_zero();
+            let origin = cx.ruler_origin;
             let (axis, zero) = if vertical { ("X", origin.x) } else { ("Y", origin.y) };
             o.push(Overlay::Measure { p: pointer, text: format!("{axis}: {}", cx.len(at - zero)) });
         }
@@ -246,6 +251,7 @@ impl GuideEdit {
             pointer: ev.pos,
             began: false,
             deselect: shift && selected,
+            key: !shift && selected && !cx.selection.is_empty(),
         });
         self.snap = GuideSnap::default();
         Some(match (selected, shift) {
@@ -278,6 +284,11 @@ impl GuideEdit {
                     vec![Action::Commit]
                 } else if d.deselect {
                     vec![Action::Exec("guide.select".into(), json!({ "indexes": [d.index], "toggle": true }))]
+                } else if d.key && cx.selection.key_guide == Some(d.index) {
+                    // A click on the key guide again: no key.
+                    vec![Action::Exec("select.key".into(), json!({}))]
+                } else if d.key {
+                    vec![Action::Exec("select.key".into(), json!({ "guide": d.index }))]
                 } else {
                     vec![]
                 }
@@ -310,12 +321,12 @@ impl GuideEdit {
         out
     }
 
-    /// The pointer over a guide, or while one is dragged.
+    /// The pointer over a guide, or while one is dragged, turned with the view.
     pub fn cursor(&self, cx: &ToolContext, p: Point) -> Option<Cursor> {
         if let Some(d) = &self.drag {
-            return Some(guide_cursor(d.vertical));
+            return Some(guide_cursor(d.vertical).turned(cx.view_angle()));
         }
-        guide_at(cx, p).and_then(|i| cx.doc.guides.get(i)).map(|g| guide_cursor(g.vertical))
+        guide_at(cx, p).and_then(|i| cx.doc.guides.get(i)).map(|g| guide_cursor(g.vertical).turned(cx.view_angle()))
     }
 
     /// While a guide is dragged: the smart guide it snapped to and its position by the pointer.
@@ -588,8 +599,12 @@ mod tests {
             id,
             name: "B".into(),
             rect: vectorcraft_geom::Rect::new(600.0, 0.0, 900.0, 300.0),
+            locked: false,
             show_center_mark: false,
             show_cross_hairs: false,
+            show_video_safe_areas: false,
+            video_ruler_pixel_aspect_ratio: 1.0,
+            color: None,
         });
         d.guides = vec![Guide { artboard: Some(id), ..Guide::new(false, 150.0) }];
         let (s, p) = (Selection::default(), paint());
@@ -618,6 +633,43 @@ mod tests {
         let a = g.pointer(&c, &ev(PointerKind::Drag, 50.0, 420.0, alt)).unwrap();
         assert_eq!(a[0], Action::Begin("Copy Guide".into()));
         assert_eq!(a[1], Action::Preview("guide.move".into(), json!({"dx": 0.0, "dy": 20.0, "copy": true})));
+    }
+
+    /// #2143: a click on a guide selected with objects makes it the key; on the key guide again,
+    /// no key. Alone (no objects), with Shift, or dragged, it doesn't.
+    #[test]
+    fn a_click_on_a_guide_selected_with_objects_makes_it_the_key() {
+        // The same document as doc_with_rect's, with the guides.
+        let (d, rect) = (guides_doc(), doc_with_rect().1);
+        let p = paint();
+        let click = |s: &Selection, m: Mods| {
+            let c = cx(&d, s, &p);
+            let mut g = GuideEdit::default();
+            let mut out = g.press(&c, &ev(PointerKind::Down, 302.0, 50.0, m)).unwrap();
+            out.extend(g.pointer(&c, &ev(PointerKind::Up, 302.0, 50.0, m)).unwrap());
+            out
+        };
+        let mut s = Selection::default();
+        s.set([rect]);
+        s.toggle_guide(0);
+        let make = Action::Exec("select.key".into(), json!({"guide": 0}));
+        assert_eq!(click(&s, Mods::default()), vec![make]);
+        s.key_guide = Some(0);
+        assert_eq!(click(&s, Mods::default()), vec![Action::Exec("select.key".into(), json!({}))], "the key guide again");
+        let shift = Mods { shift: true, ..Default::default() };
+        assert_eq!(click(&s, shift), vec![Action::Exec("guide.select".into(), json!({"indexes": [0], "toggle": true}))]);
+        s.set_guides([0]);
+        assert_eq!(click(&s, Mods::default()), vec![], "a guide alone has nothing to align");
+        // Not selected yet: the first click selects it.
+        s.set([rect]);
+        assert_eq!(click(&s, Mods::default()), vec![Action::Exec("guide.select".into(), json!({"indexes": [0]}))]);
+        // A drag moves it.
+        s.toggle_guide(0);
+        let c = cx(&d, &s, &p);
+        let mut g = GuideEdit::default();
+        g.press(&c, &ev(PointerKind::Down, 302.0, 50.0, Mods::default()));
+        g.pointer(&c, &ev(PointerKind::Drag, 340.0, 50.0, Mods::default()));
+        assert_eq!(g.pointer(&c, &ev(PointerKind::Up, 340.0, 50.0, Mods::default())), Some(vec![Action::Commit]));
     }
 
     #[test]
@@ -663,8 +715,10 @@ mod tests {
                 2.0,
                 Point::new(inch(0.01), inch(0.03)),
                 Point::new(inch(3.07), inch(3.27)),
-                Point::new(inch(3.06), inch(3.28)),
-                inch(0.05),
+                // An inch ruler's ticks are binary fractions, so at zoom 2 they are 1/16 in
+                // apart, not the 0.05 in a decimal ladder gave (#2827).
+                Point::new(inch(3.0725), inch(3.28)),
+                inch(0.0625),
             ),
         ]
     }
@@ -688,6 +742,7 @@ mod tests {
         for (unit, zoom, origin, pointer, expected, tick) in origin_tick_cases() {
             let (mut doc, _) = doc_with_rect();
             doc.ruler_origin = origin;
+            doc.rulers = vectorcraft_doc::RulerMode::Global;
             let (selection, paint) = (Selection::default(), paint());
             let c = ToolContext { unit, zoom, smart_guides: false, snap_to_point: false, ..cx(&doc, &selection, &paint) };
             for vertical in [false, true] {
@@ -713,6 +768,7 @@ mod tests {
         for (unit, zoom, origin, pointer, expected, _) in origin_tick_cases() {
             let mut doc = guides_doc();
             doc.ruler_origin = origin;
+            doc.rulers = vectorcraft_doc::RulerMode::Global;
             let paint = paint();
             for (index, vertical, from) in [(0, true, 300.0), (1, false, 400.0)] {
                 let mut selection = Selection::default();
@@ -753,6 +809,7 @@ mod tests {
         ] {
             let mut doc = guides_doc();
             doc.ruler_origin = origin;
+            doc.rulers = vectorcraft_doc::RulerMode::Global;
             let paint = paint();
             for (index, vertical, from, want) in [(0, true, 300.0, 225.0), (1, false, 400.0, 235.0)] {
                 let mut selection = Selection::default();
@@ -776,6 +833,7 @@ mod tests {
         for origin in [Point::ZERO, Point::new(17.0, 23.0), Point::new(-17.0, -23.0)] {
             let mut doc = guides_doc();
             doc.ruler_origin = origin;
+            doc.rulers = vectorcraft_doc::RulerMode::Global;
             let paint = paint();
             for (index, vertical, from) in [(0, true, 300.0), (1, false, 400.0)] {
                 let mut selection = Selection::default();
@@ -814,6 +872,7 @@ mod tests {
         ] {
             let mut doc = guides_doc();
             doc.ruler_origin = origin;
+            doc.rulers = vectorcraft_doc::RulerMode::Global;
             let paint = paint();
             for unit in [vectorcraft_doc::Unit::Points, vectorcraft_doc::Unit::Millimeters] {
                 for (index, vertical, from) in [(0, true, 300.0), (1, false, 400.0)] {
@@ -845,6 +904,45 @@ mod tests {
                     let quiet = ToolContext { measurement_labels: false, ..c };
                     assert!(new.overlays(&quiet).is_empty(), "measurement-label preference is preserved");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn ruler_guide_readouts_count_from_the_active_artboard_with_artboard_rulers() {
+        let mut doc = guides_doc();
+        doc.artboards.push(vectorcraft_doc::Artboard {
+            id: 2,
+            name: "Artboard 2".into(),
+            rect: Rect::new(150.0, 200.0, 350.0, 400.0),
+            locked: false,
+            show_center_mark: false,
+            show_cross_hairs: false,
+            show_video_safe_areas: false,
+            video_ruler_pixel_aspect_ratio: 1.0,
+            color: None,
+        });
+        doc.ruler_origin = Point::new(5.0, 5.0);
+        let (paint, selection) = (paint(), Selection::default());
+        for (rulers, active, zero) in [
+            (vectorcraft_doc::RulerMode::Artboard, 1, Point::new(150.0, 200.0)),
+            (vectorcraft_doc::RulerMode::Artboard, 0, Point::new(doc.artboards[0].rect.x0, doc.artboards[0].rect.y0)),
+            (vectorcraft_doc::RulerMode::Global, 1, Point::new(5.0, 5.0)),
+        ] {
+            doc.rulers = rulers;
+            let c =
+                ToolContext { ruler_origin: doc.ruler_origin_for(active), smart_guides: false, snap_to_point: false, ..cx(&doc, &selection, &paint) };
+            assert_eq!(c.ruler_origin, zero, "{rulers:?} {active}");
+            for vertical in [true, false] {
+                let mut new = NewGuide::new(&c, vertical, None);
+                new.pointer(&c, &ev(PointerKind::Drag, 222.0, 238.0, Mods::default()), true);
+                let want = if vertical { format!("X: {}", c.len(222.0 - zero.x)) } else { format!("Y: {}", c.len(238.0 - zero.y)) };
+                assert!(matches!(new.overlays(&c).last(), Some(Overlay::Measure { text, .. }) if text == &want), "{rulers:?} {active}: want {want}");
+                // Shift puts the guide on a ruler tick counted from the same zero point.
+                let snapped = new.pointer(&c, &ev(PointerKind::Drag, 222.0, 238.0, Mods { shift: true, ..Default::default() }), true);
+                let at = guide_preview_position(&snapped, vertical, None);
+                let from = if vertical { zero.x } else { zero.y };
+                assert_eq!(at, from + c.unit.snap_to_ruler_tick(if vertical { 222.0 } else { 238.0 } - from, c.zoom), "{rulers:?} {active}");
             }
         }
     }

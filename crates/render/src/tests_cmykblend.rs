@@ -154,7 +154,7 @@ fn busy_page() -> Document {
     shadowed.appearance.effects.push(vectorcraft_doc::Effect { id: "stylize.dropShadow".into(), params: shadow, visible: true });
     add(&mut d, shadowed);
     let stops = vec![GradientStop::new(0.0, CYAN), GradientStop { opacity: 0.3, ..GradientStop::new(1.0, MAGENTA) }];
-    let ramp = Paint::Gradient(Box::new(GradientPaint::new(Gradient { kind: GradientKind::Linear, stops })));
+    let ramp = Paint::Gradient(Box::new(GradientPaint::new(Gradient::new(GradientKind::Linear, stops))));
     let n = Node::path(d.alloc_id(), shapes::rectangle(Rect::new(20.0, 90.0, 120.0, 130.0)), Appearance::basic(ramp, Paint::None, 0.0));
     add(&mut d, n);
     let mut over = rect(&mut d, Rect::new(100.0, 80.0, 160.0, 120.0), Color::cmyk(0.0, 0.0, 1.0, 0.0));
@@ -222,6 +222,7 @@ fn placed_images_are_separated_not_blackened() {
             xf: Affine::IDENTITY,
             link: None,
             placement: Default::default(),
+            pixels: None,
         })),
     );
     add(&mut d, n);
@@ -256,8 +257,27 @@ fn rich_black_shows_black_ink_alone_as_rgb_black() {
     let mut png = vec![];
     img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
     d.images.insert("red".into(), ImageBlob::new("image/png", png));
-    let im = ImageObject { key: "red".into(), width: 20, height: 20, xf: Affine::IDENTITY, link: None, placement: Default::default() };
+    let im = ImageObject { key: "red".into(), width: 20, height: 20, xf: Affine::IDENTITY, link: None, placement: Default::default(), pixels: None };
     let n = Node::new(d.alloc_id(), NodeKind::Image(Box::new(im)));
     add(&mut d, n);
     assert_eq!(centre_with(&d, true), centre_with(&d, false), "an image shows as it is");
+}
+
+/// An overprinting stroke in the colour of the fill under it shows no darker band in Overprint
+/// Preview: the same ink printed over itself is that ink (#2415). Multiply would square the colour.
+#[test]
+fn overprint_of_the_same_colour_shows_no_darker_band() {
+    for (mode, c) in [(ColorMode::Rgb, Color::rgb(0.0, 0.55, 0.29)), (ColorMode::Cmyk, Color::cmyk(0.85, 0.0, 1.0, 0.0))] {
+        let mut d = Document::new_with_mode(40.0, 40.0, mode);
+        let mut n =
+            Node::path(d.alloc_id(), shapes::rectangle(Rect::new(10.0, 10.0, 30.0, 30.0)), Appearance::basic(Paint::solid(c), Paint::solid(c), 8.0));
+        for it in &mut n.appearance.items {
+            *it.overprint_mut() = true;
+        }
+        add(&mut d, n);
+        let opts = RenderOptions { background: Some([255, 255, 255, 255]), overprint_preview: true, ..Default::default() };
+        let r = Renderer::new().render_region_with(&d, d.artboards[0].rect, 1.0, &opts);
+        // (20, 20) is fill only; (12, 20) lies in the stroke's inner half, over the fill.
+        assert!(near(r.pixel(12, 20), r.pixel(20, 20), 2), "{mode:?}: {:?} vs {:?}", r.pixel(12, 20), r.pixel(20, 20));
+    }
 }

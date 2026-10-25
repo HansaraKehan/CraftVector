@@ -6,6 +6,7 @@ use vectorcraft_doc::pattern::{PATTERN_EDIT_LAYER, RepeatKind, TileType};
 use vectorcraft_doc::{Node, NodeKind};
 use vectorcraft_geom::{Point, Rect};
 
+use super::tests_menucmds::place_undecodable_png;
 use super::*;
 
 fn session() -> Session {
@@ -178,6 +179,50 @@ fn options_rename_updates_swatch_and_paints() {
     assert!(matches!(node(&s, big).appearance.fill_paint(), Paint::Pattern { pattern, .. } if pattern == "Spots"));
 }
 
+/// Pattern Options refuses a new name that a swatch of another kind, a second swatch of the
+/// pattern or a color group has, and takes a name that only the pattern's own swatch has.
+#[test]
+fn options_rename_refuses_a_name_another_swatch_has() {
+    let mut s = session();
+    make_dots(&mut s);
+    s.execute("swatch.new", &json!({"name": "Brick", "color": "#aa3300"})).unwrap();
+    s.execute("swatch.newGroup", &json!({"name": "Mine", "colors": ["#0000ff"]})).unwrap();
+    // "Dots copy": a second swatch of the pattern.
+    s.execute("swatch.duplicate", &json!({"name": "Dots"})).unwrap();
+    for taken in [" Brick ", "Mine", "Dots copy", "[Registration]"] {
+        let e = s.execute("pattern.options", &json!({"name": "Dots", "newName": taken})).unwrap_err().to_string();
+        assert!(e.contains(&format!("a swatch or color group named `{}` exists", taken.trim())), "{e}");
+    }
+    assert!(doc(&s).pattern("Dots").is_some());
+    let named = |s: &Session, n: &str| doc(s).swatches_iter().filter(|w| w.name == n).count();
+    assert_eq!((named(&s, "Brick"), named(&s, "Dots"), named(&s, "Dots copy")), (1, 1, 1));
+    // The pattern's own swatch, renamed in Swatch Options: the pattern can take its name.
+    s.execute("swatch.delete", &json!({"name": "Dots copy"})).unwrap();
+    s.execute("swatch.edit", &json!({"name": "Dots", "newName": "Spots"})).unwrap();
+    assert_eq!(s.execute("pattern.options", &json!({"name": "Dots", "newName": "Spots"})).unwrap()["name"], "Spots");
+    assert_eq!(named(&s, "Spots"), 1);
+    assert!(matches!(&doc(&s).swatch("Spots").unwrap().paint, Paint::Pattern { pattern, .. } if pattern == "Spots"));
+    // With no swatch of the pattern under its name, a color group's name is still refused.
+    s.execute("swatch.edit", &json!({"name": "Spots", "newName": "Spot Tiles"})).unwrap();
+    assert!(s.execute("pattern.options", &json!({"name": "Spots", "newName": "Mine"})).is_err());
+}
+
+/// Renaming a pattern renames only its own swatches: a color swatch that has the pattern's old
+/// name keeps it, and art linked to that swatch stays linked.
+#[test]
+fn options_rename_leaves_other_swatches_of_the_old_name() {
+    let mut s = session();
+    make_dots(&mut s);
+    s.execute("swatch.edit", &json!({"name": "Dots", "newName": "Dot Tiles"})).unwrap();
+    s.execute("swatch.new", &json!({"name": "Dots", "color": "#3366cc", "global": true})).unwrap();
+    let r = rect(&mut s, 100.0, 100.0, 20.0, 20.0);
+    s.execute("paint.setFill", &json!({"ids": [r.0], "swatch": "Dots"})).unwrap();
+    s.execute("pattern.options", &json!({"name": "Dots", "newName": "Spots"})).unwrap();
+    assert!(doc(&s).swatch("Dots").is_some_and(|w| matches!(w.paint, Paint::Solid { .. })), "the color swatch keeps its name");
+    assert!(matches!(&doc(&s).swatch("Dot Tiles").unwrap().paint, Paint::Pattern { pattern, .. } if pattern == "Spots"));
+    assert!(matches!(node(&s, r).appearance.fill_paint(), Paint::Solid { swatch: Some(l), .. } if l == "Dots"));
+}
+
 #[test]
 fn delete_pattern_unpaints_objects() {
     let mut s = session();
@@ -267,6 +312,55 @@ fn save_a_copy_while_editing() {
     assert!(doc(&s).pattern("Dots copy").is_some());
 }
 
+/// Make, Save a Copy and Pattern Options trim the name they are given, as the Pattern Options
+/// panel does; the trimmed name is the one compared with the names there are, and a blank name
+/// gives the name the command gives when there is none.
+#[test]
+fn made_copied_and_renamed_patterns_trim_their_names() {
+    let mut s = session();
+    make_dots(&mut s);
+    let make = |s: &mut Session, name: &str| {
+        let r = rect(s, 0.0, 0.0, 10.0, 10.0);
+        s.execute("object.pattern.make", &json!({"ids": [r.0], "name": name, "edit": false})).unwrap()["name"].clone()
+    };
+    assert_eq!(make(&mut s, "  Grid \t"), "Grid");
+    assert_eq!(make(&mut s, " Dots"), "Dots 2");
+    assert_eq!(make(&mut s, ""), "New Pattern 1");
+    assert_eq!(make(&mut s, " \t "), "New Pattern 2");
+    s.execute("object.pattern.edit", &json!({"name": "Grid"})).unwrap();
+    assert_eq!(s.execute("object.pattern.saveCopy", &json!({"name": " Lines\t"})).unwrap()["name"], "Lines");
+    assert_eq!(s.execute("object.pattern.saveCopy", &json!({"name": "  "})).unwrap()["name"], "Grid copy");
+    s.execute("object.pattern.done", &json!({})).unwrap();
+    assert_eq!(s.execute("pattern.options", &json!({"name": "Dots 2", "newName": " Spots "})).unwrap()["name"], "Spots");
+    assert_eq!(s.execute("pattern.options", &json!({"name": "Spots", "newName": " "})).unwrap()["name"], "Spots");
+    let e = s.execute("pattern.options", &json!({"name": "Spots", "newName": " Lines"})).unwrap_err().to_string();
+    assert!(e.contains("a pattern named `Lines` exists"), "{e}");
+    // Save a Copy names the copy of a pattern whose saved name has white space around it, as a
+    // saved file can hold, from the trimmed name (" Old " gives "Old copy").
+    let d = Arc::make_mut(&mut s.doc_mut().unwrap().doc);
+    d.patterns.iter_mut().filter(|p| p.name == "Grid copy").for_each(|p| p.name = " Old ".into());
+    s.execute("object.pattern.edit", &json!({"name": " Old "})).unwrap();
+    assert_eq!(s.execute("object.pattern.saveCopy", &json!({})).unwrap()["name"], "Old copy");
+    s.execute("object.pattern.cancel", &json!({})).unwrap();
+    let names: Vec<&str> = doc(&s).patterns.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Dots", "Grid", "Spots", "New Pattern 1", "New Pattern 2", "Lines", " Old ", "Old copy"]);
+    assert!(doc(&s).swatch("Spots").is_some() && doc(&s).swatch(" Spots ").is_none());
+}
+
+/// Make and Save a Copy number a name that a color group has, as they number a swatch's name
+/// (swatches and color groups share one namespace).
+#[test]
+fn made_and_copied_patterns_number_a_color_groups_name() {
+    let mut s = session();
+    s.execute("swatch.newGroup", &json!({"name": "Mine", "colors": ["#0000ff"]})).unwrap();
+    s.execute("swatch.newGroup", &json!({"name": "New Pattern 1", "colors": ["#00ff00"]})).unwrap();
+    let r = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
+    assert_eq!(s.execute("object.pattern.make", &json!({"ids": [r.0], "name": "Mine", "edit": false})).unwrap()["name"], "Mine 2");
+    assert_eq!(s.execute("object.pattern.make", &json!({"ids": [r.0], "edit": false})).unwrap()["name"], "New Pattern 2");
+    s.execute("object.pattern.edit", &json!({"name": "Mine 2"})).unwrap();
+    assert_eq!(s.execute("object.pattern.saveCopy", &json!({"name": "Mine"})).unwrap()["name"], "Mine 3");
+}
+
 #[test]
 fn undo_make_pattern() {
     let mut s = session();
@@ -325,15 +419,123 @@ fn svg_export_writes_pattern_def() {
     assert!(svg[start..end].contains("<path"));
 }
 
+/// A pattern fill is written as a PDF tiling pattern, which PDF import reads back as a pattern
+/// swatch: a rotated hatch over a long bar (#3849) stays one object with one pattern fill, in a few
+/// kilobytes, instead of hundreds of tiles.
 #[test]
-fn pdf_export_expands_pattern_fills() {
-    let mut s = session();
-    make_dots(&mut s);
-    let big = rect(&mut s, 100.0, 100.0, 50.0, 50.0);
-    s.execute("paint.setFill", &json!({"ids": [big.0], "swatch": "Dots"})).unwrap();
-    let rep = vectorcraft_pdf::export_with_report(doc(&s), &Default::default()).unwrap();
+fn pdf_export_writes_pattern_fills_as_tiling_patterns() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="2812" height="300" viewBox="0 0 2812 300">
+  <defs>
+    <pattern id="hatch" patternUnits="userSpaceOnUse" width="24" height="24" patternTransform="rotate(45)">
+      <rect width="12" height="24" fill="#EB003C"/>
+      <rect x="12" width="12" height="24" fill="#FFFFFF"/>
+    </pattern>
+  </defs>
+  <rect x="80" y="80" width="2650" height="140" fill="url(#hatch)" stroke="#EB003C" stroke-width="4"/>
+</svg>"##;
+    let d = vectorcraft_svg::import(svg).unwrap();
+    let rep = vectorcraft_pdf::export_with_report(&d, &Default::default()).unwrap();
     assert!(rep.warnings.iter().all(|w| !w.contains("pattern")), "{:?}", rep.warnings);
-    assert!(rep.bytes.len() > 500);
+    assert!(rep.bytes.len() < 8_000, "{} bytes", rep.bytes.len());
+    let plain = vectorcraft_pdf::export(&d, &vectorcraft_pdf::PdfOptions::uncompressed()).unwrap();
+    assert!(String::from_utf8_lossy(&plain).contains("/PatternType 1"));
+    let back = vectorcraft_pdf::import(&rep.bytes).unwrap();
+    assert_eq!(back.patterns.len(), 1);
+    assert_eq!(back.patterns[0].art.len(), 2, "the hatch's two stripes");
+    let mut leaves = vec![];
+    back.walk(|n| {
+        if !n.is_container() {
+            leaves.push(n.appearance.fill_paint());
+        }
+    });
+    assert!(leaves.len() <= 2, "{leaves:?}");
+    assert!(leaves.iter().any(|p| matches!(p, Paint::Pattern { pattern, .. } if *pattern == back.patterns[0].name)), "{leaves:?}");
+}
+
+/// A pattern fill nested more than four patterns deep is written as its tiles, and the export says so.
+#[test]
+fn pdf_export_writes_patterns_nested_too_deep_as_tiles_with_a_warning() {
+    use std::sync::Arc;
+    use vectorcraft_doc::pattern::{PatternDef, pattern_paint};
+    use vectorcraft_doc::{Appearance, Document};
+    let square = |paint: Paint| {
+        Node::path(NodeId(0), vectorcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::basic(paint, Paint::None, 0.0))
+    };
+    let mut d = Document::new(100.0, 100.0);
+    d.patterns.push(PatternDef::new("P0", vec![Arc::new(square(Paint::solid(vectorcraft_color::Color::rgb(1.0, 0.0, 0.0))))]));
+    for i in 1..=4 {
+        d.patterns.push(PatternDef::new(&format!("P{i}"), vec![Arc::new(square(pattern_paint(&format!("P{}", i - 1))))]));
+    }
+    // P3 nests four tiling patterns (P3 to P0); P4 one more, which is written as its tiles.
+    for (top, tiles) in [("P3", false), ("P4", true)] {
+        let mut d = d.clone();
+        let mut n = square(pattern_paint(top));
+        n.id = d.alloc_id();
+        let layer = d.layers[0].id;
+        d.insert(Some(layer), 0, n).unwrap();
+        let rep = vectorcraft_pdf::export_with_report(&d, &Default::default()).unwrap();
+        assert_eq!(rep.warnings.iter().any(|w| w.contains("are written as their tiles")), tiles, "{top}: {:?}", rep.warnings);
+    }
+}
+
+#[test]
+fn every_raster_export_says_when_a_pattern_holds_an_image_that_could_not_be_decoded() {
+    // A PNG whose header reads (so it places at its size) but whose pixel data is cut short, made
+    // into a pattern and then cleared from the page: only the pattern's tile draws it.
+    let mut s = session();
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(20, 20, image::Rgba([200, 30, 30, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let idat = png.windows(4).position(|w| w == b"IDAT").unwrap();
+    png.truncate(idat + 8);
+    let placed = s.execute("file.place", &json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&png)})).unwrap();
+    let placed = NodeId(placed["ids"][0].as_u64().unwrap());
+    sel(&mut s, &[placed]);
+    s.execute("object.pattern.make", &json!({"name": "Cut", "width": 20, "height": 20})).unwrap();
+    s.execute("object.pattern.done", &json!({})).unwrap();
+    sel(&mut s, &[placed]);
+    s.execute("edit.clear", &json!({})).unwrap();
+    assert!(doc(&s).node(placed).is_none());
+    let big = rect(&mut s, 100.0, 100.0, 50.0, 50.0);
+    s.execute("paint.setFill", &json!({"ids": [big.0], "swatch": "Cut"})).unwrap();
+    // The first export draws the pattern's tile, and the later ones draw it from the tile kept.
+    for n in 0..3 {
+        let r = s.execute("document.export", &json!({"format": "png", "background": "transparent"})).unwrap();
+        let warnings = r["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(warnings.iter().any(|w| w.as_str().is_some_and(|w| w.contains("couldn't be decoded"))), "export {n}: {r}");
+    }
+}
+
+#[test]
+fn a_raster_export_says_when_a_pattern_tile_draws_an_undecodable_image_from_its_kept_rasterize_image() {
+    // A PNG whose pixel data is cut short, with Rasterize, a drop shadow and a blur: the shadow
+    // draws the Rasterize image, and the blurred content draws the image kept from that draw.
+    let mut s = session();
+    let placed = place_undecodable_png(&mut s);
+    for (effect, params) in [
+        ("rasterize", json!({"background": "white"})),
+        ("stylize.dropShadow", json!({"x": 2, "y": 2, "blur": 1})),
+        ("blur.gaussian", json!({"radius": 4})),
+    ] {
+        s.execute("effect.apply", &json!({"effect": effect, "params": params, "ids": [placed.0]})).unwrap();
+    }
+    sel(&mut s, &[placed]);
+    s.execute("object.pattern.make", &json!({"name": "Cut", "width": 80, "height": 40})).unwrap();
+    s.execute("object.pattern.done", &json!({})).unwrap();
+    sel(&mut s, &[placed]);
+    s.execute("edit.clear", &json!({})).unwrap();
+    let big = rect(&mut s, 100.0, 100.0, 50.0, 50.0);
+    s.execute("paint.setFill", &json!({"ids": [big.0], "swatch": "Cut"})).unwrap();
+    let warns = |s: &mut Session| {
+        let r = s.execute("document.export", &json!({"format": "png", "background": "transparent"})).unwrap();
+        r["warnings"].as_array().is_some_and(|w| w.iter().any(|w| w.as_str().is_some_and(|w| w.contains("couldn't be decoded"))))
+    };
+    assert!(warns(&mut s), "the first export");
+    // A new overlap draws a new tile of the same art, and the tile renderer draws its shadow and
+    // its blurred content from the rasters it kept.
+    s.execute("pattern.options", &json!({"name": "Cut", "overlap": {"h": "right"}})).unwrap();
+    assert!(warns(&mut s), "the export after Pattern Options");
 }
 
 // ---------- repeat ----------
@@ -350,7 +552,7 @@ fn radial_repeat_wraps_selection() {
     let RepeatKind::Radial { instances, radius, center, .. } = spec.kind else { panic!() };
     assert_eq!((instances, radius), (8, 50.0));
     assert!(close(center, Point::new(200.0, 150.0)));
-    assert_eq!(spec.transforms().len(), 8);
+    assert_eq!(spec.transforms(None).len(), 8);
     assert_eq!(n.kind_label(), "Radial Repeat");
 }
 
@@ -390,7 +592,7 @@ fn radial_instance_transforms_rotate_around_center() {
     sel(&mut s, &[r]);
     let v = s.execute("object.repeat.radial", &json!({"instances": 4, "radius": 50})).unwrap();
     let NodeKind::Repeat(spec) = node(&s, id_of(&v)).kind else { panic!() };
-    let t = spec.transforms();
+    let t = spec.transforms(None);
     let c = Point::new(200.0, 100.0);
     assert!(close(t[0] * c, Point::new(200.0, 100.0)));
     assert!(close(t[1] * c, Point::new(250.0, 150.0)));
@@ -429,7 +631,7 @@ fn object_expand_expands_repeats() {
         sel(&mut s, &[r]);
         let id = id_of(&s.execute(cmd, &opts).unwrap());
         let NodeKind::Repeat(spec) = node(&s, id).kind else { panic!("{cmd}") };
-        let n = spec.expand().len();
+        let n = spec.expand(None).len();
         assert_eq!(s.execute("object.expand.info", &json!({})).unwrap()["object"], json!(true), "{cmd}");
         let undo = s.doc().unwrap().history.undo.len();
         s.execute("object.expand", &json!({"fill": false, "stroke": false})).unwrap();
@@ -478,7 +680,7 @@ fn grid_repeat_and_options() {
     let RepeatKind::Grid { rows, cols, flip_cols, grid_type, .. } = spec.kind else { panic!() };
     assert_eq!((rows, cols, flip_cols), (2, 4, true));
     assert_eq!(grid_type, TileType::BrickByRow { offset: 0.5 });
-    assert_eq!(spec.expand().len(), 8);
+    assert_eq!(spec.expand(None).len(), 8);
 }
 
 #[test]
@@ -586,4 +788,112 @@ fn picking_another_pattern_swatch_keeps_the_pattern_transform() {
     let Paint::Pattern { pattern, xf } = node(&s, big).appearance.fill_paint() else { panic!() };
     assert_eq!(pattern, "Dots");
     assert_eq!(xf.as_coeffs(), [2.0, 0.0, 0.0, 2.0, 15.0, 10.0]);
+}
+
+#[test]
+fn inner_glow_on_a_pattern_fill_stays_inside_the_object_on_the_threaded_renderer() {
+    // #2426: the glow's pixmap was drawn with the pattern's paint transform, so it landed
+    // scaled at the top left instead of along the object's edges.
+    let mut s = session();
+    make_dots(&mut s);
+    let bg = rect(&mut s, 0.0, 0.0, 400.0, 400.0);
+    s.execute("paint.setFill", &json!({"ids": [bg.0], "color": "#223344"})).unwrap();
+    let big = rect(&mut s, 100.0, 100.0, 150.0, 150.0);
+    s.execute("paint.setFill", &json!({"ids": [big.0], "swatch": "Dots"})).unwrap();
+    sel(&mut s, &[big]);
+    s.execute("effect.apply", &json!({"effect": "stylize.innerGlow", "params": {"blur": 10}})).unwrap();
+    let mut r = vectorcraft_render::Renderer::new();
+    r.threads = 2;
+    let view = Affine::scale(1.5) * Affine::translate((-20.0, -30.0));
+    let out = r.render(&s.doc().unwrap().doc, 400, 400, view, &Default::default());
+    let [red, ..] = out.pixel(110, 100);
+    assert!(red < 0x30, "glow outside the object: red {red}");
+    let [red, ..] = out.pixel(123, 200);
+    assert!(red > 0x40, "no glow along the edge: red {red}");
+}
+
+fn mirror_axis(s: &Session) -> vectorcraft_tools::mirror::MirrorAxis {
+    let st = s.active().unwrap();
+    vectorcraft_tools::mirror::MirrorAxis::of(&st.doc, &st.selection, 1.0).unwrap()
+}
+
+#[test]
+fn mirror_axis_drag_previews_once_and_undo_redo_preserve_source() {
+    use vectorcraft_tools::{PointerEvent, PointerKind};
+    let mut s = session();
+    rect(&mut s, 100.0, 100.0, 60.0, 80.0);
+    let id = id_of(&s.execute("object.repeat.mirror", &json!({})).unwrap());
+    let before = node(&s, id);
+    let axis = mirror_axis(&s);
+    let v = ViewInfo::default();
+    s.select_tool("selection", v).unwrap();
+    let h = super::tests::history(&s);
+    for (kind, dx) in [(PointerKind::Down, 0.0), (PointerKind::Drag, 20.0), (PointerKind::Drag, 30.0), (PointerKind::Up, 40.0)] {
+        s.pointer(&PointerEvent::new(kind, axis.center.x + dx, axis.center.y), v).unwrap();
+        assert!(close(mirror_axis(&s).center, axis.center + vectorcraft_geom::Vec2::new(dx, 0.0)));
+    }
+    assert_eq!(super::tests::history(&s).0, h.0 + 1);
+    let after = node(&s, id);
+    let (NodeKind::Repeat(a), NodeKind::Repeat(b)) = (&before.kind, &after.kind) else { panic!() };
+    assert_eq!(a.source, b.source, "moving the mirror axis leaves the source artwork in place");
+    assert_ne!(a.transforms(None), b.transforms(None), "the reflected copy updates live");
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(node(&s, id), before);
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(node(&s, id), after);
+}
+
+#[test]
+fn mirror_axis_rotation_snaps_and_escape_restores_document_and_history() {
+    use vectorcraft_tools::{Mods, PointerEvent, PointerKind, ToolKey};
+    let mut s = session();
+    rect(&mut s, 100.0, 100.0, 60.0, 80.0);
+    let id = id_of(&s.execute("object.repeat.mirror", &json!({})).unwrap());
+    let v = ViewInfo::default();
+    s.select_tool("selection", v).unwrap();
+    let before = node(&s, id);
+    let h = super::tests::history(&s);
+    let axis = mirror_axis(&s);
+    let end = axis.ends[1];
+    let destination = axis.center + vectorcraft_geom::Vec2::new(70.0, 60.0);
+    s.pointer(&PointerEvent::new(PointerKind::Down, end.x, end.y), v).unwrap();
+    let shift = Mods { shift: true, ..Default::default() };
+    s.pointer(&PointerEvent::new(PointerKind::Drag, destination.x, destination.y).with_mods(shift), v).unwrap();
+    assert!((mirror_axis(&s).angle - 45.0).abs() < 1e-6);
+    assert_eq!(mirror_axis(&s).center, axis.center);
+    s.tool_key(ToolKey::Escape, Mods::default(), v).unwrap();
+    assert!(!s.tool_busy());
+    s.pointer(&PointerEvent::new(PointerKind::Up, destination.x, destination.y), v).unwrap();
+    assert_eq!(node(&s, id), before);
+    assert_eq!(super::tests::history(&s), h);
+    // A click is not an edit, and a subsequent real drag still works after cancellation.
+    s.pointer(&PointerEvent::new(PointerKind::Down, end.x, end.y), v).unwrap();
+    s.pointer(&PointerEvent::new(PointerKind::Up, end.x, end.y), v).unwrap();
+    assert_eq!(super::tests::history(&s), h);
+    s.pointer(&PointerEvent::new(PointerKind::Down, end.x, end.y), v).unwrap();
+    s.pointer(&PointerEvent::new(PointerKind::Up, destination.x, destination.y).with_mods(shift), v).unwrap();
+    assert!((mirror_axis(&s).angle - 45.0).abs() < 1e-6);
+    assert_eq!(super::tests::history(&s).0, h.0 + 1);
+}
+
+#[test]
+fn mirror_axis_hidden_controls_and_other_repeat_kinds_do_not_capture_drags() {
+    use vectorcraft_tools::{PointerEvent, PointerKind};
+    for command in ["object.repeat.mirror", "object.repeat.radial", "object.repeat.grid"] {
+        let mut s = session();
+        rect(&mut s, 100.0, 100.0, 60.0, 80.0);
+        let id = id_of(&s.execute(command, &json!({})).unwrap());
+        let before = node(&s, id);
+        let st = s.active().unwrap();
+        if command != "object.repeat.mirror" {
+            assert!(vectorcraft_tools::mirror::MirrorAxis::of(&st.doc, &st.selection, 1.0).is_none());
+        }
+        let v = ViewInfo { show_bbox: false, ..Default::default() };
+        s.select_tool("selection", v).unwrap();
+        // Away from every instance: the hidden axis's top handle cannot edit the repeat.
+        s.pointer(&PointerEvent::new(PointerKind::Down, 170.0, 76.0), v).unwrap();
+        s.pointer(&PointerEvent::new(PointerKind::Drag, 200.0, 80.0), v).unwrap();
+        s.pointer(&PointerEvent::new(PointerKind::Up, 200.0, 80.0), v).unwrap();
+        assert_eq!(node(&s, id), before);
+    }
 }
