@@ -127,9 +127,6 @@ Tap the **⚙** in the strip to open the **Pen & Touch** window. Changes apply i
 
 ---
 
-## 🔗 Links
-
-The community-chat link of the original app has been replaced everywhere (Help menu, command palette, Home / About button) with the developer's GitHub: <https://github.com/HansaraKehan>.
 
 ---
 
