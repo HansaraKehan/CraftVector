@@ -744,6 +744,9 @@ fn crop_and_rasterize_say_in_the_status_bar_when_an_image_could_not_be_decoded()
 /// One headless frame of the whole window at `time` → how long the app asked to wait before the
 /// next one.
 fn frame_at(app: &mut VectorcraftApp, ctx: &egui::Context, time: f64) -> std::time::Duration {
+    // The app's background work (the link-watch look) runs on host time; drive it with this test's
+    // simulated seconds rather than the real monotonic clock, as the window loop would.
+    app.now_override = Some(time);
     let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), time: Some(time), ..Default::default() };
     let mut out = ctx.run_ui(raw, |ui| {
         app.logic(ui.ctx());

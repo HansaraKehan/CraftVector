@@ -116,6 +116,143 @@ fn shape_builder_drag_merges_a_narrow_overlap_when_far_art_is_selected() {
 }
 
 #[test]
+fn shape_builder_drag_merges_across_an_overlap_thinner_than_the_precision() {
+    let mut s = session();
+    let a = rect(&mut s, 100.0, 100.0, 100.0, 100.0);
+    let b = rect(&mut s, 199.999, 100.0, 100.0, 100.0);
+    s.execute("select.set", &json!({"ids": [a.0, b.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[150, 150], [250, 150]]})).unwrap();
+    let out = ids(&r);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(outline(&node(&s, out[0])).0.subpaths.len(), 1, "no hairline gap at the 0.001 pt overlap");
+    assert!((area(&s, out[0]) - 19999.9).abs() < 1.0, "{}", area(&s, out[0]));
+    // A click on one side leaves the sliver to the other square, which stays whole.
+    s.execute("edit.undo", &json!({})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[150, 150]]})).unwrap();
+    let merged = NodeId(r["merged"].as_u64().unwrap());
+    assert!((area(&s, merged) - 9999.9).abs() < 1e-3, "{}", area(&s, merged));
+    let out = ids(&r);
+    assert_eq!(out.len(), 2, "{out:?}");
+    let rest = out.iter().copied().find(|i| *i != merged).unwrap();
+    assert!((area(&s, rest) - 10000.0).abs() < 1e-6, "{}", area(&s, rest));
+}
+
+#[test]
+fn shape_builder_drag_merges_across_an_overlap_thinner_than_the_precision_with_a_line_selected() {
+    let mut s = session();
+    let a = rect(&mut s, 100.0, 100.0, 100.0, 100.0);
+    let b = rect(&mut s, 199.999, 100.0, 100.0, 100.0);
+    let l = line(&mut s, (400.0, 400.0), (450.0, 450.0));
+    s.execute("select.set", &json!({"ids": [a.0, b.0, l.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[150, 150], [250, 150]]})).unwrap();
+    let merged = NodeId(r["merged"].as_u64().unwrap());
+    assert_eq!(ids(&r).len(), 2, "the merged shape and the line: {r}");
+    assert_eq!(outline(&node(&s, merged)).0.subpaths.len(), 1, "no hairline gap at the 0.001 pt overlap");
+    assert!((area(&s, merged) - 19999.9).abs() < 1.0, "{}", area(&s, merged));
+}
+
+#[test]
+fn shape_builder_click_beside_a_sliver_leaves_it_to_one_shape() {
+    let mut s = session();
+    // Two lines 0.005 pt apart cut a square; the strip between them is a sliver.
+    let a = rect(&mut s, 100.0, 100.0, 100.0, 100.0);
+    let l1 = line(&mut s, (150.0, 50.0), (150.0, 250.0));
+    let l2 = line(&mut s, (150.005, 50.0), (150.005, 250.0));
+    s.execute("select.set", &json!({"ids": [a.0, l1.0, l2.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[120, 150]]})).unwrap();
+    let merged = NodeId(r["merged"].as_u64().unwrap());
+    let rest: Vec<NodeId> = ids(&r).into_iter().filter(|i| *i != merged && outline(&node(&s, *i)).0.subpaths.iter().all(|sp| sp.closed)).collect();
+    assert_eq!(rest.len(), 1, "{r}");
+    let total = area(&s, merged) + area(&s, rest[0]);
+    assert!((total - 10000.0).abs() < 0.1, "the merged shape and the rest overlap: {} + {}", area(&s, merged), area(&s, rest[0]));
+}
+
+#[test]
+fn shape_builder_click_beside_a_sliver_of_closed_shapes_leaves_it_to_one_shape() {
+    let mut s = session();
+    // Two squares over a third leave a strip of it 0.005 pt wide between them.
+    let a = rect(&mut s, 100.0, 100.0, 100.0, 100.0);
+    let b = rect(&mut s, 100.0, 100.0, 49.9975, 100.0);
+    let c = rect(&mut s, 150.0025, 100.0, 49.9975, 100.0);
+    s.execute("select.set", &json!({"ids": [a.0, b.0, c.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[125, 150]]})).unwrap();
+    let out = ids(&r);
+    assert_eq!(out.len(), 3, "the merged shape, the rest of the back square and the right square: {r}");
+    let total: f64 = out.iter().map(|i| area(&s, *i)).sum();
+    assert!((total - 14999.75).abs() < 0.1, "the merged shape and the rest overlap: {total}");
+}
+
+#[test]
+fn shape_builder_click_keeps_a_sliver_the_merge_leaves_out_in_the_rest() {
+    // Also with a line selected, which merges in the planar map.
+    for with_line in [false, true] {
+        let mut s = session();
+        // B overlaps A and C by 0.005 pt more than C does: the strip of A and B between them is a
+        // sliver next to the region of A alone, which a click merges without it.
+        let a = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
+        let b = rect(&mut s, 49.995, 0.0, 50.005, 100.0);
+        let c = rect(&mut s, 50.0, 0.0, 50.0, 100.0);
+        let mut sel = vec![a.0, b.0, c.0];
+        if with_line {
+            sel.push(line(&mut s, (400.0, 400.0), (450.0, 450.0)).0);
+        }
+        s.execute("select.set", &json!({ "ids": sel })).unwrap();
+        let r = s.execute("shapeBuilder.merge", &json!({"points": [[25, 50]]})).unwrap();
+        let merged = NodeId(r["merged"].as_u64().unwrap());
+        assert!((area(&s, merged) - 4999.5).abs() < 0.1, "{}", area(&s, merged));
+        let out = ids(&r);
+        assert_eq!(out.len(), sel.len() + 1, "{r}");
+        // What is left of A, B and C: 5,000.5, 5,000.5 and 5,000.
+        let total: f64 = out.iter().map(|i| area(&s, *i)).sum();
+        assert!((total - 20000.5).abs() < 0.1, "what is left of the back square lost the strip: {total} ({with_line})");
+    }
+}
+
+#[test]
+fn shape_builder_click_keeps_a_sliver_away_from_the_merge_in_the_rest() {
+    let mut s = session();
+    // Three squares over a fourth leave two strips of it 0.005 pt wide; a click merges the left
+    // square's region, next to the first strip only.
+    let a = rect(&mut s, 100.0, 100.0, 150.0, 100.0);
+    let b = rect(&mut s, 100.0, 100.0, 49.9975, 100.0);
+    let c = rect(&mut s, 150.0025, 100.0, 49.995, 100.0);
+    let e = rect(&mut s, 200.0025, 100.0, 49.9975, 100.0);
+    s.execute("select.set", &json!({"ids": [a.0, b.0, c.0, e.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[125, 150]]})).unwrap();
+    let out = ids(&r);
+    assert_eq!(out.len(), 4, "{r}");
+    let rest = out.iter().copied().find(|i| area(&s, *i) > 9000.0).unwrap();
+    assert_eq!(outline(&node(&s, rest)).0.subpaths.len(), 1, "no hairline gap at the second strip");
+    let total: f64 = out.iter().map(|i| area(&s, *i)).sum();
+    assert!((total - 24999.25).abs() < 0.1, "{total}");
+}
+
+#[test]
+fn shape_builder_click_keeps_a_sliver_away_from_the_merge_in_the_rest_with_a_compound_path() {
+    let mut s = session();
+    // The same with the three squares in one compound path, whose three regions have one coverage.
+    let a = rect(&mut s, 100.0, 100.0, 150.0, 100.0);
+    let b = rect(&mut s, 100.0, 100.0, 49.9975, 100.0);
+    let c = rect(&mut s, 150.0025, 100.0, 49.995, 100.0);
+    let e = rect(&mut s, 200.0025, 100.0, 49.9975, 100.0);
+    s.execute("select.set", &json!({"ids": [b.0, c.0, e.0]})).unwrap();
+    let compound = NodeId(s.execute("object.compoundPath.make", &json!({})).unwrap()["id"].as_u64().unwrap());
+    s.execute("select.set", &json!({"ids": [a.0, compound.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[125, 150]]})).unwrap();
+    let merged = NodeId(r["merged"].as_u64().unwrap());
+    assert!((area(&s, merged) - 5000.25).abs() < 0.1, "{}", area(&s, merged));
+    let out = ids(&r);
+    assert_eq!(out.len(), 3, "{r}");
+    // What is left of the back square holds the second strip; what is left of the compound path
+    // keeps the gap it had there.
+    let mut rest: Vec<(usize, f64)> =
+        out.iter().copied().filter(|i| *i != merged).map(|i| (outline(&node(&s, i)).0.subpaths.len(), area(&s, i))).collect();
+    rest.sort_by_key(|r| r.0);
+    assert_eq!(rest.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 2], "{rest:?}");
+    assert!((rest[0].1 - 9999.75).abs() < 0.1 && (rest[1].1 - 9999.25).abs() < 0.1, "{rest:?}");
+}
+
+#[test]
 fn shape_builder_click_splits_out_one_region() {
     let mut s = session();
     two(&mut s);
@@ -363,6 +500,32 @@ fn shape_builder_tool_drives_the_command() {
     s.pointer(&PointerEvent::new(PointerKind::Down, 125.0, 50.0).with_mods(alt), v).unwrap();
     s.pointer(&PointerEvent::new(PointerKind::Up, 125.0, 50.0).with_mods(alt), v).unwrap();
     assert_eq!(layer_children(&s), 1);
+}
+
+/// A click of the Shape Builder merges over the map the tool built for the hover, as does the
+/// command over the same inputs with the same gap; another gap needs a map of its own.
+#[test]
+fn shape_builder_merge_uses_the_map_the_tool_has() {
+    use vectorcraft_tools::builder::maps_built;
+    let mut s = session();
+    two(&mut s);
+    let v = ViewInfo::default();
+    s.select_tool("shapeBuilder", v).unwrap();
+    s.pointer(&PointerEvent::new(PointerKind::Move, 75.0, 50.0), v).unwrap();
+    let built = maps_built();
+    s.pointer(&PointerEvent::new(PointerKind::Down, 75.0, 50.0), v).unwrap();
+    s.pointer(&PointerEvent::new(PointerKind::Up, 75.0, 50.0), v).unwrap();
+    assert_eq!(s.journal.last().unwrap().0, "shapeBuilder.merge");
+    assert_eq!(layer_children(&s), 3, "the overlap and what is left of each square");
+    assert_eq!(maps_built(), built, "the click builds no map");
+    // Undone, the squares are the inputs the tool's map was built from.
+    s.execute("edit.undo", &json!({})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[75, 50]]})).unwrap();
+    assert!((area(&s, NodeId(r["merged"].as_u64().unwrap())) - 5000.0).abs() < 1e-6);
+    assert_eq!(maps_built(), built, "the command over the same inputs builds no map");
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("shapeBuilder.merge", &json!({"points": [[75, 50]], "gap": 3})).unwrap();
+    assert_eq!(maps_built(), built + 1, "another gap");
 }
 
 #[test]
@@ -1024,6 +1187,29 @@ fn shape_builder_erase_drag_into_regions_deletes_them_not_the_edges_it_crosses()
     assert!((area(&s, out[0]) - 7500.0).abs() < 1e-6);
     assert!(outline(&node(&s, out[0])).0.is_closed());
     assert_eq!(node(&s, out[0]).appearance.fill_paint(), Paint::solid(Color::rgb(0.0, 0.0, 1.0)));
+}
+
+#[test]
+fn shape_builder_erase_drag_deletes_an_overlap_narrower_than_twice_the_tolerance() {
+    let mut s = session();
+    // A 1.5 pt overlap: every point of it is within the 2 pt tolerance of its edges.
+    two_at(&mut s, 98.5);
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[50, 50], [150, 50]], "erase": true})).unwrap();
+    assert_eq!((r["regions"].as_u64(), r["edges"].as_u64()), (Some(3), Some(0)), "{r}");
+    assert_eq!(layer_children(&s), 0, "no strip is left");
+}
+
+#[test]
+fn shape_builder_erase_click_or_drag_from_inside_a_narrow_overlap_deletes_it() {
+    for points in [json!([[99.2, 50]]), json!([[99.2, 50], [150, 50]]), json!([[95, 10], [103.5, 60]])] {
+        let mut s = session();
+        two_at(&mut s, 98.5);
+        let r = s.execute("shapeBuilder.merge", &json!({"points": points, "erase": true})).unwrap();
+        assert_eq!(r["edges"].as_u64(), Some(0), "{points}: {r}");
+        let d = &s.doc().unwrap().doc;
+        let left: Vec<f64> = d.children(d.default_layer()).unwrap().iter().filter_map(|c| c.geometric_bounds()).map(|b| b.width()).collect();
+        assert!(left.iter().all(|w| *w > 2.0), "{points}: no strip is left: {left:?}");
+    }
 }
 
 /// In Merge Mode, Clicking Stroke Splits the Path: a click on a lone rectangle's top side, 1 pt
@@ -2199,6 +2385,42 @@ fn shape_builder_keeps_the_edges_of_an_unfilled_live_paint_group() {
     assert!((stroked_length(&s, &out) - 700.0).abs() < 1.0, "{}", stroked_length(&s, &out));
 }
 
+/// A plain group whose name starts with "Live Paint" is not a Live Paint group: the Shape Builder
+/// takes its paths, and a merge elsewhere keeps them.
+#[test]
+fn shape_builder_takes_the_paths_of_a_plain_group_named_live_paint() {
+    let mut s = session();
+    let a = rect(&mut s, 0.0, 0.0, 100.0, 100.0);
+    set_fill(&mut s, a, Color::rgb(1.0, 0.0, 0.0));
+    s.execute("select.set", &json!({"ids": [a.0]})).unwrap();
+    let g = NodeId(s.execute("object.group", &json!({})).unwrap()["id"].as_u64().unwrap());
+    s.edit("t", |d, _| {
+        d.node_mut(g).unwrap().name = Some("Live Painting".into());
+        Ok(())
+    })
+    .unwrap();
+    let c = rect(&mut s, 160.0, 20.0, 100.0, 20.0);
+    set_fill(&mut s, c, Color::rgb(0.0, 1.0, 0.0));
+    s.execute("select.set", &json!({"ids": [g.0, c.0]})).unwrap();
+    let map = s.execute("shapeBuilder.regions", &json!({})).unwrap();
+    assert_eq!(map["regions"].as_array().unwrap().len(), 2, "{map}");
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[200, 30]]})).unwrap();
+    let out = ids(&r);
+    assert!(out.iter().any(|i| (area(&s, *i) - 10000.0).abs() < 1.0), "the group's rectangle is kept: {r}");
+    // A stroke of the group's rectangle splits as a plain path's does.
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("select.set", &json!({"ids": [g.0]})).unwrap();
+    let r = s.execute("shapeBuilder.merge", &json!({"points": [[-1, 50]], "splitStroke": true})).unwrap();
+    assert_eq!(node(&s, g).children().unwrap().len(), 2, "{r}");
+    // Make Live Paint takes the group as a source rather than as a Live Paint group to merge into.
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("select.set", &json!({"ids": [g.0]})).unwrap();
+    let r = s.execute("livePaint.make", &json!({})).unwrap();
+    assert_eq!(r["faces"], 1, "{r}");
+    let made = node(&s, NodeId(r["id"].as_u64().unwrap()));
+    assert!(vectorcraft_tools::builder::sources(&made).unwrap().children().unwrap().iter().any(|c| c.id == g));
+}
+
 // ---------- Image Trace ----------
 
 /// A 100×100 image with a black disc (r = 30 px), placed at (50, 50) scaled ×2.
@@ -2578,6 +2800,71 @@ fn image_trace_palettes_and_swatch_libraries() {
     let mut bad = |p: Value| s.execute("imageTrace.make", &json!({"preset": "6 Colors", "params": p})).is_err();
     assert!(bad(json!({"palette": "documentLibrary", "library": "No Such Library"})));
     assert!(bad(json!({"palette": "rainbow"})));
+}
+
+#[test]
+fn image_trace_document_library_uses_a_color_group() {
+    let mut s = session();
+    let r = vectorcraft_trace::Raster::from_fn(60, 60, |x, y| match (x < 30, y < 30) {
+        (true, _) => [200, 40, 40, 255],
+        (false, true) => [40, 160, 60, 255],
+        (false, false) => [50, 60, 200, 255],
+    });
+    add_image(&mut s, &r, Affine::IDENTITY);
+    // Ungrouped swatches of the image's own colors, and a group of colors a little off them.
+    s.execute("swatch.new", &json!({"colors": ["#c82828", "#28a03c", "#323cc8"]})).unwrap();
+    s.execute("swatch.newGroup", &json!({"name": "Brand", "colors": ["#b43c3c", "#3c8c50", "#4650b4"]})).unwrap();
+    s.execute("swatch.newGroup", &json!({"name": "Empty"})).unwrap();
+    s.execute("swatch.newGroup", &json!({"name": "Été", "colors": ["#b43c3c", "#3c8c50", "#4650b4"]})).unwrap();
+    let hex = |c: &Color| {
+        let [r, g, b, _] = c.to_rgba8(1.0);
+        format!("#{r:02x}{g:02x}{b:02x}")
+    };
+    let trace = |s: &mut Session, extra: Value| {
+        let mut params = json!({"mode": "color", "palette": "documentLibrary", "library": "document", "colors": 3});
+        params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        s.execute("imageTrace.makeAndExpand", &json!({"params": params}))
+    };
+    let fills = |s: &Session, id: &Value| -> Vec<String> {
+        let g = node(s, NodeId(id.as_u64().unwrap()));
+        let mut v: Vec<String> = g.children().unwrap().iter().filter_map(|n| n.appearance.fill_paint().color()).map(|c| hex(&c)).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    // Every swatch: the image's own colors win.
+    let r = trace(&mut s, json!({})).unwrap();
+    assert_eq!(fills(&s, &r["id"]), ["#28a03c", "#323cc8", "#c82828"]);
+    s.execute("edit.undo", &json!({})).unwrap();
+    // The group: its colors only, and its name matches whatever its case.
+    for name in ["Brand", "brand", "Été", "été", "ÉTÉ"] {
+        let r = trace(&mut s, json!({"colorGroup": name})).unwrap();
+        assert_eq!(fills(&s, &r["id"]), ["#3c8c50", "#4650b4", "#b43c3c"], "{name}");
+        s.execute("edit.undo", &json!({})).unwrap();
+    }
+    // An empty name is every swatch.
+    let r = trace(&mut s, json!({"colorGroup": ""})).unwrap();
+    assert_eq!(fills(&s, &r["id"]), ["#28a03c", "#323cc8", "#c82828"]);
+    s.execute("edit.undo", &json!({})).unwrap();
+    let err = |s: &mut Session, extra: Value| trace(s, extra).unwrap_err().to_string();
+    assert!(err(&mut s, json!({"colorGroup": "Nope"})).contains("no color group `Nope`"));
+    assert!(err(&mut s, json!({"colorGroup": "Empty"})).contains("`Empty` has no colours"));
+    assert!(err(&mut s, json!({"colorGroup": "Brand", "library": "web-safe-216"})).contains("needs `library: \"document\"`"));
+    // Every other palette refuses a group too, in any mode; an empty name is no group.
+    for palette in ["limited", "fullTone", "automatic"] {
+        let e = err(&mut s, json!({"colorGroup": "Brand", "palette": palette}));
+        assert!(e.contains("`colorGroup` needs `palette: \"documentLibrary\"`"), "{palette}: {e}");
+    }
+    let e = err(&mut s, json!({"colorGroup": "Brand", "mode": "grayscale", "palette": "limited"}));
+    assert!(e.contains("needs `palette: \"documentLibrary\"`"), "{e}");
+    // Document Library uses the group in Color mode only.
+    for mode in ["blackAndWhite", "grayscale", "logo"] {
+        let e = err(&mut s, json!({"colorGroup": "Brand", "mode": mode}));
+        assert!(e.contains("`colorGroup` needs `mode: \"color\"`"), "{mode}: {e}");
+    }
+    s.execute("imageTrace.makeAndExpand", &json!({"params": {"mode": "color", "palette": "limited", "colors": 3, "colorGroup": ""}})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    trace(&mut s, json!({"mode": "grayscale", "colorGroup": ""})).unwrap();
 }
 
 #[test]

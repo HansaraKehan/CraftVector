@@ -579,7 +579,7 @@ impl Tool for ArtboardTool {
         // (labels are drawn 8 px right of and 14 px above their point).
         let at = Point::new(r.x0 - cx.tol(8.0), r.y0 - cx.tol(4.0));
         o.push(Overlay::Label { p: at, text: format!("{:02} - {}", self.active + 1, ab.name), color: BLUE });
-        if let (Some(Drag::Resize { began: true, .. }), true) = (self.drag, cx.measurement_labels) {
+        if let (Some(Drag::Resize { began: true, .. }), true) = (self.drag, cx.transform_tools_guides) {
             o.push(Overlay::Measure {
                 p: Point::new(r.x1, r.y1) + Vec2::new(cx.tol(12.0), cx.tol(12.0)),
                 text: cx.size_label(r.width(), r.height()),
@@ -684,6 +684,26 @@ mod tests {
     fn drag_board2(cx: &ToolContext, t: &mut ArtboardTool, dx: f64, dy: f64) -> Value {
         t.pointer(cx, &ev(PointerKind::Down, 700.0, 100.0));
         preview_params(&t.pointer(cx, &ev(PointerKind::Drag, 700.0 + dx, 100.0 + dy)))
+    }
+
+    #[test]
+    fn artboard_resize_readout_honors_transform_tools_guides() {
+        let d = two_boards();
+        let (s, p) = (Selection::default(), paint());
+        let measures = |t: &ArtboardTool, c: &ToolContext| t.overlays(c).iter().filter(|o| matches!(o, Overlay::Measure { .. })).count();
+        let mut t = ArtboardTool { active: 1, ..Default::default() };
+        for on in [true, false] {
+            let c = ToolContext { transform_tools_guides: on, ..cx(&d, &s, &p) };
+            t.pointer(&c, &ev(PointerKind::Down, 800.0, 100.0));
+            t.pointer(&c, &ev(PointerKind::Drag, 820.0, 100.0));
+            assert_eq!(measures(&t, &c), usize::from(on), "transform tools {on}");
+            t.pointer(&c, &ev(PointerKind::Up, 820.0, 100.0));
+        }
+        let mut t = ArtboardTool::default();
+        let create = ToolContext { measurement_labels: true, transform_tools_guides: false, ..cx(&d, &s, &p) };
+        t.pointer(&create, &ev(PointerKind::Down, 900.0, 300.0));
+        t.pointer(&create, &ev(PointerKind::Drag, 1000.0, 400.0));
+        assert_eq!(measures(&t, &create), 1, "new artboard drag still uses measurement labels");
     }
 
     #[test]

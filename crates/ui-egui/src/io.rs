@@ -189,13 +189,20 @@ pub fn install_module(app: &mut VectorcraftApp, module: Value) -> Result<Value, 
     Ok(r)
 }
 
+/// Where File → Open… starts: the folder of the most recently opened file, else the active
+/// document's (#4122).
+fn open_dialog_folder(app: &VectorcraftApp) -> Option<String> {
+    app.ui.recent_files.iter().find_map(|p| fileio::dialog_folder(p)).or_else(|| suggested(app, "").1)
+}
+
 /// File → Open…
 pub fn open_dialog(app: &mut VectorcraftApp) -> Result<(), String> {
     if let Some(f) = app.services.open_async.as_mut() {
         f();
         return Ok(());
     }
-    let path = pick_open(app, &FilePick { filters: FilePick::filters(fileio::open_filters()), ..Default::default() })?;
+    let path =
+        pick_open(app, &FilePick { filters: FilePick::filters(fileio::open_filters()), folder: open_dialog_folder(app), ..Default::default() })?;
     open_reporting(app, &path).map(|_| ())
 }
 

@@ -1,4 +1,4 @@
-//! Library panels: read-only views of one library each (swatch, graphic style and symbol
+//! Library panels: read-only views of one library each (swatch, graphic style, symbol and brush
 //! libraries; any kind of library implementing [`LibraryKind`]) with thumbnail and list views, a
 //! find field, the libraries menu and previous / next arrows. A plain click on an item adds it to
 //! the document and applies it; Shift and Cmd/Ctrl-clicks select items (and folders) for Add to ….
@@ -7,7 +7,7 @@
 //! As in Illustrator (<https://helpx.adobe.com/illustrator/using/using-creating-swatches.html>,
 //! "Swatch libraries"), each open library is a panel of its own, `library:<kind>:<library id>`
 //! ([`panel_id`]), that floats, tabs, docks and closes as any panel of the shared docking system:
-//! `window.swatchLibrary`, `window.graphicStyleLibrary` and `window.symbolLibrary` open one, or bring it forward when it is
+//! `window.swatchLibrary`, `window.graphicStyleLibrary`, `window.symbolLibrary` and `window.brushLibrary` open one, or bring it forward when it is
 //! open. `UiState::library_panels` keeps each one's view, Show Find Field and Persistent
 //! (`ui.libraryPanel`); a persistent panel reopens when the app starts ([`restore`]). A persistent
 //! panel whose library can't be found shows the library as missing, with its file and Locate
@@ -163,6 +163,7 @@ fn kind(kind: &str) -> Option<Kind> {
         kind_of::<super::swatches::SwatchLibraries>(),
         kind_of::<super::graphic_styles::GraphicStyleLibraries>(),
         kind_of::<super::symbols::SymbolLibraries>(),
+        kind_of::<super::brushes::BrushLibraries>(),
     ]
     .into_iter()
     .find(|k| k.kind == kind)
@@ -208,14 +209,14 @@ fn registered(panel: &str) -> Result<&'static str, String> {
 
 /// Is panel `panel` open (in the dock or floating)?
 pub(crate) fn is_open(ui: &UiState, panel: &str) -> bool {
-    ui.docking.as_ref().is_some_and(|l| l.panels().iter().any(|p| p.as_str() == panel)) || crate::floating::group_of(ui, panel).is_some()
+    crate::panel_docking::layout_of(ui).contains(&panel.to_string())
 }
 
 /// The open library panels.
 fn open_panels(ui: &UiState) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     let docked = ui.docking.iter().flat_map(|l| l.panels());
-    for p in docked.chain(ui.floating_panels.iter().flat_map(|g| &g.panels)) {
+    for p in docked {
         if p.starts_with(PREFIX) && !out.contains(p) {
             out.push(p.clone());
         }
@@ -367,22 +368,28 @@ fn rename(ui: &mut UiState, from: &str, to: &str) -> Result<(), String> {
         serde_json::from_value(v).map_err(|e| e.to_string())
     }
     registered(to)?;
-    let docking = ui.docking.as_ref().map(|l| renamed(l, from, to)).transpose()?;
+    let mut docking = ui.docking.as_ref().map(|l| renamed(l, from, to)).transpose()?;
+    // A floating window keeps its id, and with it its OS window.
+    if let (Some(new), Some(old)) = (docking.as_mut(), ui.docking.as_ref()) {
+        for (window, was) in new.floating.iter_mut().zip(&old.floating) {
+            window.id = was.id;
+        }
+    }
     let mut hidden = std::collections::BTreeMap::new();
     for (p, at) in &ui.docking_hidden {
         hidden.insert(if p == from { to.to_string() } else { p.clone() }, renamed(at, from, to)?);
     }
     ui.docking = docking;
     ui.docking_hidden = hidden;
-    for p in ui.floating_panels.iter_mut().flat_map(|g| g.panels.iter_mut()).chain(ui.open_panel.as_mut()).filter(|p| p.as_str() == from) {
-        *p = to.into();
+    if ui.open_panel.as_deref() == Some(from) {
+        ui.open_panel = Some(to.into());
     }
     Ok(())
 }
 
 /// The interaction id of the tile or row of `name` in panel `panel`.
 pub(crate) fn tile_id(panel: &str, name: &str) -> egui::Id {
-    egui::Id::new(("library-tile", panel, name))
+    egui::Id::unique(("library-tile", panel, name))
 }
 
 /// The state key `key` of panel `panel`.
@@ -553,7 +560,7 @@ fn set(app: &mut VectorcraftApp, panel: &str, mut params: Value) {
 }
 
 /// Open-dialog filters for Other Library… / Locate Library… of library panels of kind `kind`
-/// (symbol libraries: any document).
+/// (symbol and brush libraries: any document).
 pub(crate) fn library_pick_filters(kind: &str) -> Vec<(&'static str, &'static [&'static str])> {
     match kind {
         super::swatches::SwatchLibraries::KIND => fileio::library_open_filters("Swatch libraries", swatchlib::LIBRARY_EXTS).collect(),
@@ -594,7 +601,7 @@ pub(crate) fn user_slot(id: &str, prefix: &str, libraries: Vec<LibraryInfo>) -> 
 #[cfg(test)]
 pub(crate) fn show_window(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let Some(panel) = last_open(&app.ui).map(LibraryPanel::panel) else { return };
-    let area = egui::Area::new(egui::Id::new("test-library-panel")).fixed_pos(egui::pos2(20.0, 20.0));
+    let area = egui::Area::new(egui::Id::unique("test-library-panel")).fixed_pos(egui::pos2(20.0, 20.0));
     area.show(ctx, |ui| crate::dock::panel_body(app, ui, &panel, 256.0, 400.0));
 }
 
@@ -612,7 +619,7 @@ fn body<K: LibraryKind>(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) {
     };
     let panel = panel_id(K::KIND, id);
     let (view, hide_find) = settings(&app.ui, K::KIND, id).map_or((K::VIEW, false), |s| (s.view.unwrap_or(K::VIEW), s.hide_find));
-    let query = if hide_find { String::new() } else { widgets::search_field(ui, egui::Id::new(key(&panel, "find")), tl!("Find")) };
+    let query = if hide_find { String::new() } else { widgets::search_field(ui, egui::Id::unique(key(&panel, "find")), tl!("Find")) };
     ui.add_space(4.0);
     let rows = K::rows(&lib, &query.trim().to_lowercase());
     let selected = selection(ui.ctx(), &panel);
@@ -939,7 +946,7 @@ mod tests {
         app.run("window.swatchLibrary", json!({"library": "web-safe-216"})).unwrap();
         let panel = "library:swatches:web-safe-216";
         app.run("ui.libraryPanel", json!({"panel": panel, "view": "smallList"})).unwrap();
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new(key(panel, "find")), "#FF00".to_string()));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique(key(panel, "find")), "#FF00".to_string()));
         frame(&mut app, &ctx, vec![], Modifiers::NONE, 0.0);
         frame(&mut app, &ctx, vec![], Modifiers::NONE, 0.5);
         assert!(ctx.read_response(tile_id(panel, "#FF0033")).is_some());
@@ -1132,7 +1139,7 @@ mod tests {
     }
 
     fn groups(app: &VectorcraftApp) -> Vec<Vec<String>> {
-        docking(app).floating.iter().map(|g| g.panels.clone()).collect()
+        docking(app).floating.iter().map(crate::panel_docking::window_panels).collect()
     }
 
     #[test]
@@ -1154,7 +1161,7 @@ mod tests {
         assert_eq!(groups(&app).len(), 3);
         assert_eq!(last_open(&app.ui).map(LibraryPanel::panel), Some(pastels.clone()));
         // They group, dock and close as any panel, and `window.panel` shows one again.
-        app.run("window.panel.float", json!({"panel": brights, "onto": pastels})).unwrap();
+        app.run("window.panel.move", json!({"panel": brights, "anchor": pastels})).unwrap();
         assert!(groups(&app).contains(&vec![pastels.clone(), brights.clone()]), "{:?}", groups(&app));
         app.run("window.panel.dock", json!({"panel": styles})).unwrap();
         assert!(craft_ui::docking::Layout { root: docking(&app).root.clone(), floating: vec![] }.contains(&styles));
@@ -1242,7 +1249,7 @@ mod tests {
         let next = restarted(&app);
         assert!(is_open(&next.ui, &pastels) && is_open(&next.ui, &brand), "{}", next.ui.status);
         assert!(!is_open(&next.ui, &brights), "a panel that isn't persistent closed with the app");
-        let group = docking(&next).floating.iter().find(|g| g.panels.contains(&pastels)).unwrap();
+        let group = docking(&next).floating.iter().find(|g| g.contains(&pastels)).unwrap();
         assert_eq!(group.rect[..2], [40.0, 90.0], "where it was");
         let s = settings(&next.ui, "swatches", "pastels").unwrap();
         assert_eq!((s.view, s.hide_find, s.persistent), (Some(View::LargeList), true, true));
@@ -1427,8 +1434,8 @@ mod tests {
         step::<SwatchLibraries>(&mut app, "pastels", 1);
         let next = panel_id("swatches", SWATCH_IDS[5]);
         assert!(!is_open(&app.ui, &first) && is_open(&app.ui, &next), "{}", app.ui.status);
-        let group = docking(&app).floating.iter().find(|g| g.panels.contains(&next)).unwrap();
-        assert_eq!((group.panels.len(), group.rect[0], group.rect[1]), (1, 50.0, 60.0), "in its place");
+        let group = docking(&app).floating.iter().find(|g| g.contains(&next)).unwrap();
+        assert_eq!((group.panels().count(), group.rect[0], group.rect[1]), (1, 50.0, 60.0), "in its place");
         let s = settings(&app.ui, "swatches", SWATCH_IDS[5]).unwrap();
         assert_eq!((s.view, s.persistent), (Some(View::SmallList), true), "the panel keeps its settings");
         assert!(settings(&app.ui, "swatches", "pastels").is_none());

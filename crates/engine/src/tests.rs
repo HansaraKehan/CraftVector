@@ -91,6 +91,42 @@ fn unknown_and_disabled() {
 }
 
 #[test]
+fn unknown_command_names_the_nearest_id() {
+    let mut s = session();
+    for typo in ["select.al", "Select.All", "selcet.all"] {
+        let e = s.execute(typo, &json!({})).unwrap_err();
+        assert!(matches!(&e, EngineError::UnknownCommandNear(id, near) if id == typo && near == "select.all"), "{typo}: {e:?}");
+        assert_eq!(e.to_string(), format!("unknown command `{typo}`; did you mean `select.all`?"));
+    }
+    let e = s.execute("nope", &json!({})).unwrap_err();
+    assert!(matches!(&e, EngineError::UnknownCommand(id) if id == "nope"), "{e:?}");
+    assert_eq!(e.to_string(), "unknown command `nope`");
+    let e = s.execute("command.batch", &json!({"commands": [{"command": "select.al", "params": {}}]})).unwrap_err();
+    assert!(e.to_string().contains("did you mean `select.all`?"), "{e}");
+}
+
+#[test]
+fn a_long_unknown_command_id_is_answered_at_once() {
+    let mut s = session();
+    let long = "x".repeat(200_000);
+    let start = std::time::Instant::now();
+    assert!(matches!(s.execute(&long, &json!({})), Err(EngineError::UnknownCommand(_))));
+    let e = crate::check_params("file.new", &json!({ long.as_str(): 1 })).unwrap_err();
+    assert!(e.to_string().contains("the command takes:"), "{e}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn action_batch_names_the_nearest_command_id() {
+    let mut s = session();
+    let e = s.execute("action.batch", &json!({"source": "dataSets", "commands": [{"command": "select.al"}]})).unwrap_err();
+    assert_eq!(e.to_string(), "invalid parameters for `action.batch`: commands[0]: unknown command `select.al`; did you mean `select.all`?");
+    let e = s.execute("action.batch", &json!({"source": "dataSets", "commands": [{"command": "nope"}]})).unwrap_err();
+    assert_eq!(e.to_string(), "invalid parameters for `action.batch`: commands[0]: unknown command `nope`");
+}
+
+#[test]
 fn group_ungroup() {
     let mut s = session();
     let a = rect(&mut s, 0.0, 0.0, 10.0, 10.0);
@@ -2449,6 +2485,34 @@ fn an_isolated_compound_paths_member_moves_alone() {
     s.execute("select.set", &json!({"ids": [c.0]})).unwrap();
     s.execute("object.move", &json!({"dx": 5, "dy": 0})).unwrap();
     assert_eq!((x0(&s, outer), x0(&s, hole)), (5.0, 55.0), "the compound path selected: the whole ring");
+}
+
+/// The X, Y, W and H of the Properties and Transform panels run `object.setBounds`, which takes the
+/// same objects as the other transforms: a path of a compound path selected alone sets its own
+/// box and leaves the ring around it (#4046). The hole is off-centre, and a plain rectangle
+/// outside the ring keeps "everything moved" from passing.
+#[test]
+fn set_bounds_of_a_compound_paths_member_sets_only_that_path() {
+    let x = |s: &Session, id: NodeId| {
+        let b = s.doc().unwrap().doc.node(id).unwrap().geometric_bounds().unwrap();
+        (b.x0, b.x1)
+    };
+    let mut s = session();
+    let (c, outer, hole) = isolated_ring(&mut s);
+    let other = rect(&mut s, 100.0, 0.0, 10.0, 10.0);
+    s.execute("select.set", &json!({"ids": [hole.0]})).unwrap();
+    s.execute("object.setBounds", &json!({"width": 20, "reference": 0})).unwrap();
+    assert_eq!((x(&s, outer), x(&s, hole)), ((0.0, 40.0), (10.0, 30.0)), "isolated: only the hole is wider");
+    s.execute("object.setBounds", &json!({"x": 25, "reference": 0})).unwrap();
+    assert_eq!((x(&s, outer), x(&s, hole)), ((0.0, 40.0), (25.0, 45.0)), "isolated: only the hole moved");
+    s.execute("object.exitIsolation", &json!({})).unwrap();
+    s.execute("select.set", &json!({"ids": [hole.0]})).unwrap();
+    s.execute("object.setBounds", &json!({"x": 12, "reference": 0})).unwrap();
+    assert_eq!((x(&s, outer), x(&s, hole)), ((0.0, 40.0), (12.0, 32.0)), "not isolated: still only the hole");
+    s.execute("select.set", &json!({"ids": [c.0]})).unwrap();
+    s.execute("object.setBounds", &json!({"x": 5, "reference": 0})).unwrap();
+    assert_eq!((x(&s, outer), x(&s, hole)), ((5.0, 45.0), (17.0, 37.0)), "the compound path selected: the whole ring");
+    assert_eq!(x(&s, other), (100.0, 110.0), "the rectangle outside never moves");
 }
 
 /// `depth` and `childLimit` slice a summary read; a level that shows fewer children

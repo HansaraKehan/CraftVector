@@ -288,6 +288,48 @@ fn setup_survives_save_and_load() {
     assert_eq!(back.setup.grid_colors_name(), "Custom");
 }
 
+/// Highlight Substituted Fonts is a preference (Preferences › Type): `document.setup` does not
+/// report it, and ignores it with a warning that names `prefs.set`, so an older build's reply
+/// passed back still applies its other keys. The document's stored value and the preference stay.
+#[test]
+fn highlight_substituted_fonts_is_ignored_with_a_pointer_to_the_preference() {
+    let mut s = session();
+    let q = s.execute("document.setup", &json!({})).unwrap();
+    assert!(q.get("highlightSubstitutedFonts").is_none() && q.get("warnings").is_none(), "{q}");
+    let r = s.execute("document.setup", &json!({"highlightSubstitutedFonts": false, "bleed": 9})).unwrap();
+    let w = r["warnings"][0].as_str().unwrap_or_default();
+    assert!(w.contains("prefs.set") && w.contains("highlightSubstitutedFonts"), "{r}");
+    assert_eq!(setup(&s).bleed, [9.0; 4]);
+    assert!(setup(&s).highlight_substituted_fonts, "the stored value is not changed");
+    assert!(s.prefs.highlight_substituted_fonts, "nor is the preference");
+    assert_eq!(s.doc().unwrap().history.undo.len(), 1);
+    // The reply, warning included, can be passed back; alone, the key changes nothing.
+    let mut plain = r.clone();
+    plain.as_object_mut().unwrap().remove("warnings");
+    assert_eq!(s.execute("document.setup", &r).unwrap(), plain);
+    assert_eq!(s.execute("document.setup", &json!({"highlightSubstitutedFonts": true})).unwrap()["warnings"], r["warnings"]);
+    assert_eq!(s.doc().unwrap().history.undo.len(), 1);
+    let e = s.execute("document.setup", &json!({"highlightSubstitutedFonts": 1})).unwrap_err().to_string();
+    assert!(e.contains("true or false"), "{e}");
+}
+
+/// A file saved with Document Setup's old Highlight Substituted Fonts value opens, keeps that
+/// value when saved again, and leaves the preference as it was.
+#[test]
+fn a_file_with_the_old_highlight_substituted_fonts_value_opens_and_keeps_it() {
+    let mut s = session();
+    let mut d = (*s.doc().unwrap().doc).clone();
+    d.setup.highlight_substituted_fonts = false;
+    let data = vectorcraft_format::base64_encode(&vectorcraft_format::save_file(&d));
+    s.execute("document.open", &json!({"name": "old.vectorcraft", "dataBase64": data})).unwrap();
+    assert!(!setup(&s).highlight_substituted_fonts);
+    assert!(s.prefs.highlight_substituted_fonts, "the preference decides the screen");
+    let again = vectorcraft_format::load(&vectorcraft_format::save_file(&s.doc().unwrap().doc)).unwrap();
+    assert!(!again.setup.highlight_substituted_fonts);
+    let q = s.execute("document.setup", &json!({})).unwrap();
+    assert_eq!(s.execute("document.setup", &q).unwrap(), q);
+}
+
 /// A file whose bleed, superscript, subscript or small caps size lies outside the range
 /// `document.setup` takes opens with it at the nearer end of that range, and the setup it reports
 /// can be fed back.

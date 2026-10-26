@@ -117,7 +117,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush Options…",
             [],
             None,
-            "{name, params?: {…fields to change (brush.get shows them; values outside their ranges are clamped). calligraphic: angle −180..180°, roundness 0..100%, size 0..1296 pt, variation: [angle°, roundness%, size pt], modes: [fixed|random|pressure for angle, roundness, size] (pressure goes from value − variation at the lightest pen pressure to value + variation at the heaviest). scatter: size [a, b] 1..10000%, spacing [a, b] 1..10000%, scatter [a, b] −1000..1000%, rotation [a, b] −180..180°, modes: [fixed|random|pressure for size, spacing, scatter, rotation] (fixed: a; random: between a and b; pressure: a at the lightest pen pressure to b at the heaviest), rotation_relative_to_path. art: width 1..1000%, scale: {mode: proportional|stretch|betweenGuides, start, end: 0..1 of the art length}, direction: leftToRight|rightToLeft|topToBottom|bottomToTop, flip_along, flip_across, overlap. pattern: scale 1..10000%, spacing 0..10000%, fit: stretch|addSpace|approximate, flip_along, flip_across. scatter, art and pattern: colorization: {method: none|tints|tintsAndShades|hueShift, key: colour (hueShift: the art colour that becomes the stroke colour; without a key: the solid color the art's fills and strokes use most, black when they use none)}; colorization and the art brush's scale change only the fields given}, newName? (trimmed; blank: the name is kept; a new bristle brush name has at most 31 characters, and a longer name the brush has is kept)} edit a brush definition (strokes using it update) → {name}",
+            "{name, params?: {…fields to change (brush.get shows them; values outside their ranges are clamped). calligraphic: angle −180..180°, roundness 0..100%, size 0..1296 pt, variation: [angle°, roundness%, size pt], modes: [fixed|random|pressure for angle, roundness, size] (pressure goes from value − variation at the lightest pen pressure to value + variation at the heaviest). scatter: size [a, b] 1..10000%, spacing [a, b] 1..10000%, scatter [a, b] −1000..1000%, rotation [a, b] −180..180°, modes: [fixed|random|pressure for size, spacing, scatter, rotation] (fixed: a; random: between a and b; pressure: a at the lightest pen pressure to b at the heaviest), rotation_relative_to_path. art: width 1..1000%, width_mode: null (fixed)|pressure, width_max 1..1000% (pressure: width at the lightest pen pressure to width_max at the heaviest, half way on a stroke drawn without pressure), scale: {mode: proportional|stretch|betweenGuides, start, end: 0..1 of the art length}, direction: leftToRight|rightToLeft|topToBottom|bottomToTop, flip_along, flip_across, overlap. pattern: scale 1..10000%, spacing 0..10000%, fit: stretch|addSpace|approximate, flip_along, flip_across. scatter, art and pattern: colorization: {method: none|tints|tintsAndShades|hueShift, key: colour (hueShift: the art colour that becomes the stroke colour; without a key: the solid color the art's fills and strokes use most, black when they use none)}; colorization and the art brush's scale change only the fields given}, newName? (trimmed; blank: the name is kept; a new bristle brush name has at most 31 characters, and a longer name the brush has is kept)} edit a brush definition (strokes using it update) → {name}",
             has_doc,
             brush_options
         ),
@@ -146,7 +146,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Symbol…",
             [],
             None,
-            "{name?, ids?|id?, registration?: 0..8 (9-point grid, 4 = centre; Symbol Options › Registration), exportType?: movieClip (default)|graphic, nineSlice?: bool, nineSliceGuides?: array} make a symbol from the selection and replace it with an instance; nineSlice is Symbol Options › Enable Guides for 9-Slice Scaling, nineSliceGuides [left, top, right, bottom] as fractions 0..1 of the natural size (default a third each) → {name, id, registration, exportType, nineSlice}",
+            "{name?, ids?|id?, registration?: 0..8 (9-point grid, 4 = centre; Symbol Options › Registration), exportType?: movieClip (default)|graphic, nineSlice?: bool, nineSliceGuides?: array} make a symbol from the selection and replace it with an instance; a frame of threaded text in the selection leaves its thread with the text it shows, which the symbol's art holds; nineSlice is Symbol Options › Enable Guides for 9-Slice Scaling, nineSliceGuides [left, top, right, bottom] as fractions 0..1 of the natural size (default a third each) → {name, id, registration, exportType, nineSlice}",
             has_selection,
             symbol_new
         ),
@@ -191,7 +191,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Redefine Symbol",
             [],
             None,
-            "{name, ids?|id?} replace the symbol's art with the selection (instances update; the selection becomes an instance) → {name, id}",
+            "{name, ids?|id?} replace the symbol's art with the selection (instances update; the selection becomes an instance; a frame of threaded text in the selection leaves its thread with the text it shows, which the symbol's art holds) → {name, id}",
             has_selection,
             symbol_update
         ),
@@ -249,7 +249,7 @@ fn ids_json(ids: &[NodeId]) -> Value {
     Value::Array(ids.iter().map(|i| Value::from(i.0)).collect())
 }
 
-fn roots(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
+pub(crate) fn roots(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
     match ids_param(p, "ids").or_else(|| id_param(p, "id").map(|i| vec![i])) {
         Some(mut v) => {
             // Explicit ids: only existing, non-layer objects, none inside another of them.
@@ -269,7 +269,7 @@ fn name_param<'a>(p: &'a Value, cmd: &str) -> Result<&'a str> {
 // ---------- brushes ----------
 
 /// Brushable nodes (paths and compound paths) under `ids`.
-fn brush_targets(d: &Document, ids: &[NodeId]) -> Vec<NodeId> {
+pub(crate) fn brush_targets(d: &Document, ids: &[NodeId]) -> Vec<NodeId> {
     let mut out = vec![];
     for id in ids {
         let Some(n) = d.node(*id) else { continue };
@@ -302,6 +302,27 @@ fn brush_selection_art(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "art": art.map(|n| serde_json::to_value(&n).unwrap_or_default()) }))
 }
 
+/// The stroke paint a brush gives paths without one: the current stroke colour, else black.
+pub(crate) fn stroke_paint(s: &Session) -> Paint {
+    if s.paint.stroke.is_none() { Paint::solid(Color::BLACK) } else { s.paint.stroke.clone() }
+}
+
+/// Paint paths `ids` of `d` with brush `name` (a path without a stroke takes `stroke`).
+pub(crate) fn apply_brush(d: &mut Document, ids: &[NodeId], name: &str, stroke: &Paint) {
+    for id in ids {
+        let Some(n) = d.node_mut(*id) else { continue };
+        if n.appearance.stroke().is_none_or(|st| st.paint.is_none()) {
+            n.appearance.set_stroke(stroke.clone());
+        }
+        if let Some(st) = n.appearance.stroke_mut() {
+            if st.width <= 0.0 {
+                st.width = 1.0;
+            }
+            st.brush = Some(name.to_string());
+        }
+    }
+}
+
 fn brush_apply(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "brush.apply";
     let name = name_param(p, C)?.to_string();
@@ -309,21 +330,10 @@ fn brush_apply(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, format!("no brush named `{name}`")));
     }
     let ids = brush_targets(&s.doc()?.doc, &roots(s, p)?);
-    let stroke = if s.paint.stroke.is_none() { Paint::solid(Color::BLACK) } else { s.paint.stroke.clone() };
+    let stroke = stroke_paint(s);
     s.edit("Apply Brush", |d, _| {
         d.unknown.insert(brush::CURRENT_KEY.into(), json!(name));
-        for id in &ids {
-            let Some(n) = d.node_mut(*id) else { continue };
-            if n.appearance.stroke().is_none_or(|st| st.paint.is_none()) {
-                n.appearance.set_stroke(stroke.clone());
-            }
-            if let Some(st) = n.appearance.stroke_mut() {
-                if st.width <= 0.0 {
-                    st.width = 1.0;
-                }
-                st.brush = Some(name.clone());
-            }
-        }
+        apply_brush(d, &ids, &name, &stroke);
         Ok(())
     })?;
     Ok(json!({ "ids": ids_json(&ids) }))
@@ -874,7 +884,8 @@ fn replace_with_instance(d: &mut Document, ids: &[NodeId], name: &str, xf: Affin
 fn symbol_new(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "symbol.new";
     let ids = roots(s, p)?;
-    let art = selection_art(s, p)?.ok_or_else(|| EngineError::Other("nothing selected".into()))?;
+    let mut art = selection_art(s, p)?.ok_or_else(|| EngineError::Other("nothing selected".into()))?;
+    super::threads::keep_shown_text(&s.doc()?.doc, &mut art);
     let (art, size, c) = normalize(art)?;
     let name = s.doc()?.doc.unique_symbol_name(str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("New Symbol"));
     let reg = registration_param(p, C)?.unwrap_or(SymbolRegistration::CENTER);
@@ -890,7 +901,10 @@ fn symbol_new(s: &mut Session, p: &Value) -> Result<Value> {
         d.set_symbol_export_type(&name, export);
         d.set_symbol_nine_slice(&name, nine);
         d.unknown.insert(CURRENT_SYMBOL.into(), json!(name));
+        let threaded = super::threads::frames(d);
         let id = replace_with_instance(d, &ids, &name, place)?;
+        // Frames of threaded text in the symbol leave their threads with the text they show.
+        super::threads::leave_threads(d, &threaded);
         sel.set([id]);
         Ok(id)
     })?;
@@ -1070,7 +1084,8 @@ fn symbol_update(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, format!("no symbol named `{name}`")));
     }
     let ids = roots(s, p)?;
-    let art = selection_art(s, p)?.ok_or_else(|| EngineError::Other("nothing selected".into()))?;
+    let mut art = selection_art(s, p)?.ok_or_else(|| EngineError::Other("nothing selected".into()))?;
+    super::threads::keep_shown_text(&s.doc()?.doc, &mut art);
     let (art, size, c) = normalize(art)?;
     let old = natural_size(&s.doc()?.doc, &name);
     let id = s.edit("Redefine Symbol", |d, sel| {
@@ -1086,7 +1101,10 @@ fn symbol_update(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
         let reg = d.symbol_registration(&name);
+        let threaded = super::threads::frames(d);
         let id = replace_with_instance(d, &ids, &name, place_xf(c + reg.offset_from_center(size.0, size.1), size, reg))?;
+        // Frames of threaded text in the symbol leave their threads with the text they show.
+        super::threads::leave_threads(d, &threaded);
         sel.set([id]);
         Ok(id)
     })?;

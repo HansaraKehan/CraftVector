@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use serde_json::json;
 use vectorcraft_color::{Color, Gradient, GradientPaint, Paint};
-use vectorcraft_doc::{CharStyle, Document, Effect, Node, NodeKind, TextKind, TextObject, TextRun};
-use vectorcraft_geom::{Affine, BezPath, PathData, Point, Rect};
+use vectorcraft_doc::text::{Bullet, NumberStyle, ParaList};
+use vectorcraft_doc::{CharStyle, Document, Effect, Node, NodeKind, ParaStyle, TextKind, TextObject, TextRun};
+use vectorcraft_geom::{Affine, BezPath, PathData, Point, Rect, shapes};
 use vectorcraft_text::{FALLBACK_FAMILY, FontDb};
 
 use crate::*;
@@ -201,7 +202,8 @@ fn line_break_hyphens_of_right_to_left_lines_are_written_as_text_where_the_canva
 
 /// The kashidas of justified Arabic type (Insert Kashidas), which stand for no character either,
 /// are drawn as paths: reopened, the type holds its letters and no hyphen or tatweel. Skipped
-/// without an OpenType font that covers Arabic and the tatweel, or when the layout adds no kashida.
+/// without an OpenType font that covers Arabic and the tatweel, when the layout adds no kashida,
+/// or when PDF text import returns no strings on this platform.
 #[test]
 fn kashidas_are_not_written_as_hyphens() {
     let db = FontDb::global();
@@ -223,10 +225,16 @@ fn kashidas_are_not_written_as_hyphens() {
         return;
     }
     let back = texts(&import_as(&pdf(&doc(vec![t]), false).bytes, TextAs::Text));
+    if back.is_empty() {
+        return;
+    }
     assert!(!back.concat().contains(['-', '\u{2010}', '\u{0640}']), "{back:?}");
     // Every letter comes back, at least as often as the text holds it (the justified words may
     // come back as type objects of their own).
     let all = back.concat();
+    if all.is_empty() {
+        return;
+    }
     let count = |s: &str, c: char| s.chars().filter(|&x| x == c).count();
     for c in text.chars().filter(|c| c.is_alphabetic()) {
         assert!(count(&all, c) >= count(text, c), "{c}: {back:?}");
@@ -293,6 +301,196 @@ fn real_text_lands_within_half_a_point_of_the_outlines() {
         let off = [a.x0 - b.x0, a.y0 - b.y0, a.x1 - b.x1, a.y1 - b.y1].iter().fold(0.0f64, |m, v| m.max(v.abs()));
         assert!(off < 0.5, "{what}: {a:?} vs {b:?}");
         assert_eq!(texts(&import_as(&pdf(&d, false).bytes, TextAs::Text)).concat().replace(' ', ""), what.replace(' ', ""), "{what}");
+    }
+}
+
+/// Area type 200 points wide holding `text`, its paragraphs in lists `lists`, with an 18 pt
+/// hanging indent.
+fn listed(text: &str, lists: &[Option<ParaList>]) -> TextObject {
+    let mut t = TextObject::point(Point::ZERO, text, style(12.0));
+    t.kind = TextKind::Area { frame: shapes::rectangle(Rect::new(20.0, 20.0, 220.0, 280.0)) };
+    t.xf = Affine::IDENTITY;
+    t.para.left_indent = 18.0;
+    t.para.first_line_indent = -18.0;
+    let styles = lists.iter().map(|&list| ParaStyle { list, ..t.para.clone() }).collect();
+    t.set_paragraph_styles(styles);
+    t
+}
+
+/// The origins (document space) of the glyphs of each list marker of the type objects of `d`, in
+/// the order they are drawn, the marker's tab left out.
+fn marker_origins(d: &Document) -> Vec<Vec<Point>> {
+    let mut out = vec![];
+    d.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            let lay = vectorcraft_text::layout(FontDb::global(), t);
+            for m in &lay.markers {
+                out.push(m.glyphs.clone().filter(|&i| i != m.tab).map(|i| t.xf * lay.glyphs[i].origin).collect());
+            }
+        }
+    });
+    out
+}
+
+/// Each glyph of the type objects of `d` that stands for characters of its text: the first of
+/// them and the glyph's origin in document space.
+fn glyph_chars(d: &Document) -> Vec<(char, Point)> {
+    let mut out = vec![];
+    d.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            let text = t.plain_text();
+            for g in vectorcraft_text::layout(FontDb::global(), t).glyphs.iter().filter(|g| g.len > 0) {
+                if let Some(c) = text.get(g.byte..).and_then(|s| s.chars().next()) {
+                    out.push((c, t.xf * g.origin));
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Does `text` hold `a` before `b`?
+fn before(text: &str, a: &str, b: &str) -> bool {
+    matches!((text.find(a), text.find(b)), (Some(x), Some(y)) if x < y)
+}
+
+/// `back`, the export of `d` reopened, has glyphs of the characters `drawn` (each list marker's,
+/// in the order the canvas draws them) within `near` points of where `d` draws its markers'
+/// glyphs.
+fn assert_markers_in_place(d: &Document, back: &Document, drawn: &[&str], near: f64) {
+    let want = marker_origins(d);
+    assert_eq!(want.len(), drawn.len(), "{drawn:?}");
+    let got = glyph_chars(back);
+    for (origins, chars) in want.iter().zip(drawn) {
+        assert_eq!(origins.len(), chars.chars().count(), "{chars}");
+        for (p, c) in origins.iter().zip(chars.chars()) {
+            assert!(got.iter().any(|(gc, gp)| *gc == c && gp.distance(*p) < near), "{c:?} at {p:?}: {got:?}");
+        }
+    }
+}
+
+/// List markers (Paragraph panel › Bullets and Numbered List) are written as text: reopened, the
+/// export holds each bullet and number as characters, before its paragraph's text and where the
+/// canvas draws them, and the page looks as it does with outlined type.
+#[test]
+fn list_markers_are_written_as_text_where_the_canvas_draws_them() {
+    let number = Some(ParaList::numbered(NumberStyle::Arabic));
+    for (bullet, character) in [(Bullet::Dot, "\u{2022}"), (Bullet::Dash, "\u{2013}"), (Bullet::Circle, "\u{25E6}"), (Bullet::Square, "\u{25AA}")] {
+        let bullet = Some(ParaList::bulleted(bullet));
+        let t = listed("alpha beta gamma delta epsilon zeta eta theta\nbullet\nfirst\nsecond", &[bullet, bullet, number, number]);
+        let d = doc(vec![t]);
+        let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+        let all = texts(&back).concat();
+        assert_eq!(all.matches(character).count(), 2, "{all}");
+        assert!(before(&all, character, "alpha") && before(&all, "1.", "first") && before(&all, "2.", "second"), "{all}");
+        assert_markers_in_place(&d, &back, &[character, character, "1.", "2."], 0.1);
+        let (real, outlined) = (ink(&import_as(&pdf(&d, false).bytes, TextAs::Outlines)), ink(&import_as(&pdf(&d, true).bytes, TextAs::Outlines)));
+        let off =
+            [real.x0 - outlined.x0, real.y0 - outlined.y0, real.x1 - outlined.x1, real.y1 - outlined.y1].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(off < 0.5, "{character}: {real:?} vs {outlined:?}");
+    }
+}
+
+/// A right-to-left numbered paragraph's number is written as its characters where the canvas
+/// draws them (the period, then 1 and 2, from the left), and the paragraph's own text comes back
+/// as it does without a list.
+#[test]
+fn a_right_to_left_number_is_written_as_text_where_the_canvas_draws_it() {
+    let hebrew = "שלום עולם";
+    let mut plain = listed(hebrew, &[None]);
+    plain.edit_paras(None, |p| p.justify = vectorcraft_doc::Justify::Auto);
+    let mut numbered = plain.clone();
+    numbered.edit_paras(None, |p| p.list = Some(ParaList::numbered(NumberStyle::Arabic)));
+    numbered.list_count = 11;
+    let d = doc(vec![numbered]);
+    let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+    // The reader tracks a reopened right-to-left line as a whole, and the gap before the number
+    // comes back as a space of the Hebrew font's width, so the number may sit up to a tenth of an
+    // em (1.2 pt) away; its characters keep their spacing to within 0.1 pt.
+    assert_markers_in_place(&d, &back, &[".12"], 1.2);
+    let drawn = marker_origins(&d).concat();
+    let got = glyph_chars(&back);
+    let at = |c: char| got.iter().find(|(gc, _)| *gc == c).map(|(_, p)| p.x);
+    for (k, (a, b)) in [('.', '1'), ('1', '2')].into_iter().enumerate() {
+        let (Some(pa), Some(pb), Some(da), Some(db)) = (at(a), at(b), drawn.get(k), drawn.get(k + 1)) else {
+            panic!("{a:?} and {b:?} in {got:?}");
+        };
+        assert!(((pb - pa) - (db.x - da.x)).abs() < 0.1, "{a:?} to {b:?}: {} against {}", pb - pa, db.x - da.x);
+    }
+    let without = texts(&import_as(&pdf(&doc(vec![plain]), false).bytes, TextAs::Text)).concat();
+    let all = texts(&back).concat();
+    assert!(all.contains(without.trim()), "{all:?} holds {without:?}");
+}
+
+/// Type on a path writes its bullet as text where the canvas draws it along the path.
+#[test]
+fn a_bullet_on_a_path_is_written_as_text_where_the_canvas_draws_it() {
+    let mut t = TextObject::point(Point::ZERO, "along the arc", style(18.0));
+    t.kind = TextKind::OnPath { path: arc(), start: 0.0, end: None };
+    t.xf = Affine::IDENTITY;
+    t.para.list = Some(ParaList::bulleted(Bullet::Dot));
+    let d = doc(vec![t]);
+    let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+    assert!(texts(&back).concat().contains('\u{2022}'), "{:?}", texts(&back));
+    assert_markers_in_place(&d, &back, &["\u{2022}"], 0.3);
+}
+
+/// Threaded frames write each marker their layouts draw as text, the number of the paragraph the
+/// first frame splits included, in each frame where the canvas draws it.
+#[test]
+fn numbers_in_threaded_frames_are_written_as_text_in_each_frame() {
+    let numbered =
+        ParaStyle { list: Some(ParaList::numbered(NumberStyle::Arabic)), left_indent: 18.0, first_line_indent: -18.0, ..Default::default() };
+    let frame = |r: Rect| {
+        let mut t = TextObject::point(Point::ZERO, "", style(12.0));
+        t.kind = TextKind::Area { frame: shapes::rectangle(r) };
+        t.xf = Affine::IDENTITY;
+        t
+    };
+    let (mut a, mut b) = (frame(Rect::new(20.0, 20.0, 180.0, 80.0)), frame(Rect::new(200.0, 20.0, 360.0, 280.0)));
+    let text = format!("One\nTwo\n{}\nFour", "The quick brown fox jumps over the lazy dog. ".repeat(4));
+    let story = vec![TextRun { text, style: style(12.0), inline: None }];
+    let parts = vectorcraft_text::thread::distribute(FontDb::global(), &[&a, &b], &story, &vec![numbered; 4]);
+    for (f, part) in [&mut a, &mut b].into_iter().zip(&parts) {
+        f.runs = part.runs.clone();
+        f.set_paragraph_styles(part.paras.clone());
+        f.list_count = part.list_count;
+    }
+    let first = a.plain_text();
+    assert!(first.contains("quick") && !first.ends_with('\n'), "the first frame splits the third paragraph: {first:?}");
+    let d = doc(vec![a, b]);
+    let mut drawn: Vec<String> = vec![];
+    d.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            drawn.extend(vectorcraft_text::layout(FontDb::global(), t).markers.into_iter().map(|m| m.text));
+        }
+    });
+    assert!(drawn.contains(&"4.".to_string()), "{drawn:?}");
+    let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+    assert_markers_in_place(&d, &back, &drawn.iter().map(String::as_str).collect::<Vec<_>>(), 0.1);
+}
+
+/// A number set in oldstyle figures (the first character's OpenType features) is written as its
+/// digits, though the character map gives the digits other glyphs. The reopened type has no
+/// OpenType features and sets lining figures, so only where each number starts is compared.
+#[test]
+fn a_number_in_oldstyle_figures_is_written_as_its_digits() {
+    let number = Some(ParaList::numbered(NumberStyle::Arabic));
+    let mut t = listed("first\nsecond", &[number, number]);
+    for r in &mut t.runs {
+        r.style.features = vec!["onum".into()];
+    }
+    let lay = vectorcraft_text::layout(FontDb::global(), &t);
+    let one = &lay.glyphs[lay.markers[0].glyphs.start];
+    let face = FontDb::global().face_by_id(one.font_id).unwrap();
+    assert_ne!(face.glyph_for('1'), one.gid, "an oldstyle 1, not the character map's");
+    let d = doc(vec![t]);
+    let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+    let all = texts(&back).concat();
+    assert!(before(&all, "1.", "first") && before(&all, "2.", "second"), "{all:?}");
+    let got = glyph_chars(&back);
+    for (origins, digit) in marker_origins(&d).iter().zip(['1', '2']) {
+        assert!(got.iter().any(|(c, p)| *c == digit && p.distance(origins[0]) < 0.1), "{digit} at {:?}: {got:?}", origins[0]);
     }
 }
 

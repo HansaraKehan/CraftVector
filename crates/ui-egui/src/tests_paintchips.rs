@@ -105,7 +105,7 @@ fn a_popover_tile_click_sets_the_fill() {
     let (fill, stroke) = chips(&ctx);
     click(&mut app, &ctx, fill.center(), Modifiers::NONE, control_bar);
     assert!(app.session.fill_active, "the Fill chip brings its proxy forward");
-    let tile = ctx.read_response(egui::Id::new(("swatch-pop-tile", "Red"))).expect("the popover shows the swatches").rect;
+    let tile = ctx.read_response(egui::Id::unique(("swatch-pop-tile", "Red"))).expect("the popover shows the swatches").rect;
     click(&mut app, &ctx, tile.center(), Modifiers::NONE, control_bar);
     assert_eq!(fill_hex(&app), "#ed1c24");
     assert_eq!(app.session.doc().unwrap().history.undo.last().unwrap().label, "Fill Color", "through paint.setFill");
@@ -113,7 +113,7 @@ fn a_popover_tile_click_sets_the_fill() {
     click(&mut app, &ctx, Pos2::new(1300.0, 900.0), Modifiers::NONE, control_bar);
     click(&mut app, &ctx, stroke.center(), Modifiers::SHIFT, control_bar);
     assert!(!app.session.fill_active);
-    assert!(ctx.read_response(egui::Id::new(("swatch-pop-tile", "Red"))).is_none(), "no swatches in the mixer");
+    assert!(ctx.read_response(egui::Id::unique(("swatch-pop-tile", "Red"))).is_none(), "no swatches in the mixer");
     let text = {
         let mut t = String::new();
         for s in frame(&mut app, &ctx, vec![], Modifiers::NONE, control_bar) {
@@ -142,7 +142,7 @@ fn the_properties_panel_has_the_control_bars_fill_and_stroke() {
     let (fill, stroke) = chips(&ctx);
     assert!(stroke.top() > fill.bottom(), "Fill above Stroke");
     click(&mut app, &ctx, fill.center(), Modifiers::NONE, props);
-    let tile = ctx.read_response(egui::Id::new(("swatch-pop-tile", "Red"))).expect("the popover shows the swatches").rect;
+    let tile = ctx.read_response(egui::Id::unique(("swatch-pop-tile", "Red"))).expect("the popover shows the swatches").rect;
     click(&mut app, &ctx, tile.center(), Modifiers::NONE, props);
     assert_eq!(fill_hex(&app), "#ed1c24", "the next object's fill");
     app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap();
@@ -152,7 +152,7 @@ fn the_properties_panel_has_the_control_bars_fill_and_stroke() {
     frame(&mut app, &ctx, vec![], Modifiers::NONE, props);
     let (fill, _) = chips(&ctx);
     click(&mut app, &ctx, fill.center(), Modifiers::NONE, props);
-    let tile = ctx.read_response(egui::Id::new(("swatch-pop-tile", "Black"))).expect("the popover shows the swatches").rect;
+    let tile = ctx.read_response(egui::Id::unique(("swatch-pop-tile", "Black"))).expect("the popover shows the swatches").rect;
     click(&mut app, &ctx, tile.center(), Modifiers::NONE, props);
     assert_eq!(fill_hex(&app), "#000000");
     assert_eq!(app.session.doc().unwrap().history.undo.last().unwrap().label, "Fill Color");
@@ -221,9 +221,9 @@ fn the_window_menu_panel_keys() {
         (egui::Key::T, cmd | alt | shift, "openType"),
     ] {
         press(&mut app, key, m);
-        assert_eq!(app.ui.open_panel.as_deref(), Some(panel), "{m:?}+{key:?}");
+        assert!(crate::panel_docking::showing(&app.ui, panel), "{m:?}+{key:?}");
         press(&mut app, key, m);
-        assert_eq!(app.ui.open_panel, None, "{m:?}+{key:?} again hides it");
+        assert!(!crate::panel_docking::showing(&app.ui, panel), "{m:?}+{key:?} again hides it");
     }
     press(&mut app, egui::Key::F7, Modifiers::NONE);
     assert_eq!(app.ui.dock_tab, crate::state::DockTab::Layers);

@@ -1939,7 +1939,14 @@ impl Writer<'_> {
         }
         let id = self.id_attr(n);
         let a = self.attrs(&css::transparency(n));
-        self.line(&format!("<g{id}{a}>"));
+        // Glyphs bent along a path (joined scripts on a curve) can only be outlines: the group
+        // names its text for screen readers and search.
+        let label = if lay.glyphs.iter().any(|g| g.bend.is_some()) {
+            format!(" role=\"img\" aria-label=\"{}\"", xml_escape(&t.plain_text()))
+        } else {
+            String::new()
+        };
+        self.line(&format!("<g{id}{a}{label}>"));
         self.depth += 1;
         // The glyphs stay in text space; the text's transform joins the document's meanwhile.
         let saved = self.xf;
@@ -1992,6 +1999,12 @@ impl Writer<'_> {
             return self.text_outlines(n, t);
         }
         if let TextKind::OnPath { path, start, end } = &t.kind {
+            // A reader lays a `<textPath>`'s glyphs straight: joined glyphs bent along the path
+            // keep their look as outlines.
+            if lay.glyphs.iter().any(|g| g.bend.is_some()) {
+                self.warn("joined type bent along a path is outlined to keep its look");
+                return self.text_outlines(n, t);
+            }
             // `<textPath>` has a start offset only: an end bracket, Align to Path and Spacing
             // keep their look as outlines.
             if end.is_some() || t.path_align != vectorcraft_doc::PathAlign::Baseline || t.path_spacing != 0.0 {

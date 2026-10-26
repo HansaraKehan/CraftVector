@@ -337,10 +337,10 @@ fn escape_after_ending_isolation_or_with_the_rotate_view_tool_resets_the_view() 
 fn escape_after_closing_a_popup_or_during_a_ruler_origin_drag_keeps_the_rotation() {
     let mut w = Window::new();
     // The menu's button has the id `ComboBox::from_id_salt("rot-combo")` gives it in the status bar's
-    // row, which hosts other widgets too.
-    let salt = egui::IdSalt::new("rot-combo");
+    // row, which hosts other widgets too. egui 0.37 salts the Ui's stable `scope_id`, not the
+    // widget rect's unstable `parent_id`; in debug builds the id's debug source names its salt.
     let widgets: Vec<egui::WidgetRect> = w.ctx.viewport(|vp| vp.prev_pass.widgets.layers().flat_map(|(_, ws)| ws.iter().copied()).collect());
-    let combo = widgets.iter().find(|r| widgets.iter().any(|row| r.id == row.parent_id.with(salt))).copied();
+    let combo = widgets.iter().find(|r| format!("{:?}", r.id).contains("rot-combo")).copied();
     let combo = combo.expect("the status bar's angle menu");
     w.click(0.0, egui::PointerButton::Primary, combo.rect.center());
     w.after(0.0, vec![]);
@@ -372,7 +372,7 @@ fn escape_after_closing_a_popup_or_during_a_ruler_origin_drag_keeps_the_rotation
     let mut w = Window::new();
     w.app.ui.view.rulers = true;
     w.after(0.0, vec![]);
-    let corner = w.ctx.read_response(egui::Id::new("ruler-corner")).expect("the rulers' corner").rect.center();
+    let corner = w.ctx.read_response(egui::Id::unique("ruler-corner")).expect("the rulers' corner").rect.center();
     let to = w.app.canvas_rect.unwrap().center();
     w.after(0.0, vec![egui::Event::PointerMoved(corner)]);
     let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };

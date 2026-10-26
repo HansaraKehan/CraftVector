@@ -1973,7 +1973,7 @@ impl FontDb {
                 }
             }
         }
-        let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+        let mut faces = self.faces.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = faces.len();
         for f in made {
             // Another thread may have added the same face meanwhile.
@@ -2183,8 +2183,9 @@ impl FontDb {
             let face = |a: &Alias| a.paired.is_none() && a.style.is_some();
             let ps =
                 self.read_faces().iter().flat_map(|f| Alias::of(&f.family, &f.style, &f.keys)).find(|(k, a)| *k == joined && face(a)).map(|(_, a)| a);
-            let ps =
-                ps.or_else(|| self.aliases.read().unwrap_or_else(|e| e.into_inner()).get(&joined).and_then(|v| v.iter().find(|a| face(a)).cloned()));
+            let ps = ps.or_else(|| {
+                self.aliases.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&joined).and_then(|v| v.iter().find(|a| face(a)).cloned())
+            });
             if let Some(a) = ps {
                 return (a.family, a.style.unwrap_or_else(|| style.to_string()));
             }
@@ -2218,7 +2219,7 @@ impl FontDb {
             None => scanned(&self.read_catalog()).unwrap_or_default(),
             Some(traits) if traits.variable => traits,
             Some(traits) => {
-                let variable = scanned(&self.catalog.read().unwrap_or_else(|e| e.into_inner())).is_some_and(|t| t.variable);
+                let variable = scanned(&self.catalog.read().unwrap_or_else(std::sync::PoisonError::into_inner)).is_some_and(|t| t.variable);
                 FontTraits { variable, ..traits }
             }
         }
@@ -2625,11 +2626,11 @@ impl FontDb {
             return None;
         }
         let key = (face.id, gid);
-        if let Some(i) = self.images.lock().unwrap_or_else(|e| e.into_inner()).kept.get(&key) {
+        if let Some(i) = self.images.lock().unwrap_or_else(std::sync::PoisonError::into_inner).kept.get(&key) {
             return i.clone();
         }
         let image = face.skrifa().and_then(|f| crate::bitmap::glyph_image(&f, face.upem, gid)).map(Arc::new);
-        self.images.lock().unwrap_or_else(|e| e.into_inner()).keep(key, image.clone());
+        self.images.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(key, image.clone());
         image
     }
 
@@ -2656,7 +2657,7 @@ impl FontDb {
         // stroke too.
         let coloured = Some((foreground.key(), stroke.filter(|_| svg).map(|c| c.key())));
         {
-            let cache = self.colours.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self.colours.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(c) = [None, coloured].iter().find_map(|k| cache.kept.get(&(face.id, gid, *k))) {
                 return c.clone();
             }
@@ -2668,7 +2669,7 @@ impl FontDb {
             crate::colr::colour_glyph(&f, face.location(), face.upem, gid, foreground)
         };
         let key = (face.id, gid, if used { coloured } else { None });
-        self.colours.lock().unwrap_or_else(|e| e.into_inner()).keep(key, content.clone());
+        self.colours.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(key, content.clone());
         content
     }
 }

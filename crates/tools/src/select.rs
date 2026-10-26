@@ -23,7 +23,10 @@
 //! kind, shape and size at the click on empty canvas, and a drag draws a rectangle for the new
 //! frame (`text.thread.add`), which comes after the clicked one in its thread. A click on the in
 //! port does the same with the new frame put before it: the story then starts there and flows on
-//! into the clicked one. Escape drops the loaded text.
+//! into the clicked one. Escape drops the loaded text. A double-click on a port where the frame is
+//! threaded splits the thread at that port (`text.thread.break`), as the archived help section on
+//! threading describes
+//! (<https://web.archive.org/web/20220127090642/https://helpx.adobe.com/illustrator/using/creating-text.html>).
 //! With Smart Guides and Invoke Distance Guides on, Alt/Option held over another object shows how
 //! far the selection is from it, and over an empty part of an artboard how far it is from the
 //! artboard's edges ([`crate::guides::distance_guides`]).
@@ -93,6 +96,8 @@ enum State {
     Pie(PieDrag),
     /// Move or rotate a live mirror axis.
     Mirror(crate::mirror::MirrorDrag),
+    /// Drag a grid repeat's row, column or corner handle or a spacing slider.
+    GridRepeat(crate::repeat_grid::GridDrag),
     /// Dragging a bracket of type on a path.
     Bracket(BracketDrag),
     /// Loaded with the text of area type or type on a path `from` by a click on its out port, or
@@ -496,6 +501,14 @@ impl SelectionTool {
     fn loaded(&mut self, cx: &ToolContext, ev: &PointerEvent, from: NodeId, before: bool, press: Option<(Point, Point)>) -> Option<Vec<Action>> {
         let p = ev.pos;
         match (ev.kind, press) {
+            // The second press of a double-click on the port that loaded the text: the text is
+            // put down, and the double-click breaks the thread there.
+            (PointerKind::Down, _)
+                if crate::text::port_at(cx, p) == Some((from, if before { crate::text::Port::In } else { crate::text::Port::Out })) =>
+            {
+                self.state = State::Idle;
+                return Some(vec![]);
+            }
             (PointerKind::Down, _) if !cx.doc.node(from).is_some_and(is_threadable) => {
                 self.state = State::Idle;
                 return None;
@@ -560,6 +573,12 @@ impl Tool for SelectionTool {
         {
             return d.cancel();
         }
+        if key == ToolKey::Escape
+            && matches!(self.state, State::GridRepeat(_))
+            && let State::GridRepeat(d) = std::mem::take(&mut self.state)
+        {
+            return d.cancel();
+        }
         if key == ToolKey::Escape && matches!(self.state, State::Loaded { .. }) {
             self.state = State::Idle;
             return vec![];
@@ -570,7 +589,7 @@ impl Tool for SelectionTool {
     fn claims_key(&self, _cx: &ToolContext, key: ToolKey) -> bool {
         match self.state {
             State::Marquee { .. } => key == ToolKey::Letter('e'),
-            State::Loaded { .. } | State::Mirror(_) => key == ToolKey::Escape,
+            State::Loaded { .. } | State::Mirror(_) | State::GridRepeat(_) => key == ToolKey::Escape,
             _ => false,
         }
     }
@@ -593,6 +612,7 @@ impl Tool for SelectionTool {
             State::Pie(d) => d.adjusting(),
             State::Bracket(b) => b.adjusting(),
             State::Mirror(d) => d.adjusting(),
+            State::GridRepeat(d) => d.adjusting(),
             _ => false,
         }
     }
@@ -606,7 +626,8 @@ impl Tool for SelectionTool {
         {
             return out;
         }
-        // Mirror controls take precedence over art, bounding handles and ruler guides.
+        // Mirror and grid repeat controls take precedence over art and ruler guides; the mirror
+        // axis line and the grid's controls yield to the bounding-box handles they overlap.
         if let State::Mirror(mut d) = self.state.clone() {
             match ev.kind {
                 PointerKind::Drag | PointerKind::Up => {
@@ -622,11 +643,34 @@ impl Tool for SelectionTool {
                 _ => return vec![],
             }
         }
+        if let State::GridRepeat(mut d) = self.state.clone() {
+            match ev.kind {
+                PointerKind::Drag | PointerKind::Up => {
+                    let mut out = d.drag(ev.pos);
+                    if ev.kind == PointerKind::Up {
+                        out.extend(d.finish());
+                        self.state = State::Idle;
+                    } else {
+                        self.state = State::GridRepeat(d);
+                    }
+                    return out;
+                }
+                _ => return vec![],
+            }
+        }
         if matches!(self.state, State::Idle)
             && ev.kind == PointerKind::Down
             && let Some(d) = crate::mirror::MirrorDrag::hit(cx, ev.pos, ev.mods)
         {
             self.state = State::Mirror(d);
+            self.hover = None;
+            return vec![];
+        }
+        if matches!(self.state, State::Idle)
+            && ev.kind == PointerKind::Down
+            && let Some(d) = crate::repeat_grid::GridDrag::hit(cx, ev.pos, ev.mods)
+        {
+            self.state = State::GridRepeat(d);
             self.hover = None;
             return vec![];
         }
@@ -645,6 +689,16 @@ impl Tool for SelectionTool {
         match (ev.kind, self.state.clone()) {
             (PointerKind::DoubleClick, _) => {
                 self.state = State::Idle;
+                // A threaded port: the thread breaks there. Any other port takes the double-click
+                // too, so it neither edits the type nor isolates.
+                if let Some((id, port)) = crate::text::port_at(cx, p) {
+                    let (input, output) = crate::text::port_states(cx.doc, id, false);
+                    let (state, name) = if port == crate::text::Port::In { (input, "in") } else { (output, "out") };
+                    if state == crate::text::PortState::Threaded {
+                        return vec![Action::Exec("text.thread.break".into(), json!({ "id": id.0, "port": name }))];
+                    }
+                    return vec![];
+                }
                 if let Some(a) = corners::double_click(cx, p, false).or_else(|| pie::double_click(cx, p)).or_else(|| typewidget::double_click(cx, p))
                 {
                     return vec![a];
@@ -925,11 +979,14 @@ impl Tool for SelectionTool {
         if let State::Mirror(d) = &self.state {
             return d.cursor(cx, p);
         }
+        if let State::GridRepeat(d) = &self.state {
+            return d.cursor(cx);
+        }
         if matches!(self.state, State::Idle)
             && !m.cmd
             && !m.ctrl
             && !m.alt
-            && let Some(cursor) = crate::mirror::cursor(cx, p)
+            && let Some(cursor) = crate::mirror::cursor(cx, p).or_else(|| crate::repeat_grid::cursor(cx, p))
         {
             return cursor;
         }
@@ -1014,6 +1071,12 @@ pub(crate) fn is_area_type(n: &vectorcraft_doc::Node) -> bool {
         && matches!(&n.kind, vectorcraft_doc::NodeKind::Text(t) if matches!(t.kind, vectorcraft_doc::TextKind::Area { .. }))
 }
 
+/// Is `n` type on a path outside perspective (Direct Selection drags its path's anchors)?
+pub(crate) fn is_path_type(n: &vectorcraft_doc::Node) -> bool {
+    n.extras().perspective.is_none()
+        && matches!(&n.kind, vectorcraft_doc::NodeKind::Text(t) if matches!(t.kind, vectorcraft_doc::TextKind::OnPath { .. }))
+}
+
 /// Can `n` be a frame of a thread: area type or type on a path, outside perspective?
 pub(crate) fn is_threadable(n: &vectorcraft_doc::Node) -> bool {
     n.extras().perspective.is_none() && matches!(&n.kind, vectorcraft_doc::NodeKind::Text(t) if !matches!(t.kind, vectorcraft_doc::TextKind::Point))
@@ -1046,7 +1109,7 @@ pub(crate) fn release_guide_at(cx: &ToolContext, p: Point, m: Mods) -> Option<Ac
 /// The resize cursor for handle `h` of a box turned by `angle` (counter-clockwise degrees): the
 /// handle that sits where `h` appears on screen, in 45° steps. In a turned view, `angle` is the
 /// box's own angle less [`ToolContext::view_angle`].
-fn handle_cursor(h: Handle, angle: f64) -> Cursor {
+pub(crate) fn handle_cursor(h: Handle, angle: f64) -> Cursor {
     let steps = if angle.is_finite() { (angle / 45.0).round() as i64 } else { 0 };
     let h = Handle::ALL.get((h as i64 - steps).rem_euclid(8) as usize).copied().unwrap_or(h);
     match h {
@@ -2676,6 +2739,35 @@ mod tests {
         assert_eq!(t.pointer(&cx, &ev(PointerKind::Up, 80.0, 90.0)), thread(json!({"from": id.0, "rect": [20.0, 20.0, 60.0, 70.0], "before": true})));
         let corner = Point::new(input.x, input.y - crate::text::PORT_RISE_PX);
         assert_eq!(t.pointer(&cx, &ev(PointerKind::Down, corner.x, corner.y)), vec![Action::Begin("Resize Type Area".into())]);
+    }
+
+    /// A double-click on a threaded port breaks the thread there, its in port before the frame
+    /// and its out port after it; it doesn't thread the loaded text into a new frame. A
+    /// double-click on a port with no thread does nothing (it doesn't switch to the Type tool).
+    #[test]
+    fn a_double_click_on_a_threaded_port_breaks_the_thread() {
+        let (mut d, id, input, output) = fitting_area_type();
+        let rect = d.children(Some(d.layers[0].id)).unwrap()[0].id;
+        let mut s = Selection::default();
+        s.set([id]);
+        let p = paint();
+        let double_click = |d: &vectorcraft_doc::Document, at: Point| {
+            let cx = cx(d, &s, &p);
+            let mut t = SelectionTool::default();
+            let kinds = [PointerKind::Down, PointerKind::Up, PointerKind::Down, PointerKind::Up, PointerKind::DoubleClick];
+            let out: Vec<Action> = kinds.into_iter().flat_map(|k| t.pointer(&cx, &ev(k, at.x, at.y))).collect();
+            assert_ne!(t.cursor(&cx, Point::new(30.0, 420.0), Mods::default()), Cursor::LoadedText, "no text stays loaded");
+            out
+        };
+        let breaks = |port: &str| vec![Action::Exec("text.thread.break".into(), json!({"id": id.0, "port": port}))];
+        d.text_threads = vec![vec![id, rect]];
+        assert_eq!(double_click(&d, output), breaks("out"));
+        assert_eq!(double_click(&d, input), vec![], "no frame before it");
+        d.text_threads = vec![vec![rect, id]];
+        assert_eq!(double_click(&d, input), breaks("in"));
+        assert_eq!(double_click(&d, output), vec![], "no frame after it");
+        d.text_threads.clear();
+        assert_eq!(double_click(&d, output), vec![]);
     }
 
     /// The memo answers for the revision, the selected objects and Use Preview Bounds it measured

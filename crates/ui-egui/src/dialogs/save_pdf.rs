@@ -27,7 +27,8 @@ use crate::{VectorcraftApp, io, widgets};
 
 pub(super) const KIND: &str = "savePdf";
 
-pub(super) const SPEC: DialogSpec = DialogSpec { heading: |_| tl!("Save PDF").into(), body, confirm, ok: Some("Save PDF"), ..DialogSpec::FORM };
+pub(super) const SPEC: DialogSpec =
+    DialogSpec { heading: |_| tl!("Save PDF").into(), body, confirm, ok: Some("Save PDF"), inputs: |_| &["path"], ..DialogSpec::FORM };
 
 /// The dialog kind of the preset editor (New / Edit in Edit → PDF Presets).
 pub(super) const PRESET_KIND: &str = "pdfPreset";
@@ -256,11 +257,13 @@ pub(super) fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui
 pub(super) fn row_with(ui: &mut egui::Ui, label: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(width, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_width(width);
-            ui.label(egui::RichText::new(label).color(t.text));
-        });
-        add(ui);
+        let label_id = ui
+            .allocate_ui_with_layout(egui::vec2(width, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(width);
+                ui.label(egui::RichText::new(label).color(t.text)).id
+            })
+            .inner;
+        ui.label_inputs_by(label_id, add);
     });
 }
 
@@ -477,7 +480,7 @@ fn general(ui: &mut egui::Ui, d: &mut Dialog, editor: bool) {
     flag(ui, d, "includeNonPrinting", tl!("Include non-printing layers"), true);
     if editor {
         heading(ui, tl!("Description"));
-        if let Some(text) = widgets::text_field(ui, "pdf-preset-description", Some(&d.str("description")), 460.0, 3) {
+        if let Some(text) = widgets::text_field_named(ui, "pdf-preset-description", Some(tl!("Description")), Some(&d.str("description")), 460.0, 3) {
             d.fields.insert("description".into(), json!(text));
         }
         return;
@@ -766,8 +769,8 @@ pub(super) fn option_label(option: &str) -> String {
 /// cached until a field or the document changes.
 fn summary_of(app: &mut VectorcraftApp, ctx: &egui::Context, p: &Value) -> Result<Value, String> {
     let revision = app.session.active().map_or(0, |s| s.revision);
-    let stamp = egui::Id::new((p.to_string(), revision));
-    let key = egui::Id::new("save-pdf-summary");
+    let stamp = egui::Id::unique((p.to_string(), revision));
+    let key = egui::Id::unique("save-pdf-summary");
     if let Some((s, v)) = ctx.data(|m| m.get_temp::<(egui::Id, Result<Value, String>)>(key))
         && s == stamp
     {

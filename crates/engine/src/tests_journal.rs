@@ -473,6 +473,54 @@ fn canceling_undo_groups_keeps_the_journal_entries_made_outside_them() {
     assert_eq!(r.active_index(), s.active_index());
 }
 
+/// A batch that edits the canceled group's document and then a document without a group keeps the
+/// steps outside the group in the journal, so a replay draws the edit the second document keeps.
+#[test]
+fn canceling_an_undo_group_keeps_a_batchs_steps_in_other_documents() {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"created": null})).unwrap();
+    s.execute("file.new", &json!({"created": null})).unwrap();
+    let objects = |s: &Session| s.documents().iter().map(|d| d.doc.node_count()).collect::<Vec<_>>();
+    let before = objects(&s);
+    let steps = json!([rect_step(10), rect_step(20), {"command": "document.activate", "params": {"index": 1}}, rect_step(30)]);
+    for (id, p) in [
+        ("document.activate", json!({"index": 0})),
+        ("edit.undoGroup.begin", json!({})),
+        ("command.batch", json!({ "commands": steps })),
+        ("shape.rectangle", rect_step(50)["params"].clone()),
+        ("edit.undoGroup.end", json!({"cancel": true})),
+    ] {
+        s.execute(id, &p).unwrap();
+    }
+    assert_eq!(objects(&s), vec![before[0], before[1] + 2], "only the group's edits are undone");
+    let (_, batch) = s.journal.iter().find(|(id, _)| id == "command.batch").unwrap();
+    assert_eq!(batch["commands"], json!([steps[2], steps[3]]));
+    let r = replayed(&s);
+    assert_eq!(documents(&r), documents(&s));
+    assert_eq!(r.active_index(), s.active_index());
+
+    // Undo scopes in two documents canceled one at a time: the second cancel finds its own step after
+    // the first one took a step out of the batch, and the third document's edit stays.
+    s.execute("file.new", &json!({"created": null})).unwrap();
+    let before = objects(&s);
+    assert!(s.set_active(0));
+    let first = s.begin_undo_scope().unwrap();
+    assert!(s.set_active(1));
+    let second = s.begin_undo_scope().unwrap();
+    assert!(s.set_active(0));
+    let activate = |index: usize| json!({"command": "document.activate", "params": {"index": index}});
+    let steps = json!([rect_step(10), activate(1), rect_step(30), activate(2), rect_step(50)]);
+    s.execute("command.batch", &json!({ "commands": steps })).unwrap();
+    s.end_undo_scope(first, true);
+    s.end_undo_scope(second, true);
+    assert_eq!(objects(&s), vec![before[0], before[1], before[2] + 1]);
+    let (_, batch) = s.journal.iter().rev().find(|(id, _)| id == "command.batch").unwrap();
+    assert_eq!(batch["commands"], json!([steps[1], steps[3], steps[4]]));
+    let r = replayed(&s);
+    assert_eq!(documents(&r), documents(&s));
+    assert_eq!(r.active_index(), s.active_index());
+}
+
 /// The edits made in an undo group (a scrubbed numeric field, #400) are one undo step, journaled
 /// one by one; a cancelled group undoes them and leaves the journal as it was.
 #[test]
@@ -730,6 +778,34 @@ fn an_undo_scope_in_an_open_group_takes_back_only_its_own_edits() {
     s.end_undo_group(false);
     s.execute("edit.undo", &json!({})).unwrap();
     assert_eq!(objects(&s), 0, "one undo takes back the group's edits");
+}
+
+/// A canceled undo scope that joined an open group forgets the journal entries it cut: when a command
+/// in another document takes the same entry number, a later cancel of the group keeps that entry, and
+/// the journal replays to the same documents.
+#[test]
+fn a_canceled_undo_scope_leaves_its_cut_entries_out_of_the_group() {
+    let mut s = Session::new();
+    let rect = json!({"x": 10, "y": 10, "width": 100, "height": 50});
+    s.execute("file.new", &json!({"width": 400, "height": 300})).unwrap();
+    s.execute("file.new", &json!({"width": 400, "height": 300})).unwrap();
+    s.execute("document.activate", &json!({"index": 0})).unwrap();
+    s.begin_undo_group();
+    s.execute("shape.rectangle", &rect).unwrap();
+    let scope = s.begin_undo_scope().unwrap();
+    s.execute("shape.rectangle", &rect).unwrap();
+    s.end_undo_scope(scope, true);
+    let journal = s.journal.len();
+    // The switch takes the entry number the scope's edit had, and the rectangle in the second document follows it.
+    s.execute("document.activate", &json!({"index": 1})).unwrap();
+    s.execute("shape.rectangle", &rect).unwrap();
+    s.end_undo_group(true);
+    let objects = s.documents().iter().map(|d| d.doc.layers[0].children().map_or(0, |c| c.len())).collect::<Vec<_>>();
+    assert_eq!(objects, [0, 1]);
+    assert_eq!(s.journal.len(), journal + 1, "only the group's own edit leaves the journal");
+    let r = replayed(&s);
+    assert_eq!(documents(&r), documents(&s));
+    assert_eq!(r.active_index(), s.active_index());
 }
 
 /// A move drag is named for what its last preview did: Alt pressed or released during the drag

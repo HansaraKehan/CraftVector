@@ -20,8 +20,14 @@ fn place_embedded(s: &mut Session, path: &str) -> NodeId {
 /// A PNG that says it is `w` × `h` 1-bit grey pixels (its header and no rows, which is all that
 /// placing and listing read).
 pub(crate) fn png_header(w: u32, h: u32) -> Vec<u8> {
+    png_header_as(w, h, [1, 0, 0, 0, 0])
+}
+
+/// A PNG that says it is `w` × `h` pixels of the bit depth, color type, compression, filter and
+/// interlace method `kind` gives (its header and no rows).
+fn png_header_as(w: u32, h: u32, kind: [u8; 5]) -> Vec<u8> {
     let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    let ihdr: Vec<u8> = [&b"IHDR"[..], &w.to_be_bytes(), &h.to_be_bytes(), &[1, 0, 0, 0, 0]].concat();
+    let ihdr: Vec<u8> = [&b"IHDR"[..], &w.to_be_bytes(), &h.to_be_bytes(), &kind].concat();
     for chunk in [&ihdr[..], b"IDAT\x78\x9c", b"IEND"] {
         out.extend((chunk.len() as u32 - 4).to_be_bytes());
         out.extend(chunk);
@@ -30,32 +36,42 @@ pub(crate) fn png_header(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// An image past what a decode may take isn't drawn: Place and Open say so and the Links panel's
-/// row carries the note, where the image used to be blank with no word (#1479).
+/// An image past what a decode may take is drawn at reduced size: Place and Open say so and the
+/// Links panel's row carries the note. One the renderer can't read at reduced size (an interlaced
+/// RGBA PNG past the allowance as decoded, or an image of more pixels than the allowance has
+/// bytes) isn't drawn, and the note says it is too large to draw (#1479).
 #[test]
 fn an_image_too_large_to_draw_is_reported() {
-    const NOTE: &str = "an image of 200000 × 200000 pixels is too large to draw";
+    const NOTE: &str = "an image of 40000 × 40000 pixels is shown at reduced size";
+    const UNDRAWN: &str = "an image of 30000 × 30000 pixels is too large to draw";
     let dir = Folder::new("huge");
-    let (big, small) = (dir.file("wall.png"), dir.file("small.png"));
-    write(&big, &png_header(200_000, 200_000));
+    let (big, small, laced) = (dir.file("wall.png"), dir.file("small.png"), dir.file("laced.png"));
+    write(&big, &png_header(40_000, 40_000));
     write(&small, &png(40, 20, BLUE));
+    write(&laced, &png_header_as(30_000, 30_000, [8, 6, 0, 0, 1]));
     let mut s = session();
     assert_eq!(run(&mut s, "file.place", json!({"path": big, "at": [200, 150], "link": false}))["warnings"], json!([NOTE]));
     assert_eq!(run(&mut s, "file.place", json!({"path": small, "at": [20, 20], "link": false}))["warnings"], json!([]));
+    assert_eq!(run(&mut s, "file.place", json!({"path": laced, "at": [20, 20], "link": false}))["warnings"], json!([UNDRAWN]));
     let l = run(&mut s, "links.list", json!({}));
     let notes: Vec<&Value> = l["links"].as_array().unwrap().iter().map(|r| &r["note"]).collect();
-    assert_eq!(notes, [&Value::Null, &json!(NOTE)], "top first: the small image has nothing to say");
+    assert_eq!(notes, [&json!(UNDRAWN), &Value::Null, &json!(NOTE)], "top first: the small image has nothing to say");
     // Opened as a document: said too. An image that decodes (16,000 px square) has no note.
-    assert_eq!(crate::cmd::fileio::load("wall.png", &png_header(200_000, 200_000)).unwrap().warnings, [NOTE]);
+    assert_eq!(crate::cmd::fileio::load("wall.png", &png_header(40_000, 40_000)).unwrap().warnings, [NOTE]);
+    let more = crate::cmd::fileio::load("more.png", &png_header(200_000, 200_000)).unwrap().warnings;
+    assert_eq!(more, ["an image of 200000 × 200000 pixels is too large to draw"], "more pixels than the allowance has bytes");
     assert!(crate::cmd::fileio::load("fine.png", &png_header(16_000, 16_000)).unwrap().warnings.is_empty());
+    // 20,000 px square at 16 bits a sample is 3.2 GB decoded and 1.6 GB as RGBA: read a row at a
+    // time at its own size, so nothing is said of it.
+    assert!(crate::cmd::fileio::load("deep.png", &png_header_as(20_000, 20_000, [16, 6, 0, 0, 0])).unwrap().warnings.is_empty());
 }
 
 /// A gray image is counted as RGBA, 4 bytes a pixel: 23,171 × 23,170 1-bit pixels decode to 537 MB
-/// of gray and are 2,147,488,280 bytes as RGBA, past the 2 GiB allowance; 23,170 × 23,170 are
-/// 2,147,395,600 bytes, within it.
+/// of gray and are 2,147,488,280 bytes as RGBA, past the 2 GiB allowance (shown at reduced size);
+/// 23,170 × 23,170 are 2,147,395,600 bytes, within it.
 #[test]
 fn a_gray_image_too_large_as_rgba_is_reported_on_place() {
-    const NOTE: &str = "an image of 23171 × 23170 pixels is too large to draw";
+    const NOTE: &str = "an image of 23171 × 23170 pixels is shown at reduced size";
     let dir = Folder::new("huge-gray-place");
     let (over, within) = (dir.file("over.png"), dir.file("within.png"));
     write(&over, &png_header(23_171, 23_170));
@@ -76,7 +92,7 @@ fn a_gray_image_too_large_as_rgba_is_reported_on_open() {
     write(&over, &png_header(23_171, 23_170));
     write(&within, &png_header(23_170, 23_170));
     let mut s = session();
-    assert_eq!(open(&mut s, &over)["warnings"], json!(["an image of 23171 × 23170 pixels is too large to draw"]));
+    assert_eq!(open(&mut s, &over)["warnings"], json!(["an image of 23171 × 23170 pixels is shown at reduced size"]));
     assert_eq!(open(&mut s, &within)["warnings"], json!([]));
 }
 fn close(a: f64, b: f64) -> bool {

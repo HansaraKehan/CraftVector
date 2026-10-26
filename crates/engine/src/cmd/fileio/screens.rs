@@ -46,7 +46,14 @@ impl ScreenSize {
     /// `2x` (or `2`), `100w`, `100h` or `72ppi`, in any case; positive numbers only.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().to_ascii_lowercase();
-        let num = |t: &str| t.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0);
+        // Digits and `.` only: `str::parse` would also take `+2`, `1e2`, `inf` and `nan`.
+        let num = |t: &str| {
+            let t = t.trim();
+            if !t.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                return None;
+            }
+            t.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+        };
         if let Some(n) = s.strip_suffix("ppi") {
             return num(n).map(Self::Ppi);
         }
@@ -164,11 +171,14 @@ pub(super) fn file_part(s: &str) -> String {
 /// trailing periods and spaces, and with `-` after a Windows device name that is the whole name or
 /// comes before its first period: `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9` and `LPT1` to `LPT9`,
 /// also with `¹`, `²` or `³` for the digit, in any case (`CON.png` becomes `CON-.png`). The same on
-/// every platform.
+/// every platform. Spaces between the device name and the period are dropped (`CON .png` becomes
+/// `CON-.png`).
 pub(crate) fn safe_file_name(s: &str) -> String {
     let name = file_part(s);
     let name = name.trim_end_matches(['.', ' ']);
     let (base, rest) = name.split_at(name.find('.').unwrap_or(name.len()));
+    // Windows ignores spaces before the extension, so `CON .png` is the CON device too.
+    let base = base.trim_end_matches(' ');
     let upper = base.to_ascii_uppercase();
     let numbered = |n: &str| n.chars().count() == 1 && n.chars().all(|c| matches!(c, '1'..='9' | '¹' | '²' | '³'));
     let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -382,7 +392,7 @@ struct Naming {
 }
 
 impl Naming {
-    /// The naming of params `o` for a document titled `title`.
+    /// The naming of params `o` for a document named `title`: its file's path, or its title before it is saved.
     fn of(o: &ScreenParams, title: &str) -> Result<Self> {
         let folders = Folders::of(o)?;
         // A prefix names files, not folders.
@@ -669,7 +679,9 @@ pub(crate) fn export(s: &mut Session, p: &Value) -> Result<Value> {
     let o = ScreenParams::of(p)?;
     let rows = rows_of(s, p, o.preset.as_deref())?;
     o.one_source()?;
-    let naming = Naming::of(&o, &s.doc()?.doc.title)?;
+    // `<filename>`: the document's file, as Save names it, or its title before it is saved.
+    let st = s.doc()?;
+    let naming = Naming::of(&o, st.path.as_deref().unwrap_or(&st.doc.title))?;
     let selection = o.selection_mode()?;
     let selected = if selection.is_some() { selected_artwork(s)? } else { vec![] };
     let doc = s.doc()?.doc.clone();
@@ -846,13 +858,14 @@ pub fn first_file(s: &Session, p: &Value) -> Result<String> {
     let rows = rows_of(s, &p, o.preset.as_deref())?;
     o.one_source()?;
     let selection = o.selection_mode()?;
-    let doc = &s.doc()?.doc;
+    let st = s.doc()?;
+    let doc = &st.doc;
     let mut selected = if selection.is_some() { selected_artwork(s)? } else { vec![] };
     // A file per object: objects that draw nothing write no file.
     if selection == Some(true) {
         selected = selected.into_iter().find(|id| export_crop(doc, &[*id]).is_some()).into_iter().collect();
     }
-    let naming = Naming::of(&o, &doc.title)?;
+    let naming = Naming::of(&o, st.path.as_deref().unwrap_or(&doc.title))?;
     let items = items(doc, &o, selection, &selected, &naming.filename, false, false)?;
     let (Some(item), Some(r)) = (items.first(), rows.first()) else { return Err(bad(C, "nothing to export")) };
     let (sub, file) = naming.file(item, 0, 0, r);
@@ -994,4 +1007,30 @@ pub(crate) fn store_settings(s: &mut Session, settings: Map<String, Value>) -> R
 /// `document.exportSettings`: the Export for Screens settings the document last exported with.
 pub(super) fn export_settings(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({ "settings": s.doc()?.doc.export_settings }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScreenSize, safe_file_name};
+
+    #[test]
+    fn size_parse_refuses_signs_and_exponents() {
+        for s in ["+2x", "+2", "+100w", "+100h", "+72ppi", "-2x", "1e2", "2e0w"] {
+            assert_eq!(ScreenSize::parse(s), None, "{s}");
+        }
+        assert_eq!(ScreenSize::parse("2x"), Some(ScreenSize::Scale(2.0)));
+        assert_eq!(ScreenSize::parse("1.5"), Some(ScreenSize::Scale(1.5)));
+        assert_eq!(ScreenSize::parse("100W"), Some(ScreenSize::Width(100.0)));
+        assert_eq!(ScreenSize::parse("72ppi"), Some(ScreenSize::Ppi(72.0)));
+    }
+
+    #[test]
+    fn device_name_with_space_before_extension_is_protected() {
+        assert_eq!(safe_file_name("CON.png"), "CON-.png");
+        assert_eq!(safe_file_name("CON .png"), "CON-.png");
+        assert_eq!(safe_file_name("NUL .png"), "NUL-.png");
+        assert_eq!(safe_file_name("COM1 .png"), "COM1-.png");
+        assert_eq!(safe_file_name("lpt9  .png"), "lpt9-.png");
+        assert_eq!(safe_file_name("My CON .png"), "My CON .png");
+    }
 }

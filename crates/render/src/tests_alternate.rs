@@ -1,7 +1,36 @@
 //! Preferences › Type › Highlight Alternate Glyphs (#394): OpenType substitutions get a pink
-//! cell behind them on screen when the preference is on.
+//! cell behind them on screen when the preference is on. Preferences › Type › Highlight
+//! Substituted Fonts does the same for text drawn in a substitute for a missing font.
 
 use super::*;
+
+/// Highlight Substituted Fonts follows the preference passed in [`RenderOptions`] for every
+/// document, whatever a document's own setup stored: on, type in a missing font has pink behind
+/// it; off, it does not.
+#[test]
+fn highlight_substituted_fonts_follows_the_preference_in_every_document() {
+    use vectorcraft_doc::text::{CharStyle, TextObject};
+    use vectorcraft_doc::{Node, NodeKind};
+    use vectorcraft_geom::Point;
+
+    let on = RenderOptions { background: Some([255, 255, 255, 255]), highlight_substitutions: true, ..Default::default() };
+    assert!(on.highlight_substituted_fonts, "on by default");
+    let off = RenderOptions { highlight_substituted_fonts: false, ..on.clone() };
+    let pinkish = |px: &[u8]| px.chunks(4).filter(|p| p[0] > 200 && p[1] < 180 && p[2] > 150 && p[2] < 230).count();
+    // A document saved with the old Document Setup value on, and one with it off.
+    for stored in [true, false] {
+        let mut d = Document::new(200.0, 100.0);
+        d.setup.highlight_substituted_fonts = stored;
+        let style = CharStyle { size: 30.0, font_family: "No Such Family".into(), ..Default::default() };
+        let n = Node::new(d.alloc_id(), NodeKind::Text(Box::new(TextObject::point(Point::new(10.0, 60.0), "Hamburg", style))));
+        let l = d.layers[0].id;
+        d.insert(Some(l), 0, n).unwrap();
+        let with = Renderer::new().render(&d, 200, 100, Affine::IDENTITY, &on);
+        let without = Renderer::new().render(&d, 200, 100, Affine::IDENTITY, &off);
+        assert!(pinkish(&with.pixels) > 50, "stored {stored}: the preference on highlights the text");
+        assert_eq!(pinkish(&without.pixels), 0, "stored {stored}: the preference off leaves no highlight");
+    }
+}
 
 #[test]
 fn is_opentype_alternate_marks_ligatures_and_forms() {

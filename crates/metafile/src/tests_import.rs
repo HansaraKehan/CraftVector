@@ -329,6 +329,28 @@ fn damaged_files_fail_or_import_partly() {
     assert!(import(&huge).is_ok());
 }
 
+/// An EMR_STRETCHDIBITS copying `png` (a BI_PNG bitmap) to a 10 × 10 box.
+fn png_stretch_dibits(png: &[u8]) -> Vec<u8> {
+    // Bounds; destination, source and its size; the BITMAPINFO and the bits (from the record start);
+    // usage, SRCCOPY and the destination size; then the BITMAPINFOHEADER and the PNG.
+    let mut body = vec![0; 16];
+    body.extend(le(&[0, 0, 0, 0, 1, 1]));
+    body.extend(le(&[80, 40, 120, png.len() as i32]));
+    body.extend(le(&[0, 0x00CC_0020, 10, 10]));
+    body.extend(le(&[40, 1, 1, 1, 5, 0, 0, 0, 0, 0]));
+    body.extend(png);
+    body
+}
+
+#[test]
+fn embedded_bitmaps_share_one_pixel_budget() {
+    // #3600: each bitmap was bounded but not their total, so many records of the largest one a record
+    // may hold cost minutes. Those past the file's budget are left out before they're decoded.
+    let records = vec![(81, png_stretch_dibits(&png_claiming(1 << 13, 1 << 13))); 5];
+    let back = import(&hand_emf(5000, 3000, &records)).unwrap();
+    assert!(back.warnings.iter().any(|w| w == "images past the most pixels one file may hold were left out"), "{:?}", back.warnings);
+}
+
 #[test]
 fn clips_nest_only_so_deep() {
     // Each clip inside the last one used to nest a clipping group one level deeper, past the stack.

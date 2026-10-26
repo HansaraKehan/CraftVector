@@ -1,10 +1,10 @@
 //! Shape Builder (`shapeBuilder.*`), Live Paint (`livePaint.*`) and Image Trace (`imageTrace.*`).
 //!
 //! **Live Paint groups** need no special node kind: a Live Paint group is a plain group whose name
-//! starts with "Live Paint". Its first child is a hidden group named "Live Paint Sources" holding
-//! the original paths (the planar map's inputs, used by Release, Merge and re-computation); then
-//! come the faces (paths named "Face", fill only) and the edges (open paths named "Edge", stroke
-//! only). See `vectorcraft_tools::builder` for the shared helpers.
+//! starts with "Live Paint" and that holds a group named "Live Paint Sources". That group is its
+//! first child, hidden, and holds the original paths (the planar map's inputs, used by Release,
+//! Merge and re-computation); then come the faces (paths named "Face", fill only) and the edges
+//! (open paths named "Edge", stroke only). See `vectorcraft_tools::builder` for the shared helpers.
 //!
 //! **Image Trace** makes a group named "Image Trace" holding the source image (hidden, bottom)
 //! and the traced filled paths above it, mapped with the image's transform. Expand drops the
@@ -39,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Shape Builder",
             [],
             None,
-            "{ids?|id?: [id…] (default: selection), points: [[x,y]…] (drag path; one point = click; may be left out with rect), rect?: [x, y, width, height] (Shift-drag marquee from where the drag started, x and y, to x+width and y+height; width and height may be negative: touches every region whose outline crosses the rectangle or has an anchor inside it and the region holding the whole rectangle, the region under x, y comes first and the one under the opposite corner comes next; with points, it also touches the regions along them; for pickColorFrom, x, y is the drag's first point and the opposite corner is its last), erase?: bool (erase mode, Alt: deletes the regions touched, and the pieces of open paths that cut regions and the edges (outline pieces between the points where paths meet; see shapeBuilder.regions) within tolerance; a deleted edge opens its path there, and edges bounding a deleted region go with it; what is left of each path keeps its look, with gradients fitted to its bounds kept where they were on it, its name, opacity mask and attributes, and its fill rule unless merged regions shaped it), splitStroke?: false (In Merge Mode, Clicking Stroke Splits the Path; not with erase or rect: when the one point of a click is within tolerance of a stroke, the path that stroke is on splits in two instead of a merge: the path keeps the rest of it, and a copy of the path holding the run of it from the anchor or crossing point before the click to the one after it, in the path's direction, goes directly above it; both keep the path's gradients where they were on it; the other objects stay as they are; with pickColorFrom \"swatches\" or fill, the run's stroke takes that paint; a path in a Live Paint group or a Shaper Group does not split, and nor does a path the run is all of, such as a lone line, or all but 0.05 pt or less of (a ten-thousandth of the larger side of a path over 500 pt)), tolerance?: pt (2, erase or splitStroke), gap?: pt (0–72; 0: Gap Detection off), openFilledAsClosed?: true (Consider Open Filled Paths as Closed: a filled open path bounds a region as if an invisible edge closed it; false: it cuts the regions it crosses like an unfilled one), pickColorFrom?: \"artwork\" (default: the merged shape takes the look of the front-most object under the first point, else under the last point, else of the front-most object) | \"swatches\" (the current fill, with the rest of the look of the front-most object over the first region the drag touches that an object covers, else of the front-most object), fill?: \"#rrggbb\" | {color|swatch|gradient|none} (overrides pickColorFrom)} → {ids, merged, regions, lines, edges (counts deleted, merged or split), split?: id (the run split off, after a split)}; after a split, ids are the roots, with the rest and the run in place of the path when it was one",
+            "{ids?|id?: [id…] (default: selection), points: [[x,y]…] (drag path; one point = click; may be left out with rect), rect?: [x, y, width, height] (Shift-drag marquee from where the drag started, x and y, to x+width and y+height; width and height may be negative: touches every region whose outline crosses the rectangle or has an anchor inside it and the region holding the whole rectangle, the region under x, y comes first and the one under the opposite corner comes next; with points, it also touches the regions along them; for pickColorFrom, x, y is the drag's first point and the opposite corner is its last), erase?: bool (erase mode, Alt: deletes the regions touched, and the pieces of open paths that cut regions and the edges (outline pieces between the points where paths meet; see shapeBuilder.regions) within tolerance, except that a point in a region no more than twice the tolerance across there touches the region; a deleted edge opens its path there, and edges bounding a deleted region go with it; what is left of each path keeps its look, with gradients fitted to its bounds kept where they were on it, its name, opacity mask and attributes, and its fill rule unless merged regions shaped it), splitStroke?: false (In Merge Mode, Clicking Stroke Splits the Path; not with erase or rect: when the one point of a click is within tolerance of a stroke, the path that stroke is on splits in two instead of a merge: the path keeps the rest of it, and a copy of the path holding the run of it from the anchor or crossing point before the click to the one after it, in the path's direction, goes directly above it; both keep the path's gradients where they were on it; the other objects stay as they are; with pickColorFrom \"swatches\" or fill, the run's stroke takes that paint; a path in a Live Paint group or a Shaper Group does not split, and nor does a path the run is all of, such as a lone line, or all but 0.05 pt or less of (a ten-thousandth of the larger side of a path over 500 pt)), tolerance?: pt (2, erase or splitStroke), gap?: pt (0–72; 0: Gap Detection off), openFilledAsClosed?: true (Consider Open Filled Paths as Closed: a filled open path bounds a region as if an invisible edge closed it; false: it cuts the regions it crosses like an unfilled one), pickColorFrom?: \"artwork\" (default: the merged shape takes the look of the front-most object under the first point, else under the last point, else of the front-most object) | \"swatches\" (the current fill, with the rest of the look of the front-most object over the first region the drag touches that an object covers, else of the front-most object), fill?: \"#rrggbb\" | {color|swatch|gradient|none} (overrides pickColorFrom)} → {ids, merged, regions, lines, edges (counts deleted, merged or split), split?: id (the run split off, after a split)}; after a split, ids are the roots, with the rest and the run in place of the path when it was one",
             has_selection_or_ids,
             sb_merge
         ),
@@ -129,7 +129,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make",
             ["Object", "Image Trace"],
             None,
-            "{id?: image or Image Trace group (default: selection), preset?: name (imageTrace.presets), enhanced?: false (the preset's enhanced version: with Auto Grouping, and with Shapes in all but High Fidelity Photo; Flat Logo has none and is traced as it is), params?: {mode: \"blackAndWhite\"|\"grayscale\"|\"color\"|\"logo\", threshold: 0-255, palette: \"limited\"|\"fullTone\"|\"automatic\"|\"documentLibrary\" (color mode; limited: the `colors` best colours, fullTone: as many as the tones need, more with colorDetail, automatic: flat art with its own colours, else fullTone, documentLibrary: at most `colors` of the library's colours, as they are), colors: 2-256, colorDetail: 0-100 (fullTone, automatic), library: \"document\" (the document's swatches) or a swatch library id or name (swatch.library.list; documentLibrary), paths: 0-100, corners: 0-100, noise: px, method: \"abutting\"|\"overlapping\", ignoreWhite (leave out white areas), ignoreColor?: \"#rrggbb\" (with ignoreWhite: the colour left out instead of white), snapCurvesToLines, shapes: false (filled outlines that are a circle, an ellipse, a rectangle or a regular polygon come out as that live shape), autoGrouping: false (each path that has others inside it is grouped with them), gradients: false (grayscale and color: an area whose colour changes evenly along one direction is one path with a linear gradient fill), fills: true, strokes: false (Create: lines up to strokeWidth wide become stroked centre lines; without fills, wider areas become stroked outlines), strokeWidth: px (10), logoColors?: [\"#rrggbb\"…] (mode logo: flat-colour logos only; colours found automatically or named here, white is always its own colour, at most ten; noise = areas under noise/10 px ignored; edges to a fraction of a pixel, sharp corners restored, lines and circles snapped; enclosed transparent areas are painted white unless ignoreWhite makes them holes; fills/strokes are ignored; gradients and photos are refused)}, view?: as imageTrace.setView (default: the traced object's own, else tracingResult), ids?: [id…] (instead of id)} → {id, paths, anchors, colors, warnings: [text…] (the image is over 1500 px on a side, so it traces more slowly; or it was traced scaled down; Flat Logo names only the size it traced a larger image at)}",
+            "{id?: image or Image Trace group (default: selection), preset?: name (imageTrace.presets), enhanced?: false (the preset's enhanced version: with Auto Grouping, and with Shapes in all but High Fidelity Photo; Flat Logo has none and is traced as it is), params?: {mode: \"blackAndWhite\"|\"grayscale\"|\"color\"|\"logo\", threshold: 0-255, palette: \"limited\"|\"fullTone\"|\"automatic\"|\"documentLibrary\" (color mode; limited: the `colors` best colours, fullTone: as many as the tones need, more with colorDetail, automatic: flat art with its own colours, else fullTone, documentLibrary: at most `colors` of the library's colours, as they are), colors: 2-256, colorDetail: 0-100 (fullTone, automatic), library: \"document\" (the document's swatches) or a swatch library id or name (swatch.library.list; documentLibrary), colorGroup?: name (color mode, documentLibrary with library \"document\": the colors of that document color group instead of every swatch; \"\" is every swatch), paths: 0-100, corners: 0-100, noise: px, method: \"abutting\"|\"overlapping\", ignoreWhite (leave out white areas), ignoreColor?: \"#rrggbb\" (with ignoreWhite: the colour left out instead of white), snapCurvesToLines, shapes: false (filled outlines that are a circle, an ellipse, a rectangle or a regular polygon come out as that live shape), autoGrouping: false (each path that has others inside it is grouped with them), gradients: false (grayscale and color: an area whose colour changes evenly along one direction is one path with a linear gradient fill), fills: true, strokes: false (Create: lines up to strokeWidth wide become stroked centre lines; without fills, wider areas become stroked outlines), strokeWidth: px (10), logoColors?: [\"#rrggbb\"…] (mode logo: flat-colour logos only; colours found automatically or named here, white is always its own colour, at most ten; noise = areas under noise/10 px ignored; edges to a fraction of a pixel, sharp corners restored, lines and circles snapped; enclosed transparent areas are painted white unless ignoreWhite makes them holes; fills/strokes are ignored; gradients and photos are refused)}, view?: as imageTrace.setView (default: the traced object's own, else tracingResult), ids?: [id…] (instead of id)} → {id, paths, anchors, colors, warnings: [text…] (the image is over 1500 px on a side, so it traces more slowly; or it was traced scaled down; Flat Logo names only the size it traced a larger image at)}",
             has_selection_or_ids,
             |s, p| trace_make(s, p, false)
         ),
@@ -287,9 +287,21 @@ fn sb_merge(s: &mut Session, p: &Value) -> Result<Value> {
         f => f,
     };
     let roots = root_ids(s, p)?;
+    let gap = gap_param(p);
+    // The map the Shape Builder tool already has, which a click or drag of it is made over.
+    let shared = s.tool.shape_builder_map().filter(|(_, g)| *g == gap);
     let label = if erase { "Shape Builder Delete" } else { "Shape Builder" };
     let (ids, merged, touched, split) = s.edit(label, |d, sel| {
-        let (map, leaves) = BuilderMap::with_gap(d, &roots, erase || split_tol.is_some(), open_filled_as_closed, gap_param(p));
+        let (shapes, leaves) = b::shape_builder_shapes(d, &roots, open_filled_as_closed);
+        let built;
+        let map = match &shared {
+            // The tool's map has the outline edges, which erasing and splitting need.
+            Some((m, _)) if m.shapes == shapes => m.as_ref(),
+            _ => {
+                built = BuilderMap::of_shapes(shapes, erase || split_tol.is_some(), gap);
+                &built
+            }
+        };
         let outlines = b::drawn_outlines(d, &leaves);
         let leaves: Vec<Node> = leaves.into_iter().cloned().collect();
         if map.shapes.is_empty() {
@@ -327,7 +339,7 @@ fn sb_merge(s: &mut Session, p: &Value) -> Result<Value> {
             return Ok((ids, None, touched, Some(split)));
         }
         let mut touched = Touched { regions: marquee.map(|(a, b)| map.regions_in_marquee(a, b)).unwrap_or_default(), ..Default::default() };
-        touched.extend(&map.hits_along(&pts, piece_tol));
+        touched.extend(&map.builder_hits_along(&pts, piece_tol));
         touched.edges = map.erased_edges(&touched);
         if touched.is_empty() {
             return Err(EngineError::Other("Shape Builder: no region under the pointer".into()));
@@ -373,7 +385,8 @@ fn sb_merge(s: &mut Session, p: &Value) -> Result<Value> {
                 let mut rest = if in_union {
                     // What is left of it: its faces not merged or deleted, united. They share their
                     // edges with the merged faces exactly, where subtracting the merged shape left
-                    // slivers of the outline along them (#569).
+                    // slivers of the outline along them (#569). A sliver goes in only where the
+                    // shape covers it and the merged shape does not take it in.
                     let kept: Vec<&po::Region> = map
                         .regions
                         .iter()
@@ -381,7 +394,7 @@ fn sb_merge(s: &mut Session, p: &Value) -> Result<Value> {
                         .filter(|(k, (r, ..))| r.sources.contains(&i) && !touched.regions.contains(k))
                         .map(|(_, (r, ..))| r)
                         .collect();
-                    if kept.is_empty() { PathData::default() } else { faces.merge(&kept) }
+                    if kept.is_empty() { PathData::default() } else { faces.merge_rest(i, &kept, &picked) }
                 } else {
                     b::node_outline(leaf).map_or_else(|| sh.path.clone(), |o| o.0)
                 };
@@ -987,18 +1000,49 @@ fn trace_params(c: &str, p: &Value) -> Result<tr::TraceParams> {
     if !(params.stroke_width.is_finite() && params.stroke_width > 0.0) {
         return Err(bad(c, "strokeWidth must be a positive number of pixels"));
     }
+    // A color group is refused unless the trace uses it: Color mode with Document Library and the
+    // document's swatches.
+    if params.color_group.as_deref().is_some_and(|g| !g.is_empty()) {
+        if params.palette != tr::Palette::DocumentLibrary {
+            return Err(bad(c, "`colorGroup` needs `palette: \"documentLibrary\"`"));
+        }
+        if params.library != super::swatchlib::DOCUMENT_SWATCHES {
+            return Err(bad(c, "`colorGroup` needs `library: \"document\"`"));
+        }
+        if params.mode != tr::Mode::Color {
+            return Err(bad(c, "`colorGroup` needs `mode: \"color\"`"));
+        }
+    }
     Ok(params)
 }
 
-/// Document Library in Color mode: look the library's colours up into `params.swatches` → each
-/// one as traced (sRGB) with the colour to fill with. Errors name command `c`.
+/// Document Library with `colorGroup`: the solid colors of the active document's color group
+/// `name` (so named exactly, else ignoring case). Errors name command `c`.
+/// ([`trace_params`] has checked that the library is the document's swatches.)
+fn trace_group_colors(c: &str, s: &Session, name: &str) -> Result<Vec<Color>> {
+    let groups = &s.doc()?.doc.swatch_groups;
+    let lower = name.to_lowercase();
+    let group = groups
+        .iter()
+        .find(|g| g.name == name)
+        .or_else(|| groups.iter().find(|g| g.name.to_lowercase() == lower))
+        .ok_or_else(|| bad(c, format!("no color group `{name}` in the document (see swatch.list)")))?;
+    Ok(group.swatches.iter().filter_map(|w| w.paint.color()).collect())
+}
+
+/// Document Library in Color mode: look the library's colors (or its color group's) up into
+/// `params.swatches` → each one as traced (sRGB) with the color to fill with. Errors name command `c`.
 fn trace_library(c: &str, s: &Session, params: &mut tr::TraceParams) -> Result<Vec<([u8; 3], Color)>> {
     if params.mode != tr::Mode::Color || params.palette != tr::Palette::DocumentLibrary {
         return Ok(vec![]);
     }
-    let key = params.library.as_str();
-    let colors = super::swatchlib::library_colors(s, key)
-        .ok_or_else(|| bad(c, format!("no swatch library `{key}` (see swatch.library.list; \"document\": the document's swatches)")))?;
+    let group = params.color_group.as_deref().filter(|g| !g.is_empty());
+    let key = group.unwrap_or(params.library.as_str());
+    let colors = match group {
+        Some(name) => trace_group_colors(c, s, name)?,
+        None => super::swatchlib::library_colors(s, key)
+            .ok_or_else(|| bad(c, format!("no swatch library `{key}` (see swatch.library.list; \"document\": the document's swatches)")))?,
+    };
     if colors.is_empty() {
         return Err(bad(c, format!("`{key}` has no colours")));
     }

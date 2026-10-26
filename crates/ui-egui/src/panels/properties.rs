@@ -380,7 +380,7 @@ fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
         // button does.
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 26.0 - ui.spacing().item_spacing.x).max(80.0);
-            if let Some(name) = widgets::text_field(ui, ("ab", "name"), Some(&ab.name), w, 1).filter(|n| !n.is_empty()) {
+            if let Some(name) = widgets::text_field_named(ui, ("ab", "name"), Some(tl!("Name:")), Some(&ab.name), w, 1).filter(|n| !n.is_empty()) {
                 app.run("artboard.setProps", json!({"index": i, "name": name})).ok();
             }
             if widgets::icon_button(ui, "dc-artboard-options", tl!("Artboard Options"), false, 26.0).clicked() {
@@ -400,7 +400,7 @@ fn artboard_sections(app: &mut VectorcraftApp, ui: &mut Ui) {
                         "y" => origin.y,
                         _ => 0.0,
                     };
-                    if let Some(v) = widgets::num_field(ui, ("ab", key, row), Some(v - offset), units, fw) {
+                    if let Some(v) = widgets::num_field_named(ui, ("ab", key, row), Some(tl!(label)), Some(v - offset), units, fw) {
                         // A new X or Y moves the active artboard; a new W or H goes to every selected one.
                         let indices = if matches!(key, "width" | "height") { super::artboards::resized_with(app, i) } else { vec![i] };
                         let common = json!({"scaleArt": scale_art, "moveArt": move_art});
@@ -575,7 +575,7 @@ fn artboard_fill_row(app: &mut VectorcraftApp, ui: &mut Ui, i: usize, color: Opt
             widgets::proxy_chip(ui, r, &paint, false, None);
         });
         pick = chip.on_hover_text(tl!("Color Picker…")).clicked();
-        match widgets::dropdown(ui, "ab-fill", shown, &options, 110.0) {
+        match widgets::dropdown_named(ui, "ab-fill", Some(tl!("Fill:")), shown, &options, 110.0) {
             Some(k) if k < fills.len() => set = Some(fills[k]),
             Some(_) => pick = true,
             None => {}
@@ -687,34 +687,44 @@ pub fn transform_section(app: &mut VectorcraftApp, ui: &mut Ui) {
         return;
     };
     let b = bx.rect;
-    let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
-    let rp = bx.reference_point(refi);
+    // The reference point, or a symbol instance's registration point: X/Y are read and set there
+    // and the rotation and flips turn and mirror the selection about it, as in the Transform panel.
+    let reference = super::transform::panel_reference(app, ui, &bx);
+    let (refi, rp) = (reference.index, reference.point);
     let copy = super::transform::alt_enter_copies(app, ui);
     section_header(ui, tl!("Transform"));
     let fw = super::field_width(ui);
     ui.horizontal(|ui| {
         if let Some(i) = widgets::reference_point(ui, refi) {
-            ui.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), i));
+            ui.data_mut(|d| d.insert_temp(egui::Id::unique("refpt"), i));
         }
         ui.add_space(6.0);
         let link = super::transform::proportional(app, ui);
         egui::Grid::new("xf-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
             dim_label(ui, "X:");
-            if let Some(v) = widgets::num_field(ui, "tx", Some(rp.x - origin.x), units, fw) {
-                app.run("object.setBounds", json!({"x": v + origin.x, "reference": refi, "copy": copy})).ok();
+            if let Some(v) = widgets::num_field_named(ui, "tx", Some(crate::i18n::t("X:")), Some(rp.x - origin.x), units, fw) {
+                super::transform::run_transform(
+                    app,
+                    "object.setBounds",
+                    json!({"x": reference.bounds_xy(v + origin.x, 0.0).0, "reference": refi, "copy": copy}),
+                );
             }
             dim_label(ui, "W:");
-            if let Some(v) = widgets::size_field(ui, "tw", Some(b.width()), units, fw) {
-                app.run("object.setBounds", json!({"width": v, "reference": refi, "proportional": link, "copy": copy})).ok();
+            if let Some(v) = widgets::size_field_named(ui, "tw", Some(tl!("W:")), Some(b.width()), units, fw) {
+                super::transform::run_transform(app, "object.setBounds", json!({"width": v, "reference": refi, "proportional": link, "copy": copy}));
             }
             ui.end_row();
             dim_label(ui, "Y:");
-            if let Some(v) = widgets::num_field(ui, "ty", Some(rp.y - origin.y), units, fw) {
-                app.run("object.setBounds", json!({"y": v + origin.y, "reference": refi, "copy": copy})).ok();
+            if let Some(v) = widgets::num_field_named(ui, "ty", Some(crate::i18n::t("Y:")), Some(rp.y - origin.y), units, fw) {
+                super::transform::run_transform(
+                    app,
+                    "object.setBounds",
+                    json!({"y": reference.bounds_xy(0.0, v + origin.y).1, "reference": refi, "copy": copy}),
+                );
             }
             dim_label(ui, "H:");
-            if let Some(v) = widgets::size_field(ui, "th", Some(b.height()), units, fw) {
-                app.run("object.setBounds", json!({"height": v, "reference": refi, "proportional": link, "copy": copy})).ok();
+            if let Some(v) = widgets::size_field_named(ui, "th", Some(tl!("H:")), Some(b.height()), units, fw) {
+                super::transform::run_transform(app, "object.setBounds", json!({"height": v, "reference": refi, "proportional": link, "copy": copy}));
             }
             ui.end_row();
         });
@@ -725,18 +735,18 @@ pub fn transform_section(app: &mut VectorcraftApp, ui: &mut Ui) {
         let icon = icons::icon(ui, "rotate-ccw", 16.0, Tokens::get(ui.ctx()).icon);
         crate::scrub::note_label(ui, icon.rect);
         // The bounding box's angle: a new value turns the selection to it.
-        if let Some(a) = widgets::plain_field(ui, "rot", bx.angle, "°", 2, fw) {
-            app.run("object.rotate", json!({"angle": a, "absolute": true, "copy": copy})).ok();
+        if let Some(a) = widgets::plain_field_named(ui, "rot", Some(tl!("Rotation")), bx.angle, "°", 2, fw) {
+            super::transform::run_transform(app, "object.rotate", json!({"angle": a, "absolute": true, "origin": reference.origin(), "copy": copy}));
         }
         ui.add_space(10.0);
         // Lucide's flip icons are named for their mirror line: flip-vertical-2 draws a vertical
         // line (the left-right flip), flip-horizontal-2 a horizontal one (top-bottom). The labels
         // are the reference app's Properties panel names for the same buttons (#1910).
         if widgets::icon_button(ui, "flip-vertical-2", tl!("Flip Along Horizontal Axis"), false, 24.0).clicked() {
-            app.run("object.reflect", json!({"axis": "vertical"})).ok();
+            super::transform::run_transform(app, "object.reflect", json!({"axis": "vertical", "origin": reference.origin()}));
         }
         if widgets::icon_button(ui, "flip-horizontal-2", tl!("Flip Along Vertical Axis"), false, 24.0).clicked() {
-            app.run("object.reflect", json!({"axis": "horizontal"})).ok();
+            super::transform::run_transform(app, "object.reflect", json!({"axis": "horizontal", "origin": reference.origin()}));
         }
         // More Options: the Transform panel's Scale Corners and Scale Strokes & Effects, open
         // while they are toggled.

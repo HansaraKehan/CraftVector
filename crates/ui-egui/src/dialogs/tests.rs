@@ -358,7 +358,7 @@ fn dialogs_are_as_tall_as_their_content() {
             let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
             ctx.run_ui(input, |ui| show(app, ui.ctx())).textures_delta.clear();
         }
-        ctx.memory(|m| m.area_rect(egui::Id::new(("dialog", kind)))).unwrap().height()
+        ctx.memory(|m| m.area_rect(egui::Id::unique(("dialog", kind)))).unwrap().height()
     };
     let tall = height(&mut app, "command", json!({"__command": "object.move", "a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8}));
     let prompt = height(&mut app, crate::unsaved::KIND, json!({"index": 0, "name": "Untitled-1", "then": "close"}));
@@ -403,7 +403,7 @@ fn dialogs_do_not_stretch_to_the_screen() {
             let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
             ctx.run_ui(input, |ui| show(&mut app, ui.ctx())).textures_delta.clear();
         }
-        let h = ctx.memory(|m| m.area_rect(egui::Id::new(("dialog", kind.as_str()))))?.height();
+        let h = ctx.memory(|m| m.area_rect(egui::Id::unique(("dialog", kind.as_str()))))?.height();
         Some((kind, h))
     };
     let mut checked = 0;
@@ -426,7 +426,7 @@ fn dialog_rect(app: &mut VectorcraftApp, w: f32) -> egui::Rect {
         let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
         ctx.run_ui(input, |ui| show(app, ui.ctx())).textures_delta.clear();
     }
-    ctx.memory(|m| m.area_rect(egui::Id::new(("dialog", kind.as_str())))).unwrap()
+    ctx.memory(|m| m.area_rect(egui::Id::unique(("dialog", kind.as_str())))).unwrap()
 }
 
 #[test]
@@ -1442,7 +1442,13 @@ fn dialog_sliders_report_the_numbers_their_fields_show() {
     app.run("tool.options", json!({"tool": "pencil"})).unwrap();
     set(&mut app, "fidelity", json!(2.5));
     let shown = tree(|ui| show(&mut app, ui.ctx()));
-    assert_eq!(slider_value(&shown, "Fidelity:"), v(2.5, (0.5, 20.0), "2.5pt"));
+    assert_eq!(slider_value(&shown, "Fidelity:"), v(2.5, (0.01, 20.0), "2.5pt"));
+    // The Smooth tool's rail starts at its own lowest Fidelity.
+    app.ui.dialog = None;
+    app.run("tool.options", json!({"tool": "smooth"})).unwrap();
+    set(&mut app, "fidelity", json!(0.25));
+    let shown = tree(|ui| show(&mut app, ui.ctx()));
+    assert_eq!(slider_value(&shown, "Fidelity:"), v(0.25, (0.05, 20.0), "0.25pt"));
     app.ui.dialog = None;
     app.run("paint.setFill", json!({"color": "#ff8000"})).unwrap();
     app.run("ui.colorPicker", json!({})).unwrap();

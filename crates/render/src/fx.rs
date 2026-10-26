@@ -35,8 +35,8 @@
 //!
 //! A cached raster is made again when something its content reads from outside the object
 //! changes ([`Inputs`]): the pattern definitions, symbols, images and brushes it uses, the
-//! document's raster resolution, color mode and substitution highlights, the knockout its object
-//! inherits, the color settings and fonts, the plug-ins its plug-in effects run, and the options
+//! document's raster resolution and color mode, the substitution highlights, the knockout its
+//! object inherits, the color settings and fonts, the plug-ins its plug-in effects run, and the options
 //! and layer settings it is drawn with.
 //!
 //! The same applies to one fill or stroke's own raster effects (around that item alone) and to
@@ -687,7 +687,8 @@ fn linear_key(view: Affine) -> [u64; 4] {
 }
 
 /// The pan of the view a raster was cropped for, or made at a lower resolution than the view's, and
-/// the device-pixel rect of the frame it was made in ([`PixelEntry::view`], [`ShadowEntry::view`]).
+/// the device-pixel rect it was made for in that view: the frame's, or around it the margin of
+/// [`pan_margin`] ([`PixelEntry::view`], [`ShadowEntry::view`]).
 #[derive(Clone, Copy, Debug)]
 struct ViewCrop {
     pan: Vec2,
@@ -701,7 +702,7 @@ impl ViewCrop {
 
     /// Does the raster draw in a frame through `view` (of the same zoom and rotation) onto
     /// `screen`? When the view is panned by whole pixels and the frame's rect, panned back, lies
-    /// within the one the raster was made in: the same pixels in the same places, as when a frame
+    /// within the one the raster was made for: the same pixels in the same places, as when a frame
     /// is drawn again only in a part of it.
     fn serves(&self, view: Affine, screen: Rect) -> bool {
         let d = view.translation() - self.pan;
@@ -709,6 +710,30 @@ impl ViewCrop {
         let s = screen - whole;
         (d - whole).hypot() < 1e-6 && s.x0 >= self.screen.x0 && s.y0 >= self.screen.y0 && s.x1 <= self.screen.x1 && s.y1 <= self.screen.y1
     }
+
+    /// The rect the raster was made for, in the device pixels of a frame through `view` that it
+    /// serves ([`Self::serves`]).
+    fn served(&self, view: Affine) -> Rect {
+        let d = view.translation() - self.pan;
+        self.screen + Vec2::new(d.x.round(), d.y.round())
+    }
+}
+
+/// How far (device pixels, on each side) past a `w` × `h` view a raster cropped to it, and `m`
+/// pixels around that, is made when it is made again at the same zoom and rotation, so that later
+/// pans of up to that many pixels draw it: the most that keeps the raster within `budget` pixels and
+/// `side` pixels a side, with two pixels to spare for rounding, and at most half the view's longer
+/// side. 0 when the view and the `m` pixels around it alone leave no room.
+fn pan_margin((w, h): (f64, f64), m: f64, budget: f64, side: f64) -> f64 {
+    let (a, b) = (w + 2.0 * m, h + 2.0 * m);
+    // The largest `e` with (a + 2e) × (b + 2e) within the budget, less two pixels for the rounding
+    // of the raster's edges to whole pixels.
+    let e = (((a - b).powi(2) + 4.0 * budget).sqrt() - (a + b)) / 4.0 - 2.0;
+    // (Also for a view or spread that isn't a number.)
+    if !e.is_finite() {
+        return 0.0;
+    }
+    e.min((side - a.max(b)) / 2.0 - 2.0).min(w.max(h) / 2.0).floor().max(0.0)
 }
 
 /// Most pixels a raster of [`Renderer::pixel_content`] or [`Renderer::with_filters`] holds while
@@ -816,8 +841,9 @@ struct Shadow {
     mode: vectorcraft_doc::color::BlendMode,
     /// Made before its object moved ([`ShadowEntry::moved`]).
     moved: bool,
-    /// Cropped to the view, or made over a raster that is ([`ShadowEntry::view`]).
-    cropped: bool,
+    /// For a raster cropped to the view, or made over a raster that is ([`ShadowEntry::view`]), the
+    /// rect it was made for, in this frame's device pixels ([`ViewCrop::served`]).
+    cropped: Option<Rect>,
 }
 
 impl ShadowEntry {
@@ -941,8 +967,8 @@ pub(crate) struct Reads {
     images: bool,
     /// Brushed strokes: the brush library.
     brushes: bool,
-    /// Type: the fonts, whether overprinting shows ([`crate::proof::overprints`]) and Document
-    /// Setup's substitution highlights.
+    /// Type: the fonts, whether overprinting shows ([`crate::proof::overprints`]) and the
+    /// substitution highlights.
     text: bool,
     /// Plug-in effects on its objects: the plug-ins installed. Those in the symbol and pattern art
     /// it shows are found with the document's inputs ([`DocInputs`]).
@@ -1099,9 +1125,12 @@ impl Renderer {
     /// what can show in the `screen` (device pixels): the view, and around it the blur's spread and
     /// `around` (document units: how far the shadows and glows stacked over this one look), made
     /// coarser to fit the budget where the blur hides the coarser grid. Such a raster, and one
-    /// made over it (`over_cropped`), is reused only in the same view. `None` when the effect isn't
-    /// a shadow/glow or the raster would still be too large (caller falls back to
-    /// [`Self::draw_shadow_filter`]).
+    /// made over it, is reused while a pan keeps the view inside the rect it was made for: the
+    /// view, and when the raster kept for the object was made at the same zoom and rotation and no
+    /// drag is on, the view with [`pan_margin`] around it, within `over` (the rect, in device
+    /// pixels, that the cropped rasters of the shadows and glows it is made over were made for;
+    /// `None` when it is made over none). `None` when the effect isn't a shadow/glow or the raster
+    /// would still be too large (caller falls back to [`Self::draw_shadow_filter`]).
     /// While dragging on a multithreaded context, a raster that has to be made again counts as too
     /// large when it would hold more than [`DRAG_PIXEL_BUDGET`] pixels.
     #[allow(clippy::too_many_arguments)]
@@ -1113,7 +1142,7 @@ impl Renderer {
         fx: &RasterFx,
         reach: Rect,
         owner: Option<&Arc<Node>>,
-        (screen, around, over_cropped): (Rect, f64, bool),
+        (screen, around, over): (Rect, f64, Option<Rect>),
         paint: &mut dyn FnMut(&mut Self, &mut RenderContext, &Frame),
     ) -> Option<Shadow> {
         let (mode, opacity, dx, dy, blur, color, darkness) = match fx {
@@ -1128,7 +1157,6 @@ impl Renderer {
         // What the silhouette reads: as the raster kept for `n` found it, else found now.
         let reads = self.shadows.get(&key).filter(|e| e.node.is(n)).map_or_else(|| Reads::of(n), |e| e.inputs.reads);
         let inputs = self.raster_inputs(f, n, reads);
-        let in_view = ViewCrop::of(f.view, screen);
         let exact = |e: &ShadowEntry| {
             e.linear == linear && e.node.is(n) && e.inputs == inputs && (interacting || !e.moved) && e.view.is_none_or(|v| v.serves(f.view, screen))
         };
@@ -1141,7 +1169,7 @@ impl Renderer {
                 e.stamp = stamp;
                 self.stats.moved += usize::from(e.moved);
                 let p = f.view * e.anchor;
-                (e.image.clone(), (p.x + e.rel.0).round(), (p.y + e.rel.1).round(), e.scale, e.moved, e.view.is_some())
+                (e.image.clone(), (p.x + e.rel.0).round(), (p.y + e.rel.1).round(), e.scale, e.moved, e.view.map(|v| v.served(f.view)))
             }
             None => {
                 // An Outer Glow's silhouette grows by a quarter of a pixel of the document's raster grid first.
@@ -1162,18 +1190,23 @@ impl Renderer {
                 };
                 // A glow too large for the budget is made coarser, where its blur hides the coarser grid: the filter
                 // layer the caller falls back to can't make its silhouette solid.
-                let full = region(whole, matches!(fx, RasterFx::OuterGlow { .. }), 4.0e6).filter(|_| !over_cropped);
+                let full = region(whole, matches!(fx, RasterFx::OuterGlow { .. }), 4.0e6).filter(|_| over.is_none());
                 // Else it is cropped to what can show in the view, within the budget of the filter
-                // layer it would otherwise be drawn through, and made coarser in the same way.
+                // layer it would otherwise be drawn through, and made coarser in the same way. Made
+                // again at this zoom and rotation (after a pan), it covers a margin around the view
+                // too, so that later pans within the margin draw it.
                 let ((x0, y0, w, h, scale), cropped) = match full {
-                    Some(r) => (r, false),
+                    Some(r) => (r, None),
                     None => {
                         let m = spread + around / f.px;
-                        let r = whole.intersect(screen.inflate(m, m));
+                        let again = self.shadows.get(&key).is_some_and(|e| e.linear == linear) && !f.opts.dragging;
+                        let e = if again { pan_margin((screen.width(), screen.height()), m, PIXEL_BUDGET, 8192.0) } else { 0.0 };
+                        let room = over.map_or(screen.inflate(e, e), |o| screen.inflate(e, e).intersect(o));
+                        let r = whole.intersect(room.inflate(m, m));
                         if r.width() <= 0.0 || r.height() <= 0.0 {
                             return None;
                         }
-                        (region(r, true, PIXEL_BUDGET)?, true)
+                        (region(r, true, PIXEL_BUDGET)?, Some(room))
                     }
                 };
                 // During a drag, a larger shadow on a multithreaded context is filtered within the
@@ -1185,7 +1218,10 @@ impl Renderer {
                 // Silhouette (the object's painted alpha, and its colors under Darkness), offset by
                 // the shadow distance.
                 let mut off = f.offscreen_context(w, h);
-                let crop = Frame { mt: false, view: Affine::scale(1.0 / scale) * Affine::translate((-x0, -y0)) * f.view, ..*f };
+                let view = Affine::scale(1.0 / scale) * Affine::translate((-x0, -y0)) * f.view;
+                // Art is culled against the raster's own area: members of a group outside the view cast their shadows in it.
+                let visible = view.inverse().transform_rect_bbox(Rect::new(0.0, 0.0, f64::from(w), f64::from(h)));
+                let crop = Frame { mt: false, view, visible, ..*f };
                 let before = self.stats.moved;
                 self.inside_layer(|r| paint(r, &mut off, &shifted(&crop, dx, dy)));
                 // A silhouette drawn over moved rasters makes a moved shadow.
@@ -1234,7 +1270,7 @@ impl Renderer {
                 let p = f.view * anchor;
                 let node = Drawn::of(n, owner);
                 let rel = (x0 - p.x, y0 - p.y);
-                let view = cropped.then_some(in_view);
+                let view = cropped.map(|room| ViewCrop::of(f.view, room));
                 self.shadows.insert(key, ShadowEntry { node, linear, anchor, rel, image: image.clone(), scale, view, made, inputs, moved, stamp });
                 self.trim_fx_rasters(FX_RASTER_BUDGET);
                 (image, x0, y0, scale, moved, cropped)
@@ -1345,7 +1381,10 @@ impl Renderer {
         let anchor = reach.origin();
         let p = f.view * anchor;
         let mut off = f.offscreen_context(w, h);
-        let crop = Frame { mt: false, view: Affine::scale(1.0 / scale) * Affine::translate((-(p.x + rel.0), -(p.y + rel.1))) * f.view, ..*f };
+        let view = Affine::scale(1.0 / scale) * Affine::translate((-(p.x + rel.0), -(p.y + rel.1))) * f.view;
+        // Culled against the raster's area, as `shadow_raster` draws the silhouette.
+        let visible = view.inverse().transform_rect_bbox(Rect::new(0.0, 0.0, f64::from(w), f64::from(h)));
+        let crop = Frame { mt: false, view, visible, ..*f };
         self.inside_layer(|r| paint(r, &mut off, &shifted(&crop, dx, dy)));
         off.flush();
         let mut pm = vello_cpu::Pixmap::new(w, h);
@@ -1684,7 +1723,8 @@ impl Renderer {
         for (i, fx) in rfx.iter().enumerate().filter(|(_, x)| x.is_below()) {
             // A raster cropped to the view covers what the shadows and glows stacked over it read.
             let around: f64 = rfx.iter().skip(i + 1).filter(|x| x.is_below()).map(looks).sum();
-            let over_cropped = made.iter().any(|(_, s)| s.as_ref().is_some_and(|s| s.cropped));
+            // The rect that the cropped rasters of the earlier ones (drawn into this one's silhouette) were all made for.
+            let over = made.iter().filter_map(|(_, s)| s.as_ref()?.cropped).reduce(|a, b| a.intersect(b));
             let shadow = {
                 let earlier = &made;
                 let view = f.view;
@@ -1701,7 +1741,7 @@ impl Renderer {
                     }
                     paint(r, c, fr);
                 };
-                let view = (screen, around, over_cropped);
+                let view = (screen, around, over);
                 content.cache.and_then(|slot| self.shadow_raster(f, content.node, slot + i, fx, stacked, owner.as_ref(), view, &mut art))
             };
             stacked = match fx {
@@ -1773,9 +1813,11 @@ impl Renderer {
     /// resolution. A whole raster at full resolution is cached while the object, the
     /// zoom and what the content reads ([`Inputs`]) stay the same (panning only moves it), and
     /// while interacting after the content only moved ([`Self::move_pixel_content`]). A cropped or
-    /// lower-resolution raster is cached while the object, the view (its pan included) and what the
-    /// content reads stay the same ([`PixelEntry::view`]); a lower-resolution one is kept resampled to
-    /// the view's pixels ([`Self::resampled`]).
+    /// lower-resolution raster is cached while the object, the zoom and what the content reads stay
+    /// the same and a pan keeps the view inside the rect it was made for ([`PixelEntry::view`]): the
+    /// view, and for a raster cropped to it that is made again at the same zoom and rotation, outside
+    /// a drag and for content without a [`Kept`] image, the view with [`pan_margin`] around it. A
+    /// lower-resolution one is kept resampled to the view's pixels ([`Self::resampled`]).
     /// While dragging, content without such a raster to draw renders within [`DRAG_PIXEL_BUDGET`]
     /// pixels and is not cached.
     fn pixel_content(
@@ -1815,8 +1857,20 @@ impl Renderer {
         let fits = full.area() <= PIXEL_BUDGET;
         // Device pixels from a pixel to the content deciding it (`None`: anywhere).
         let margin = chain.iter().try_fold(2.0, |m, fx| looks_around(fx).map(|d| m + d / f.px));
+        let linear = linear_key(f.view);
+        let key = content.cache.map(|slot| (content.node as *const Node as usize, slot, f.ink));
+        // Made again at this zoom and rotation (after a pan), a raster cropped to the view covers a
+        // margin around the view too, so that later pans within the margin draw it.
+        let again = key.and_then(|key| self.pixel_fx.get(&key)).is_some_and(|e| e.linear == linear) && content.kept.is_none() && !f.opts.dragging;
+        let room = match margin {
+            Some(m) if !fits && again => {
+                let e = pan_margin((screen.width(), screen.height()), m, PIXEL_BUDGET, f64::from(crate::MAX_RASTER_SIDE));
+                screen.inflate(e, e)
+            }
+            _ => screen,
+        };
         let region = match margin {
-            Some(m) if !fits => full.intersect(screen.inflate(m, m)),
+            Some(m) if !fits => full.intersect(room.inflate(m, m)),
             _ => full,
         };
         let (x0, y0) = (region.x0.floor(), region.y0.floor());
@@ -1825,11 +1879,10 @@ impl Renderer {
         let side = f64::from(crate::MAX_RASTER_SIDE);
         let k = (PIXEL_BUDGET / (rw * rh)).sqrt().min(side / rw).min(side / rh).min(1.0);
         let (w, h) = ((rw * k).ceil().clamp(1.0, side), (rh * k).ceil().clamp(1.0, side));
-        // The cached raster: of the whole content at full size at this zoom, else of this view.
-        let linear = linear_key(f.view);
+        // The cached raster: of the whole content at full size at this zoom, else of this view (and
+        // the margin around it).
         let whole = fits && k >= 1.0;
-        let in_view = (!whole).then(|| ViewCrop::of(f.view, screen));
-        let key = content.cache.map(|slot| (content.node as *const Node as usize, slot, f.ink));
+        let in_view = (!whole).then(|| ViewCrop::of(f.view, room));
         let stamp = self.stamp;
         let channels = match f.ink {
             Ink::Cmy => effects::pixel::Channels::CmyPlane,
@@ -2131,13 +2184,18 @@ impl Renderer {
             let o = f.opts;
             (doc.images, self.dim_images.map(f32::to_bits), o.smooth_images, o.image_mips, o.trace_views, o.progressive_placed).hash(&mut h);
             o.trace_source.as_deref().hash(&mut h);
+            o.mark_undecoded_images.hash(&mut h);
         }
         if reads.brushes {
             self.brushes.library_key(f.doc, self.stamp).hash(&mut h);
         }
         if reads.text {
-            let setup = &f.doc.setup;
-            let highlights = f.opts.highlight_substitutions.then_some((setup.highlight_substituted_fonts, setup.highlight_substituted_glyphs));
+            let o = f.opts;
+            let highlights = o.highlight_substitutions.then_some((
+                o.highlight_substituted_fonts,
+                f.doc.setup.highlight_substituted_glyphs,
+                o.highlight_alternate_glyphs,
+            ));
             (vectorcraft_text::FontDb::global().generation(), crate::proof::overprints(f.opts), highlights).hash(&mut h);
         }
         if reads.plugins || (doc.plugins && (reads.symbols || reads.patterns)) {
@@ -2409,7 +2467,7 @@ mod tests {
     use vectorcraft_doc::{Appearance, Document, Effect, Node};
     use vectorcraft_geom::{Affine, Rect, shapes};
 
-    use super::{DRAG_PIXEL_BUDGET, Drawn, PIXEL_BUDGET, drag_scale, filter_region, filter_region_within};
+    use super::{DRAG_PIXEL_BUDGET, Drawn, PIXEL_BUDGET, drag_scale, filter_region, filter_region_within, pan_margin};
     use crate::tests_fontchange::fonts_steady;
     use crate::{RenderOptions, Rendered, Renderer};
 
@@ -2452,6 +2510,21 @@ mod tests {
         assert!((f64::from(w) / k - f64::from(full.2)).abs() <= 1.0 / k && (f64::from(h) / k - f64::from(full.3)).abs() <= 1.0 / k);
         let small = Rect::new(10.0, 20.0, 110.0, 70.0);
         assert_eq!(filter_region_within(small, (1600, 1000), 4.0, DRAG_PIXEL_BUDGET), filter_region(small, (1600, 1000), 4.0));
+    }
+
+    /// The margin a raster cropped to the view is made again with keeps it within the pixel budget,
+    /// a pixel of rounding on each edge included, and within the side limit; it is at most half the
+    /// view's longer side, and 0 when the view and its spread alone fill the budget.
+    #[test]
+    fn the_margin_for_pans_stays_within_the_pixel_budget() {
+        for ((w, h), m, want) in [((2560.0, 1440.0), 32.0, 441.0), ((640.0, 360.0), 32.0, 320.0), ((3840.0, 2160.0), 32.0, 0.0)] {
+            let e = pan_margin((w, h), m, PIXEL_BUDGET, 8192.0);
+            assert_eq!(e, want, "{w} × {h}");
+            let (rw, rh) = (w + 2.0 * (m + e) + 2.0, h + 2.0 * (m + e) + 2.0);
+            assert!(e == 0.0 || rw * rh <= PIXEL_BUDGET, "{w} × {h}: {rw} × {rh}");
+        }
+        assert_eq!(pan_margin((2000.0, 10.0), 0.0, 1e9, 3000.0), 498.0, "within the side limit");
+        assert_eq!(pan_margin((2000.0, 10.0), f64::NAN, PIXEL_BUDGET, 8192.0), 0.0);
     }
 
     fn doc_with(r: Rect, fill: Color, effects: Vec<(&str, serde_json::Value)>) -> Document {

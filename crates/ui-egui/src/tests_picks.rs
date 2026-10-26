@@ -155,11 +155,27 @@ fn saved_document(app: &mut VectorcraftApp, tag: &str) -> (std::path::PathBuf, S
 // ------------------------------------------------------------------------------------- the tests
 
 #[test]
+fn file_open_starts_in_the_last_opened_files_folder() {
+    let (mut app, shown, _) = app();
+    let dir = std::env::temp_dir().join(format!("vc-open-dialog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("poster.svg").to_string_lossy().into_owned();
+    crate::io::note_recent(&mut app, &path);
+    assert!(app.run("file.open", json!({})).is_err());
+    poll(&mut app);
+    let folder = dir.to_string_lossy().into_owned();
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(p)] if p.folder == Some(folder)));
+    shown.answer(&[]);
+    poll(&mut app);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn file_open_opens_what_its_dialog_picks_when_it_answers() {
     let (mut app, shown, _) = app();
     // The dialog shows; File › Open gives up for now, without a "cancelled".
     assert!(app.run("file.open", json!({})).is_err());
-    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(_)]));
+    assert!(matches!(shown.requests().as_slice(), [PickRequest::Open(p)] if p.folder.is_none()));
     poll(&mut app);
     assert!(app.session.documents().is_empty() && app.ui.status.is_empty(), "{}", app.ui.status);
     // Another dialog waits for this one.

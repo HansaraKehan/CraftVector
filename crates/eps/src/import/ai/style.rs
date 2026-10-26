@@ -765,6 +765,20 @@ mod tests {
     }
 
     #[test]
+    fn art_styles_clear_operands_beyond_the_cap() {
+        let mut data = Vec::from(
+            b"/KnownStyle :\n(Soft) /Name ,\n/ActiveStyle :\n/CompoundFilter :\n(Chain Style Filter) 0 0 /Filter ,\n1 /Visible ,\n/BasicFilter :\n(Adobe Feather) 1 0 /Filter ,\n1 /Visible ,\n",
+        );
+        for _ in 0..80 {
+            data.extend_from_slice(b"1 ");
+        }
+        data.extend_from_slice(b"/Dictionary : /NotRecorded ,\n; /Dict ;\n /Part ,\n;\n");
+        let styles = art_styles(&data);
+        let [feather] = styles["Soft"].effects.as_slice() else { panic!() };
+        assert_eq!(feather.params["radius"].as_f64(), Some(5.0));
+    }
+
+    #[test]
     fn art_styles_ignore_filters_beyond_the_cap() {
         const UNIT: &[u8] = b"/BasicFilter :\n(Adobe Feather) 1 0 /Filter ,\n1 /Visible ,\n/Dictionary : /NotRecorded ,\n; /Dict ;\n /Part ,\n";
         let mut data =
@@ -781,14 +795,80 @@ mod tests {
     fn hostile_dash_offsets_and_width_profiles_are_tamed() {
         let mut f = Filter::default();
         paint_op(&mut f, "d", &[V::Arr(vec![V::Num(5.0)]), V::Num(f64::NAN)]);
-        assert_eq!(f.dash.map(|d| d.offset), Some(0.0));
+        assert_eq!(f.dash.as_ref().map(|d| d.offset), Some(0.0));
         // Positions outside 0..=1 and out of order, a negative width, a non-finite one.
         let arrays = HashMap::from([
             ("BSVariableWidthTValuesArray".to_string(), vec![1.5, -0.2, 0.5, 0.7]),
             ("BSCenteredWidthsArray".to_string(), vec![-1.0, 2.0, 0.5, f64::INFINITY]),
         ]);
         assert_eq!(width_profile(&arrays).map(|p| p.points), Some(vec![(0.0, 2.0, 2.0), (0.5, 0.5, 0.5), (1.0, 0.0, 0.0)]));
+        let ok = (0..64).map(|_| V::Num(2.0)).collect::<Vec<_>>();
+        paint_op(&mut f, "d", &[V::Arr(ok), V::Num(0.0)]);
+        assert_eq!(f.dash.as_ref().map(|d| d.pattern.len()), Some(64));
+        let huge = (0..65).map(|_| V::Num(1.0)).collect::<Vec<_>>();
+        paint_op(&mut f, "d", &[V::Arr(huge), V::Num(0.0)]);
+        assert_eq!(f.dash, None);
+        let long = (0..1025).map(|i| i as f64 / 1024.0).collect::<Vec<_>>();
+        let wide = vec![1.0; 1025];
+        let huge = HashMap::from([("BSVariableWidthTValuesArray".to_string(), long), ("BSCenteredWidthsArray".to_string(), wide)]);
+        assert_eq!(width_profile(&huge), None);
     }
+
+    #[test]
+    fn hostile_stroke_widths_are_sanitized() {
+        let mut f = Filter::default();
+        paint_op(&mut f, "w", &[V::Num(12.0)]);
+        assert_eq!(f.width, 12.0);
+        paint_op(&mut f, "w", &[V::Num(-1.0)]);
+        assert_eq!(f.width, 12.0);
+        paint_op(&mut f, "w", &[V::Num(f64::INFINITY)]);
+        assert_eq!(f.width, 12.0);
+    }
+
+    #[test]
+    fn hostile_stroke_paint_flags_ignore_short_operands() {
+        let mut f = Filter { paints: (true, true), ..Filter::default() };
+        paint_op(&mut f, "Xd", &[V::Num(1.0)]);
+        assert_eq!(f.paints, (true, true));
+        paint_op(&mut f, "Xd", &[V::Num(0.0), V::Num(1.0)]);
+        assert_eq!(f.paints, (false, true));
+        paint_op(&mut f, "Xd", &[V::Num(2.0), V::Num(0.0)]);
+        assert_eq!(f.paints, (true, false));
+    }
+
+    #[test]
+    fn hostile_stroke_miter_limits_are_capped() {
+        let mut f = Filter::default();
+        paint_op(&mut f, "M", &[V::Num(900.0)]);
+        assert_eq!(f.miter, 500.0);
+        paint_op(&mut f, "M", &[V::Num(0.5)]);
+        assert_eq!(f.miter, 500.0);
+    }
+
+    #[test]
+    fn hostile_stroke_caps_and_joins_ignore_invalid_values() {
+        let mut f = Filter::default();
+        paint_op(&mut f, "J", &[V::Num(99.0)]);
+        assert_eq!(f.cap, LineCap::Butt);
+        paint_op(&mut f, "J", &[V::Num(2.0)]);
+        assert_eq!(f.cap, LineCap::Square);
+        paint_op(&mut f, "j", &[V::Num(99.0)]);
+        assert_eq!(f.join, LineJoin::Miter);
+        paint_op(&mut f, "j", &[V::Num(1.0)]);
+        assert_eq!(f.join, LineJoin::Round);
+    }
+
+    #[test]
+    fn hostile_blend_opacities_are_clamped() {
+        let mut f = Filter::default();
+        paint_op(&mut f, "Xy", &[V::Num(3.0), V::Num(1.5)]);
+        assert_eq!(f.xy, Some((3, 1.0)));
+        paint_op(&mut f, "Xy", &[V::Num(-1.0), V::Num(0.25)]);
+        assert_eq!(f.xy, Some((0, 0.25)));
+        paint_op(&mut f, "Xy", &[V::Num(0.0), V::Num(f64::NAN)]);
+        assert_eq!(f.xy, Some((0, 0.25)));
+    }
+
     /// A basic filter `name` whose dictionary holds `body`.
     fn basic(name: &str, body: &str) -> String {
         format!("/BasicFilter :\n({name}) 0 0 /Filter ,\n1 /Visible ,\n/Dictionary : /NotRecorded ,\n{body}; /Dict ;\n /Part ,\n")

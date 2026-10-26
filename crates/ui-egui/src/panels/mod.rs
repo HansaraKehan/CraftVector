@@ -29,6 +29,7 @@ pub mod libraries;
 pub mod library_panel;
 pub mod links;
 pub mod magic_wand;
+pub(crate) mod memo;
 pub mod navigator;
 pub mod opentype;
 pub mod paragraph;
@@ -117,7 +118,7 @@ fn corner_fields(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: &str, widt
     egui::Grid::new((id, "corners")).num_columns(2).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
         for (k, label) in rectangle_corners() {
             dim_label(ui, label);
-            if let Some(v) = crate::widgets::num_field(ui, (id, "corner", k), Some(lc.radius(k)), unit, width) {
+            if let Some(v) = crate::widgets::num_field_named(ui, (id, "corner", k), Some(label), Some(lc.radius(k)), unit, width) {
                 app.run("object.setLiveShape", json!({"radius": v, "corners": [k]})).ok();
             }
             ui.end_row();
@@ -238,9 +239,9 @@ pub fn panel_menu_items(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) -> bool
 /// The ≡ panel-menu button drawn into `rect` (the right end of a panel's title/tab strip).
 pub fn panel_menu(app: &mut VectorcraftApp, ui: &mut Ui, id: &str, rect: Rect) {
     let t = Tokens::get(ui.ctx());
-    let resp = ui.interact(rect, ui.id().with(("panel-menu", id)), Sense::click());
+    let resp = ui.interact(rect, ui.scope_id().with(("panel-menu", id)), Sense::click());
     icons::paint(ui, "menu", rect.shrink(1.0), if resp.hovered() { t.text_strong } else { t.text_dim });
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tl!("Panel menu")));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tl!("Panel menu")));
     let resp = resp.on_hover_text(tl!("Panel menu"));
     egui::Popup::menu(&resp).show(|ui| {
         crate::widgets::menu_scroll(ui, |ui| {
@@ -249,7 +250,7 @@ pub fn panel_menu(app: &mut VectorcraftApp, ui: &mut Ui, id: &str, rect: Rect) {
                 ui.separator();
             }
             // The panel floats out of the dock or goes back in, as dragging its tab does.
-            let (label, cmd) = if crate::floating::group_of(&app.ui, id).is_some() {
+            let (label, cmd) = if crate::panel_docking::floats(&app.ui, id) {
                 (tl!("Dock Panel"), "window.panel.dock")
             } else {
                 (tl!("Float Panel"), "window.panel.float")
@@ -462,10 +463,11 @@ pub(crate) fn live_run(app: &mut VectorcraftApp, label: &str, cmd: &str, params:
 
 /// Per-panel UI state kept in egui memory (not document state).
 pub(crate) fn pstate<T: Clone + Default + Send + Sync + 'static>(ctx: &egui::Context, key: &str) -> T {
-    ctx.data(|d| d.get_temp::<T>(egui::Id::new(("panel-state", key)))).unwrap_or_default()
+    ctx.data(|d| d.get_temp::<T>(egui::Id::unique(("panel-state", key)))).unwrap_or_default()
 }
+/// Store per-panel UI state in egui temp memory under the `panel-state` namespace.
 pub(crate) fn set_pstate<T: Clone + Send + Sync + 'static>(ctx: &egui::Context, key: &str, v: T) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new(("panel-state", key)), v));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(("panel-state", key)), v));
 }
 
 /// [`crate::i18n::label_or_name`] in the UI language.
@@ -486,7 +488,7 @@ pub(crate) fn recent_colors_row(app: &VectorcraftApp, ui: &mut Ui) -> Option<Col
         if cell.right() > r.right() - 2.0 {
             break;
         }
-        let resp = ui.interact(cell, ui.id().with(("recent", i)), Sense::click());
+        let resp = ui.interact(cell, ui.scope_id().with(("recent", i)), Sense::click());
         crate::widgets::swatch_tile(ui, cell, &Paint::solid(*c), false, resp.hovered());
         if resp.on_hover_text(c.to_hex()).clicked() {
             chosen = Some(*c);
@@ -561,7 +563,7 @@ mod tests {
         let frame = |app: &mut crate::VectorcraftApp, events: Vec<Event>| {
             let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
                 proxy(app, ui, 36.0);
-                if let Some(c) = ctx.read_response(ui.id().with("stroke-proxy")).map(|r| r.rect.center()) {
+                if let Some(c) = ctx.read_response(ui.scope_id().with("stroke-proxy")).map(|r| r.rect.center()) {
                     stroke_at.set(c);
                 }
             });
@@ -602,6 +604,8 @@ mod tests_appearance;
 mod tests_asset_export;
 #[cfg(test)]
 mod tests_blend;
+#[cfg(test)]
+mod tests_brush_libraries;
 #[cfg(test)]
 mod tests_constrain;
 #[cfg(test)]

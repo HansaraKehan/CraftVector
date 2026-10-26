@@ -19,6 +19,7 @@ pub(super) const SPEC: DialogSpec = DialogSpec {
     ok: Some("OK"),
     min_width: 380.0,
     max_width: Some(560.0),
+    inputs: |_| &["path", "showCode"],
     ..DialogSpec::FORM
 };
 
@@ -266,8 +267,8 @@ fn code_view(app: &VectorcraftApp, ui: &mut egui::Ui, d: &Dialog) {
         o.insert("artboard".into(), json!(first.map_or(0, |n| n.saturating_sub(1))));
     }
     // One cached text, replaced when the document or the options change.
-    let key = egui::Id::new("svg-code");
-    let sig = egui::Id::new((st.uid, st.revision, opts.to_string())).value();
+    let key = egui::Id::unique("svg-code");
+    let sig = egui::Id::unique((st.uid, st.revision, opts.to_string())).value();
     let code: Arc<String> = match ui.ctx().data(|m| m.get_temp::<(u64, Arc<String>)>(key)).filter(|(s, _)| *s == sig) {
         Some((_, c)) => c,
         None => {

@@ -180,17 +180,117 @@ fn control_render_matches_a_png_export_on_white() {
     let _ = std::fs::remove_dir_all(base);
 }
 
+/// `ui.render {traceViews: true}` draws an Image Trace object in its view, as the canvas does:
+/// in Source Image view the image's blue shows beside the traced disc, where `ui.render` without
+/// it draws the tracing result on white.
+#[test]
+fn control_render_draws_the_trace_view_with_trace_views() {
+    let (mut app, tx, base) = confined("traceviews");
+    let png = base.join("in/disc.png");
+    image::RgbImage::from_fn(100, 100, |x, y| {
+        let (dx, dy) = (f64::from(x) + 0.5 - 50.0, f64::from(y) + 0.5 - 50.0);
+        if dx * dx + dy * dy <= 900.0 { image::Rgb([0, 0, 0]) } else { image::Rgb([170, 210, 255]) }
+    })
+    .save(&png)
+    .unwrap();
+    let r = request(&mut app, &tx, "app.open", json!({"path": s(png)}));
+    assert_eq!(r["ok"], true, "{r}");
+    app.run("select.all", json!({})).unwrap();
+    app.run("imageTrace.make", json!({"params": {"ignoreWhite": true}})).unwrap();
+    app.run("imageTrace.setView", json!({"view": "sourceImage"})).unwrap();
+    let pixels = |v: &Value| image::load_from_memory(&vectorcraft_format::base64_decode(v.as_str().unwrap()).unwrap()).unwrap().to_rgba8();
+    let view = pixels(&request(&mut app, &tx, "ui.render", json!({"traceViews": true}))["result"]["pngBase64"]);
+    let result = pixels(&request(&mut app, &tx, "ui.render", json!({}))["result"]["pngBase64"]);
+    let (beside, middle) = (view.get_pixel(10, 10).0, view.get_pixel(50, 50).0);
+    assert!(beside[0] < 200 && beside[2] > 245, "the source image beside the disc: {beside:?}");
+    assert!(middle[..3].iter().all(|&c| c < 60), "the disc: {middle:?}");
+    assert_eq!(result.get_pixel(10, 10).0, [255; 4], "the tracing result on white");
+    let _ = std::fs::remove_dir_all(base);
+}
+
 #[test]
 fn frames_with_injected_input_are_confined() {
     let (mut app, tx, base) = confined("synthetic");
     let r = request(&mut app, &tx, "ui.key", json!({"key": "Escape"}));
     assert_eq!(r["ok"], true, "{r}");
+    let ctx = egui::Context::default();
     let mut raw = egui::RawInput::default();
-    app.raw_input_hook(&mut raw);
+    app.raw_input_hook(&ctx, &mut raw);
     assert!(app.synthetic_frame, "the frame carrying the key");
+    // The batch is acknowledged only after a settled UI pass took it (one step per pass).
+    let mut out = ctx.run_ui(raw, |_| {});
+    out.textures_delta.clear();
     let mut raw = egui::RawInput::default();
-    app.raw_input_hook(&mut raw);
+    app.raw_input_hook(&ctx, &mut raw);
     assert!(!app.synthetic_frame, "the frames after it are the person's");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// Hidden logic-only ticks between the injection and its UI pass must not drain another step:
+/// one step per settled pass, not per hidden tick.
+#[test]
+fn hidden_ticks_without_a_ui_pass_do_not_drain_more_injected_steps() {
+    let (mut app, tx, base) = confined("gate");
+    let r = request(&mut app, &tx, "ui.key", json!({"key": "A", "text": "x"}));
+    assert_eq!(r["ok"], true, "{r}");
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    app.raw_input_hook(&ctx, &mut raw);
+    assert!(!raw.events.is_empty(), "the first step is in the host's input");
+    let queued = app.synthetic.len();
+    for _ in 0..3 {
+        let mut raw = egui::RawInput::default();
+        app.raw_input_hook(&ctx, &mut raw);
+        assert!(raw.events.is_empty(), "no new step while the previous batch is unapplied");
+    }
+    assert_eq!(app.synthetic.len(), queued, "the hidden ticks drained nothing");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// A UI pass that changes the document before taking an injected batch drops exactly that batch,
+/// including the synthetic modifier latch it set: a later real event keeps the host's modifiers.
+#[test]
+fn a_stale_injected_batch_is_dropped_with_its_modifier_latch() {
+    let (mut app, tx, base) = confined("discard");
+    let r = request(&mut app, &tx, "ui.key", json!({"key": "A", "text": "x", "cmd": true}));
+    assert_eq!(r["ok"], true, "{r}");
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    app.raw_input_hook(&ctx, &mut raw);
+    assert!(app.synthetic_modifiers, "the batch carries Cmd");
+    assert!(!raw.events.is_empty());
+    // The document changed after injection (a control request or a click switching documents):
+    // the batch no longer belongs to what the UI pass would act on.
+    app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+    app.raw_input_hook(&ctx, &mut raw);
+    assert!(raw.events.is_empty(), "the stale events are removed from the host's input");
+    assert!(!app.synthetic_frame && !app.synthetic_injected, "the batch is not applied");
+    assert!(!app.synthetic_modifiers, "its modifier latch is cleared too");
+    assert!(app.synthetic.is_empty(), "nothing further was queued");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+/// If the host's raw input no longer contains the synthetic batch exactly (another handler
+/// rewrote or interleaved events), the app cannot separate stale synthetic clicks/text from the
+/// person's input. It delivers nothing that pass and cancels the rest of the sequence.
+#[test]
+fn an_unidentifiable_stale_injected_batch_fails_closed() {
+    let (mut app, tx, base) = confined("discard-unknown");
+    let r = request(&mut app, &tx, "ui.key", json!({"key": "A", "text": "x", "cmd": true}));
+    assert_eq!(r["ok"], true, "{r}");
+    let ctx = egui::Context::default();
+    let mut raw = egui::RawInput::default();
+    app.raw_input_hook(&ctx, &mut raw);
+    assert!(raw.events.len() > 1, "the batch has a modifier companion and the key");
+    // Rewrite one event so the exact subsequence can no longer be found.
+    let last = raw.events.len() - 1;
+    raw.events[last] = egui::Event::Text("host".into());
+    app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+    app.raw_input_hook(&ctx, &mut raw);
+    assert!(raw.events.is_empty(), "unidentifiable stale input is never delivered");
+    assert!(!app.synthetic_frame && !app.synthetic_injected, "the stale batch is not applied");
+    assert!(!app.synthetic_modifiers, "its modifier latch is cleared too");
+    assert!(app.synthetic.is_empty(), "the rest of the stale synthetic sequence is cancelled");
     let _ = std::fs::remove_dir_all(base);
 }
 

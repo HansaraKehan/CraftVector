@@ -603,7 +603,7 @@ struct Names {
 /// The name of the entry holding `bytes`: from their content (128 bits of hash and the length), so
 /// identical images share one entry and one written before isn't written again.
 fn blob_name(bytes: &Arc<Vec<u8>>) -> String {
-    let mut guard = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = NAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Names { by_address, live_after_sweep } = &mut *guard;
     let names = by_address.get_or_insert_with(Default::default);
     let address = Arc::as_ptr(bytes) as usize;
@@ -996,6 +996,9 @@ fn restore_one(s: &mut Session, store: &Arc<dyn RecoveryStore>, file: &str) -> R
     let meta_bytes = store.read(&format!("{file}{META_EXT}")).unwrap_or_default();
     let meta: Meta = serde_json::from_slice(&meta_bytes).unwrap_or_default();
     let (mut doc, _, mut warnings) = fileio::native_file(&bytes).map_err(|e| EngineError::Other(format!("recovery copy `{file}`: {e}")))?;
+    // A frame whose first paragraph continues from the frame before draws it without the
+    // paragraph's first-line indent and list marker.
+    super::threads::mark_continued(&mut doc);
     // The images, from the entries of the copy's area.
     let from = file.split_once('/').map_or("", |(a, _)| a);
     let mut blobs = vec![];

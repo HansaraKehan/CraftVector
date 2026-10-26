@@ -162,6 +162,7 @@ fn lines_of_clusters(lines: &[&[(usize, usize, f64)]], rtl: bool) -> TextLayout 
                 scale: 1.0,
                 image: None,
                 colour: None,
+                bend: None,
             });
             x += advance;
         }

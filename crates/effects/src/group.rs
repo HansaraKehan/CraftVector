@@ -117,7 +117,7 @@ pub const PATHFINDER_MAX_OVERLAPS: usize = 16_384;
 struct Counts(Vec<isize>);
 
 // `isolate_lowest_one` is still unstable in Rust 1.96, and the workspace builds on 1.95 (rust-version).
-#[allow(clippy::manual_isolate_lowest_one)]
+#[allow(unknown_lints, clippy::manual_isolate_lowest_one)]
 impl Counts {
     fn add(&mut self, slot: usize, d: isize) {
         let mut i = slot + 1;

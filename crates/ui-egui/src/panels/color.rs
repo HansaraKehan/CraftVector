@@ -501,7 +501,7 @@ fn tint_rows(ui: &mut Ui, tint: &Tint, slider_w: f32, field_w: f32) -> Option<(f
         let percent = (tint.tint * 100.0).round() as f64;
         let shown = widgets::SliderValue::field(percent, 0.0..=100.0, "%", 0);
         let (nv, phase) = widgets::color_slider_valued(ui, ("color-slider", "tint"), "T", Some(shown), tint.tint, slider_w, &track);
-        let field = widgets::plain_field(ui, ("color-field", "tint"), percent, "%", 0, field_w);
+        let field = widgets::plain_field_named(ui, ("color-field", "tint"), Some("T"), percent, "%", 0, field_w);
         match (nv, field) {
             (Some(v), _) => Some(((v * 100.0).round() / 100.0, phase)),
             (None, Some(v)) => Some(((v as f32 / 100.0).clamp(0.0, 1.0), Live::Released)),
@@ -522,7 +522,7 @@ enum SpectrumHit {
 fn spectrum(ui: &mut Ui, mode: Mode, size: egui::Vec2) -> Option<SpectrumHit> {
     let t = Tokens::get(ui.ctx());
     let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-    let resp = ui.interact(r, ui.id().with("color-spectrum"), Sense::click_and_drag());
+    let resp = ui.interact(r, ui.scope_id().with("color-spectrum"), Sense::click_and_drag());
     ui.painter().add(widgets::color_mesh(r, (72, 12), &|x, y| to32(&spectrum_at(mode, x, y))));
     ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, t.border), StrokeKind::Outside);
     if let Some(p) = resp.hover_pos() {
@@ -633,7 +633,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                         };
                         new = Some((from_components(mode, &c2), phase, c2));
                     }
-                    if let Some(fv) = widgets::plain_field(ui, ("color-field", i), v as f64, mode.suffix(i), 0, field_w)
+                    if let Some(fv) = widgets::plain_field_named(ui, ("color-field", i), Some(lbl), v as f64, mode.suffix(i), 0, field_w)
                         && enabled
                     {
                         let mut c2 = comps.clone();
@@ -674,7 +674,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         if matches!(mode, Mode::Rgb | Mode::WebSafe | Mode::Hsb) {
             ui.add_space((ui.available_width() - 96.0).max(4.0));
             let hex = color.map(|c| hex_digits(&c)).unwrap_or_default();
-            if let Some(c) = widgets::hex_field(ui, "hex", &hex).as_deref().and_then(parse_hex) {
+            if let Some(c) = widgets::hex_field_named(ui, "hex", Some(tl!("Color")), &hex).as_deref().and_then(parse_hex) {
                 new = Some((c, Live::Released, components(mode, &c)));
             }
         }
@@ -779,7 +779,7 @@ mod tests {
         let input = egui::RawInput { events, ..Default::default() };
         let mut full = ctx.run_ui(input, |ui| {
             show(app, ui);
-            out = (ctx.read_response(ui.id().with(&id)).map(|r| r.rect), ui.min_rect().height());
+            out = (ctx.read_response(ui.scope_id().with(&id)).map(|r| r.rect), ui.min_rect().height());
         });
         full.textures_delta.clear();
         out
@@ -1094,7 +1094,7 @@ mod tests {
             let mut rect = None;
             let mut out = ctx.run_ui(input, |ui| {
                 crate::panels::proxy(app, ui, 40.0);
-                rect = ctx.read_response(ui.id().with("stroke-proxy")).map(|r| r.rect);
+                rect = ctx.read_response(ui.scope_id().with("stroke-proxy")).map(|r| r.rect);
             });
             out.textures_delta.clear();
             rect

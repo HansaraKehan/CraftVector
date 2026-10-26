@@ -801,6 +801,68 @@ fn brush_art_draws_edits_of_the_symbols_and_patterns_it_shows() {
     }
 }
 
+/// As above, with symbols `Dot` (a blue square) and `Other` (a red square with a brushed line),
+/// and patterns `Fill` (a green square) and `Spare` (a red square with a brushed line). After a
+/// frame, the next one draws as a new renderer does when two symbols or two patterns swap names,
+/// their art left as it is: the brush art's instance of `Dot` or its square painted with `Fill`
+/// then shows art that draws a brushed stroke.
+#[test]
+fn brush_art_draws_renamed_symbols_and_patterns_it_shows() {
+    let _fonts = fonts_steady();
+    use vectorcraft_brush::{Brush, BrushKind, Scatter};
+    use vectorcraft_doc::pattern::{PatternDef, pattern_paint};
+    use vectorcraft_geom::shapes::{line, rectangle};
+    let square = |d: &mut Document, paint: Paint| filled(d, rectangle(Rect::new(-4.0, -4.0, 4.0, 4.0)), paint, vec![]);
+    let art = |d: &mut Document, paint: Paint, brushed: bool| {
+        let mut members = vec![Arc::new(square(d, paint))];
+        if brushed {
+            members.push(Arc::new(brushed_line(d)));
+        }
+        Node::group(d.alloc_id(), members)
+    };
+    let doc = || {
+        let mut d = Document::new(200.0, 100.0);
+        for (name, paint, brushed) in
+            [("Dot", Paint::solid(Color::rgb(0.0, 0.0, 1.0)), false), ("Other", Paint::solid(Color::rgb(1.0, 0.0, 0.0)), true)]
+        {
+            let a = art(&mut d, paint, brushed);
+            d.symbols.push(vectorcraft_doc::Symbol { name: name.into(), art: Arc::new(a) });
+        }
+        for (name, paint, brushed) in
+            [("Fill", Paint::solid(Color::rgb(0.0, 0.6, 0.0)), false), ("Spare", Paint::solid(Color::rgb(1.0, 0.0, 0.0)), true)]
+        {
+            let a = art(&mut d, paint, brushed);
+            let mut def = PatternDef::new(name, vec![Arc::new(a)]);
+            def.tile = Rect::new(-6.0, -6.0, 6.0, 6.0);
+            d.patterns.push(def);
+        }
+        let id = d.alloc_id();
+        let instance = Node::new(id, NodeKind::SymbolInstance { symbol: "Dot".into(), xf: Affine::translate((0.0, -8.0)) });
+        let mut painted = square(&mut d, pattern_paint("Fill"));
+        painted.transform(Affine::translate((0.0, 8.0)), true);
+        let scatter = Node::group(d.alloc_id(), vec![Arc::new(instance), Arc::new(painted)]);
+        let mut lib = vectorcraft_brush::library(&d);
+        lib.push(Brush { name: "Dots".into(), kind: BrushKind::Scatter(Scatter { art: scatter, spacing: (150.0, 150.0), ..Default::default() }) });
+        vectorcraft_brush::store(&mut d, &lib);
+        let mut ap = vectorcraft_doc::Appearance::basic(Paint::None, Paint::solid(Color::BLACK), 1.0);
+        if let Some(s) = ap.stroke_mut() {
+            s.brush = Some("Dots".into());
+        }
+        let path = Node::path(d.alloc_id(), line((20.0, 50.0).into(), (180.0, 50.0).into()), ap);
+        let l = d.layers[0].id;
+        d.insert(Some(l), usize::MAX, path).unwrap();
+        d
+    };
+    edit_draws_as_new(doc(), |d| {
+        d.symbols[0].name = "Other".into();
+        d.symbols[1].name = "Dot".into();
+    });
+    edit_draws_as_new(doc(), |d| {
+        d.patterns[0].name = "Spare".into();
+        d.patterns[1].name = "Fill".into();
+    });
+}
+
 /// A path of the document and an instance of symbol `Wave` (a group holding another path) are
 /// stroked with scatter brush `Bent`, whose art is an arc envelope around a green band: the second
 /// frame evaluates none of the envelopes in their brush art again, and draws what the first drew
@@ -1794,8 +1856,8 @@ fn missing_font_type(d: &mut Document, fx: vectorcraft_doc::Effect) -> Node {
 
 /// Raster effects are made again when a document or layer setting they read changes: the raster
 /// resolution under De-Interlace, Page Knockout Group around a blurred group of translucent
-/// objects, Document Setup's highlight of substituted fonts under a blur, and the layer's Dim
-/// Images under an image's blur.
+/// objects, the Highlight Substituted Fonts and Highlight Alternate Glyphs preferences under a
+/// blur, and the layer's Dim Images under an image's blur.
 #[test]
 fn rasters_draw_document_and_layer_setting_edits() {
     let _fonts = fonts_steady();
@@ -1823,14 +1885,29 @@ fn rasters_draw_document_and_layer_setting_edits() {
     edit_draws_as_new(with_art(d, vec![group]), |d| d.page_knockout = true);
     // Blurred type in a missing family, with the substitution highlights on screen.
     let mut d = Document::new(200.0, 100.0);
-    d.setup.highlight_substituted_fonts = false;
     let blurred = missing_font_type(&mut d, effect("blur.gaussian", serde_json::json!({"radius": 1.0})));
     let mut d = with_art(d, vec![blurred]);
     let highlights = RenderOptions { background: Some([255, 255, 255, 255]), highlight_substitutions: true, ..Default::default() };
+    let unhighlighted = RenderOptions { highlight_substituted_fonts: false, ..highlights.clone() };
     // The first lookup of the missing family catalogs the installed fonts, which changes the font
     // generation: a frame drawn first does that.
     Renderer::new().render(&d, 200, 100, Affine::IDENTITY, &highlights);
-    draws_as_new(&mut d, &highlights, &highlights, |d| d.setup.highlight_substituted_fonts = true);
+    // Preferences › Type › Highlight Substituted Fonts turned on between two frames.
+    draws_as_new(&mut d, &unhighlighted, &highlights, |_| {});
+    // Blurred type with a ligature, with Highlight Alternate Glyphs turned on between two frames.
+    let mut d = Document::new(200.0, 100.0);
+    let mut ligature = missing_font_type(&mut d, effect("blur.gaussian", serde_json::json!({"radius": 1.0})));
+    if let NodeKind::Text(t) = &mut ligature.kind {
+        **t = vectorcraft_doc::text::TextObject::point(
+            vectorcraft_geom::Point::new(10.0, 60.0),
+            "fi",
+            vectorcraft_doc::text::CharStyle { size: 48.0, font_family: "Source Serif 4".into(), ..Default::default() },
+        );
+    }
+    let mut d = with_art(d, vec![ligature]);
+    let alternates = RenderOptions { highlight_alternate_glyphs: true, ..highlights.clone() };
+    Renderer::new().render(&d, 200, 100, Affine::IDENTITY, &highlights);
+    draws_as_new(&mut d, &highlights, &alternates, |_| {});
     // The layer of a blurred image dims its images to 50%.
     edit_draws_as_new(blurred_image_doc("dimmed", 106), |d| {
         if let NodeKind::Layer { dim_images, .. } = &mut Arc::make_mut(&mut d.layers[0]).kind {

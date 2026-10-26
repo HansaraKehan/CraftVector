@@ -306,8 +306,9 @@ fn save_file_waits_for_the_file_in_the_app() {
         assert_eq!(r.is_error, ui, "the app's error is the call's: {r:?}");
         let [(method, params)] = &b.seen[..] else { panic!("one call: {:?}", b.seen) };
         assert_eq!(method, "app.save");
-        // The tool sends the path made absolute (on Windows, against the current drive).
-        let path = std::path::absolute("/out/a.vectorcraft").unwrap().to_string_lossy().into_owned();
+        // The tool sends the app the path made absolute (on Windows, against the current drive), and
+        // a headless session the path as given.
+        let path = if ui { std::path::absolute("/out/a.vectorcraft").unwrap().to_string_lossy().into_owned() } else { "/out/a.vectorcraft".into() };
         let mut want = json!({"path": path});
         if ui {
             want["wait"] = json!(true);

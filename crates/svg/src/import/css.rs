@@ -18,7 +18,8 @@ pub(super) type XNode<'a, 'i> = roxmltree::Node<'a, 'i>;
 /// `name: value` declarations of a block or `style` attribute, with their `!important` flag. The
 /// `font` shorthand becomes its longhands, as usvg reads it for the rest of the drawing (#1557).
 pub(super) fn parse_decls(s: &str) -> Vec<(String, String, bool)> {
-    s.split(';')
+    split_decls(s)
+        .into_iter()
         .filter_map(|d| {
             let (k, v) = d.split_once(':')?;
             let v = v.trim();
@@ -35,6 +36,36 @@ pub(super) fn parse_decls(s: &str) -> Vec<(String, String, bool)> {
             _ => vec![(k, v, important)],
         })
         .collect()
+}
+
+/// Splits on the `;`s that are outside quoted strings and parentheses (`url(data:…;base64,…)`).
+fn split_decls(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut depth, mut quote, mut escaped) = (0, 0usize, None::<char>, false);
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ';' if depth == 0 => {
+                    parts.push(s.get(start..i).unwrap_or_default());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.push(s.get(start..).unwrap_or_default());
+    parts
 }
 
 /// The longhands of a `font` shorthand: those it leaves out back to their initial values. None
@@ -465,6 +496,18 @@ mod tests {
             assert_eq!(parse_decls(s), [("fill".to_string(), "red".to_string(), true)], "{s}");
         }
         assert_eq!(parse_decls("fill: red !importantx"), [("fill".to_string(), "red !importantx".to_string(), false)]);
+    }
+
+    #[test]
+    fn semicolons_in_quotes_and_parens_do_not_split() {
+        let d = |k: &str, v: &str| (k.to_string(), v.to_string(), false);
+        assert_eq!(parse_decls("font-family:'A;B'; fill:red"), [d("font-family", "'A;B'"), d("fill", "red")]);
+        assert_eq!(parse_decls("font-family:\"A;B\"; fill:red"), [d("font-family", "\"A;B\""), d("fill", "red")]);
+        assert_eq!(
+            parse_decls("fill:url(data:image/svg+xml;base64,AAA); stroke:red"),
+            [d("fill", "url(data:image/svg+xml;base64,AAA)"), d("stroke", "red")]
+        );
+        let _ = parse_decls("font-family:'A;B; fill:red");
     }
 
     fn with_doc(svg: &str, f: impl FnOnce(&roxmltree::Document, &Styles)) {

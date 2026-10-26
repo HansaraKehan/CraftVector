@@ -133,7 +133,7 @@ shown_when = [
     "The Selection tool after a click on the out port or the in port of selected area type or type on a path, threaded, overflowing or not: the pointer carries that text until a click threads it into a closed path, area type or type on a path, a click on empty canvas makes a new frame of the same kind and shape there, or a drag draws the new frame; from the in port the frame placed comes before the clicked one. Escape or another tool drops it.",
 ]
 hotspot = "Where the new frame's top-left corner goes (the click), or the path clicked."
-look = "A small block of text lines: the overflow text the pointer carries. Until it is drawn it borrows the I-beam (Text)."
+look = "A small block of text lines: the overflow text the pointer carries."
 
 # ── Pen family ────────────────────────────────────────────────────────────────────────────────────
 
@@ -146,7 +146,7 @@ shown_when = [
     "With Use Precise Cursors on, the crosshair shows instead.",
 ]
 hotspot = "The nib's tip."
-look = "A pen nib. Every Pen-family cursor is this nib with a different badge."
+look = "A fountain-pen nib pointing up-left along the selection arrow's axis (so swapping to the selection tools doesn't rotate the cursor), its slit widening into the breather hole and its heel clipped at the back; the shape approximates the pen tool's icon. Every Pen-family cursor is this nib with a different badge."
 
 [[cursor]]
 id = "PenDrawing"
@@ -534,6 +534,13 @@ shown_when = ["The Pencil tool: draws a freeform path; starting near the end of 
 hotspot = "The lead tip."
 
 [[cursor]]
+id = "PencilNew"
+group = "Drawing and editing tools"
+shown_when = ["The Pencil tool before a press that draws a new freehand path: the pointer is not within Edit Selected Paths of a selected path that the press would continue from an end or redraw. Over such a path, and while a stroke is drawn, the Pencil cursor has no star."]
+hotspot = "The lead tip."
+look = "The Pencil cursor with a small star badge, where PencilClose has its ring."
+
+[[cursor]]
 id = "PencilClose"
 group = "Drawing and editing tools"
 shown_when = [
@@ -549,6 +556,13 @@ group = "Drawing and editing tools"
 shown_when = ["The Pencil tool with Shift or Alt held before a press, except with Alt held when Alt key toggles to Smooth Tool is on: the press draws a straight line, at 45° steps from the Constrain Angle when Shift is held and at any angle with Alt alone."]
 hotspot = "The lead tip."
 look = "The Pencil cursor with a short straight-line badge, where PencilClose has its ring."
+
+[[cursor]]
+id = "PencilContinue"
+group = "Drawing and editing tools"
+shown_when = ["The Pencil tool over an end of a selected open path, within Edit Selected Paths, with Shift or Alt held before a press, except with Alt held when Alt key toggles to Smooth Tool is on: the press draws a straight line that continues the path from that end."]
+hotspot = "The lead tip."
+look = "PencilStraight's badge with a small filled square at the line's lower end (the end point the line continues from)."
 
 [[cursor]]
 id = "Paintbrush"

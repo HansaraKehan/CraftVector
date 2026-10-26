@@ -245,7 +245,7 @@ pub fn font_menu(
     sample: Option<&str>,
     look: MenuLook,
 ) -> Option<FontPick> {
-    let state_id = ui.id().with(&id).with("font-menu");
+    let state_id = ui.scope_id().with(&id).with("font-menu");
     let mut st: MenuState = ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
     let mut drawn = false;
     let picked = widgets::combo(ui, &id, current, width, true, |ui| {
@@ -522,7 +522,7 @@ fn list(ui: &mut Ui, state_id: egui::Id, st: &mut MenuState, current: &str, samp
             }
         }
     });
-    st.scrolled = shown.state.offset.y;
+    st.scrolled = shown.state.clamped_offset().y;
     if let Some(f) = toggled {
         if st.expanded.contains(&f) {
             st.expanded.retain(|e| *e != f);
@@ -721,7 +721,7 @@ const PREVIEWING: &str = "font-previewing";
 
 /// Where the open font menu was drawn last: (pass, its popup's layer).
 fn open_id() -> egui::Id {
-    egui::Id::new("font-menu-open")
+    egui::Id::unique("font-menu-open")
 }
 
 /// Undo a preview whose menu is gone (its panel wasn't drawn: the text was deselected, the panel
@@ -885,7 +885,7 @@ mod tests {
         for _ in 0..3 {
             let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(area), ..Default::default() }, |ui| {
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area));
-                super::list(&mut child, egui::Id::new("fonts"), &mut st, "", None, look);
+                super::list(&mut child, egui::Id::unique("fonts"), &mut st, "", None, look);
             });
             out.textures_delta.clear();
             stars = out
@@ -956,7 +956,7 @@ mod tests {
             let mut out = ctx.run_ui(input, |ui| {
                 picked = super::list(
                     ui,
-                    egui::Id::new("recent-test"),
+                    egui::Id::unique("recent-test"),
                     &mut st,
                     &names[2],
                     None,
@@ -973,7 +973,14 @@ mod tests {
             [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() }).to_vec()
         };
         assert_eq!(frame(key(egui::Key::ArrowDown), &recent).0, Some(super::FontPick::Preview(names[1].clone(), None)));
-        assert_eq!(frame(key(egui::Key::ArrowDown), &recent).0, Some(super::FontPick::Preview(names[0].clone(), None)), "skip Fonts heading");
+        // Other tests add fonts to the process-wide database while this one runs, so the first
+        // family under the Fonts heading need not be the one this test's earlier snapshot named.
+        // Read it from the rows this frame built: the highlight must skip the heading and land on
+        // that family, not on a heading or a row from the recent section.
+        let (picked, rows) = frame(key(egui::Key::ArrowDown), &recent);
+        assert_eq!(rows.get(3), Some(&Row::Heading("Fonts")), "{rows:?}");
+        let (first, style) = rows.get(4).and_then(Row::pick).expect("a family below the Fonts heading");
+        assert_eq!(picked, Some(super::FontPick::Preview(first, style)), "skip Fonts heading");
         assert_eq!(frame(key(egui::Key::ArrowUp), &recent).0, Some(super::FontPick::Preview(names[1].clone(), None)));
         // Updating recent history while the menu is open must not retarget the highlight.
         let updated = vec![names[1].clone()];
@@ -1003,7 +1010,7 @@ mod tests {
                 |ui| {
                     pick = super::list(
                         ui,
-                        egui::Id::new("filtered-recent"),
+                        egui::Id::unique("filtered-recent"),
                         &mut st,
                         &names[2],
                         None,
@@ -1041,7 +1048,7 @@ mod tests {
                 |ui| {
                     super::list(
                         ui,
-                        egui::Id::new("recent-at-top"),
+                        egui::Id::unique("recent-at-top"),
                         &mut st,
                         current,
                         None,
@@ -1110,7 +1117,7 @@ mod tests {
                 |ui| {
                     super::list(
                         ui,
-                        egui::Id::new("variable-filter"),
+                        egui::Id::unique("variable-filter"),
                         st,
                         "Source Sans 3",
                         None,

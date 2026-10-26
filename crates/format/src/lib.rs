@@ -597,6 +597,8 @@ pub fn load_file(bytes: &[u8]) -> Result<NativeFile, FormatError> {
     doc.setup.keep_in_range();
     // Untrusted: capped, named and pointing at objects the file has.
     doc.tidy_saved_selections();
+    // Untrusted: capped, named and with a zoom and centre the canvas can show.
+    doc.tidy_views();
     doc.tidy_graph_designs();
     doc.raster_effects.add_around = doc.raster_effects.add_around.clamp(0.0, vectorcraft_doc::rastersettings::MAX_ADD_AROUND);
     let mut depth_notes = vec![];
@@ -694,16 +696,22 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for c in clean.chunks(4) {
+    let groups = clean.len() / 4;
+    for (i, c) in clean.chunks(4).enumerate() {
         let mut n = 0u32;
         let mut pad = 0;
         for &b in c {
             n <<= 6;
             if b == b'=' {
                 pad += 1;
+            } else if pad > 0 {
+                return None;
             } else {
                 n |= val(b)?;
             }
+        }
+        if pad > 2 || (pad > 0 && i + 1 != groups) {
+            return None;
         }
         out.push((n >> 16) as u8);
         if pad < 2 {
@@ -781,5 +789,15 @@ mod tests {
             assert_eq!(base64_decode(&base64_encode(s)).unwrap(), s);
         }
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_rejects_misplaced_padding() {
+        for s in ["====", "A===", "AA=A", "=AAA", "QQ==QUJD", "QUI=QUJD"] {
+            assert_eq!(base64_decode(s), None, "{s}");
+        }
+        assert_eq!(base64_decode("QQ=="), Some(vec![0x41]));
+        assert_eq!(base64_decode("QUI="), Some(vec![0x41, 0x42]));
+        assert_eq!(base64_decode("QUJD"), Some(vec![0x41, 0x42, 0x43]));
     }
 }

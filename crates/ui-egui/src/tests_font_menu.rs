@@ -386,6 +386,7 @@ fn the_search_field_stays_put_while_the_list_scrolls() {
             delta: egui::vec2(0.0, dy),
             modifiers: Default::default(),
             phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
         };
         frame(vec![egui::Event::PointerMoved(over_list), wheel]);
         for _ in 0..10 {

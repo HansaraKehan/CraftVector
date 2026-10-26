@@ -298,7 +298,18 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                 let angle = g.geom.map_or(g.angle, |x| x.angle_deg());
                 let set = ui
                     .add_enabled_ui(placed, |ui| {
-                        widgets::spin_plain(ui, "grad-angle", (angle * 10.0).round() / 10.0, "°", 1, 104.0, 1.0, -180.0, &ANGLE_PRESETS)
+                        widgets::spin_plain_named(
+                            ui,
+                            "grad-angle",
+                            Some(tl!("Angle")),
+                            (angle * 10.0).round() / 10.0,
+                            "°",
+                            1,
+                            104.0,
+                            1.0,
+                            -180.0,
+                            &ANGLE_PRESETS,
+                        )
                     })
                     .inner;
                 if let Some(a) = set {
@@ -312,7 +323,11 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             ui.horizontal(|ui| {
                 icons::icon(ui, "scaling", 15.0, if radial { t.icon } else { t.text_disabled }).on_hover_text(tl!("Aspect Ratio"));
                 let asp = g.geom.map_or(100.0, |x| (x.aspect * 1000.0).round() / 10.0);
-                let set = ui.add_enabled_ui(radial, |ui| widgets::spin_plain(ui, "grad-aspect", asp, "%", 1, 104.0, 1.0, 0.5, &ASPECT_PRESETS)).inner;
+                let set = ui
+                    .add_enabled_ui(radial, |ui| {
+                        widgets::spin_plain_named(ui, "grad-aspect", Some(tl!("Aspect Ratio")), asp, "%", 1, 104.0, 1.0, 0.5, &ASPECT_PRESETS)
+                    })
+                    .inner;
                 if let Some(a) = set {
                     edit(app, json!({"aspect": a}), Live::Released);
                 }
@@ -436,7 +451,7 @@ fn thumbnail(app: &mut VectorcraftApp, ui: &mut Ui, g: &GradientPaint, is_grad: 
     widgets::drag_source(ui, &resp, || PanelDrag::paint(Paint::Gradient(Box::new(g.clone()))));
     let dr = Rect::from_min_size(r.right_top() + vec2(1.0, 0.0), vec2(14.0, 40.0));
     ui.advance_cursor_after_rect(dr);
-    let dresp = ui.interact(dr, ui.id().with("grad-swatches"), Sense::click());
+    let dresp = ui.interact(dr, ui.scope_id().with("grad-swatches"), Sense::click());
     icons::paint(ui, "chevron-down", Rect::from_center_size(dr.center(), vec2(12.0, 12.0)), if dresp.hovered() { t.text_strong } else { t.icon });
     let dresp = dresp.on_hover_text(tl!("Gradient swatches"));
     egui::Popup::menu(&dresp).show(|ui| {
@@ -609,8 +624,8 @@ fn ramp(app: &mut VectorcraftApp, ui: &mut Ui, g: &Gradient, is_grad: bool) {
     // The ramp and the strip below it, under the stops and diamonds (interacted first): a click
     // below adds a stop, and without a gradient either applies one.
     let below = Rect::from_min_max(pos2(bar.left(), bar.bottom()), pos2(bar.right(), area.bottom()));
-    let add_resp = ui.interact(below, ui.id().with("grad-add"), Sense::click());
-    let bar_resp = ui.interact(bar, ui.id().with("grad-bar"), Sense::click());
+    let add_resp = ui.interact(below, ui.scope_id().with("grad-add"), Sense::click());
+    let bar_resp = ui.interact(bar, ui.scope_id().with("grad-bar"), Sense::click());
     if add_resp.hovered() && is_grad {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
     }
@@ -628,7 +643,7 @@ fn ramp(app: &mut VectorcraftApp, ui: &mut Ui, g: &Gradient, is_grad: bool) {
         let Some(p) = midpoint_pos(stops, i) else { continue };
         let c = pos2(x_of(p), bar.top() - 5.0);
         let rect = Rect::from_center_size(c, vec2(10.0, 10.0));
-        let resp = ui.interact(rect, ui.id().with(("grad-mid", i)), Sense::click_and_drag());
+        let resp = ui.interact(rect, ui.scope_id().with(("grad-mid", i)), Sense::click_and_drag());
         let lit = drag == Drag::Mid(i) || mid_sel == Some(i) || resp.hovered();
         let pts = vec![c + vec2(0.0, -4.0), c + vec2(4.0, 0.0), c + vec2(0.0, 4.0), c + vec2(-4.0, 0.0)];
         ui.painter().add(egui::Shape::convex_polygon(pts, if lit { Color32::WHITE } else { t.icon }, Stroke::new(1.0, t.border)));
@@ -659,7 +674,7 @@ fn ramp(app: &mut VectorcraftApp, ui: &mut Ui, g: &Gradient, is_grad: bool) {
         let x = x_of(s.offset);
         let m = marker(s.offset);
         let top = m.top();
-        let resp = ui.interact(m, ui.id().with(("grad-stop", i)), Sense::click_and_drag());
+        let resp = ui.interact(m, ui.scope_id().with(("grad-stop", i)), Sense::click_and_drag());
         let (dragging_this, copy) = match drag {
             Drag::Stop { index, copy } => (index == i, copy),
             _ => (false, false),
@@ -896,10 +911,15 @@ mod tests {
             v
         }
 
-        /// The rect of the widget its parent ui keyed `key` (last frame).
+        /// The rect of the widget keyed `key` (last frame). egui 0.37's `WidgetRect.parent_id` is
+        /// the parent Ui's unstable `unique_id`, not the stable `scope_id` widgets are salted with;
+        /// debug builds remember the `with(key)` that made each id, so match that.
         fn widget(&self, key: impl std::hash::Hash + std::fmt::Debug + Copy) -> Rect {
+            let suffix = format!(".with({key:?})");
             self.ctx
-                .viewport(|vp| vp.prev_pass.widgets.layers().flat_map(|(_, w)| w.iter()).find(|w| w.id == w.parent_id.with(key)).map(|w| w.rect))
+                .viewport(|vp| {
+                    vp.prev_pass.widgets.layers().flat_map(|(_, w)| w.iter()).find(|w| format!("{:?}", w.id).ends_with(&suffix)).map(|w| w.rect)
+                })
                 .expect("widget drawn")
         }
 
@@ -1189,5 +1209,26 @@ mod tests {
         assert!(texts.iter().any(|(t, _)| t == "#FFFFFF"), "the stop's colour row: {texts:?}");
         stop_eyedropper(&mut app);
         assert_eq!((app.session.tool_id(), app.session.tool_options()), ("eyedropper", json!({"stop": "gradient", "brushKeyColor": false})));
+    }
+
+    /// The gradient panel names its Angle and Aspect Ratio inputs.
+    #[test]
+    fn angle_and_aspect_fields_are_named() {
+        use egui_kittest::kittest::Queryable;
+        let app = app(json!({"gradient": {}}));
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(280.0, 640.0)).with_accessibility_check(false).build_ui_state(
+            move |ui, app: &mut VectorcraftApp| {
+                if !std::mem::replace(&mut fonts, true) {
+                    crate::theme::install_fonts(ui.ctx());
+                    return;
+                }
+                show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let _ = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Angle");
+        let _ = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Aspect Ratio");
     }
 }

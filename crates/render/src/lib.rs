@@ -18,7 +18,7 @@ mod ink;
 mod live;
 mod lru;
 mod paint;
-pub use paint::decode_failures;
+pub use paint::{decode_failures, reduced_size};
 mod pattern;
 pub mod placed_document;
 pub mod proof;
@@ -37,9 +37,9 @@ use ink::Ink;
 use lru::FrameCache;
 
 pub use brush_fx::instance_art;
-pub use changed::{Changed, changed, view_pixels};
+pub use changed::{Changed, changed, placed_area, view_pixels};
 pub use effects::stroke::width_outline;
-pub use images::{IMAGE_CACHE_MAX, image_cache_bytes, set_image_cache_budget};
+pub use images::{IMAGE_CACHE_MAX, image_cache_bytes, newly_undecodable, set_image_cache_budget};
 pub use live::expand_live;
 pub use pattern::render_pattern_swatch;
 pub use vectorcraft_effects as effects;
@@ -145,8 +145,12 @@ pub struct RenderOptions {
     /// View Opacity Mask (Alt-click the mask thumbnail): instead of the artwork, show this object's
     /// opacity mask alone as its coverage in greyscale (white = opaque, black = transparent).
     pub mask_view: Option<NodeId>,
-    /// Screen view: highlight substituted fonts and glyphs as Document Setup asks.
+    /// Screen view: highlight substituted fonts and glyphs, as Preferences › Type and Document
+    /// Setup ask.
     pub highlight_substitutions: bool,
+    /// Screen view: Preferences › Type › Highlight Substituted Fonts. Pink behind text drawn in a
+    /// substitute for a missing font, in every document (on by default).
+    pub highlight_substituted_fonts: bool,
     /// Screen view: Preferences › Type › Highlight Alternate Glyphs. Pink behind glyphs OpenType
     /// features substituted (ligatures, contextual forms), not Document Setup's missing-glyph
     /// highlights.
@@ -182,6 +186,9 @@ pub struct RenderOptions {
     /// (box-filtered from the full image, kept with the decoded images), so the full image needn't
     /// stay in memory or be sampled. Off, images always sample their full pixels (exports).
     pub image_mips: bool,
+    /// Screen views: an image whose pixels can't be decoded draws as a light gray box crossed
+    /// from corner to corner. Off, it draws nothing (exports, which report it instead).
+    pub mark_undecoded_images: bool,
     /// Screen views while an interaction is in progress (a drag, a dialog's preview): an object
     /// whose content only moved since an earlier frame draws its cached drop shadows, outer glows
     /// and filtered content from the rasters made then, at the nearest whole pixel, without
@@ -266,6 +273,7 @@ impl Default for RenderOptions {
             guide: ([0x4a, 0xd8, 0xff], false),
             mask_view: None,
             highlight_substitutions: false,
+            highlight_substituted_fonts: true,
             highlight_alternate_glyphs: false,
             anti_alias: AntiAlias::Art,
             progressive_placed: false,
@@ -276,6 +284,7 @@ impl Default for RenderOptions {
             precise: false,
             supersample: false,
             image_mips: false,
+            mark_undecoded_images: false,
             interacting: false,
             dragging: false,
             rich_black: false,
@@ -534,6 +543,9 @@ pub struct Renderer {
     fx_arts: FrameCache<usize, FxArtEntry>,
     /// Symbol art as instances and inline graphics draw it (see [`Self::placed_art`]).
     placed_arts: FrameCache<PlacedKey, PlacedEntry>,
+    /// The bitmap clock of [`placed_document`] when this frame first drew a placed document from
+    /// a bitmap: the bitmaps drawn since then are not dropped to make room for those it asks for.
+    placed_frame: Option<u64>,
     /// Layers open around the drawing point in the current context: a non-isolated group can copy
     /// its backdrop only when there are none (see [`Self::group`]).
     nested: u32,
@@ -582,6 +594,10 @@ pub struct Renderer {
     /// The art the last frame drew with Overprint Preview or Separations Preview: the next frame
     /// draws it again for the objects that have not changed ([`proof::prepare`]).
     proof_art: Option<proof::Prepared>,
+    /// Width of [`Self::hairline`] in the pixels being drawn: 1, or the supersampling factor while
+    /// a supersampled render draws its larger frame, so outlines stay one output pixel wide. Type
+    /// outlines and dotted guides scale by it too.
+    hairline: f64,
 }
 
 /// How deep inline graphics nest (text in a symbol shown inline in text…) before they draw nothing.
@@ -679,6 +695,7 @@ impl Renderer {
             shape_of: 0,
             fx_arts: FrameCache::new(lru::FX_ART_BUDGET, 256),
             placed_arts: FrameCache::new(lru::PLACED_ART_BUDGET, 256),
+            placed_frame: None,
             nested: 0,
             backdrop: None,
             blends: PtrMap::default(),
@@ -697,6 +714,7 @@ impl Renderer {
             isolation: None,
             isolation_settled: false,
             proof_art: None,
+            hairline: 1.0,
         }
     }
 
@@ -713,7 +731,9 @@ impl Renderer {
             let (w, h) = (width.clamp(1, MAX_CONTEXT_SIDE), height.clamp(1, MAX_CONTEXT_SIDE));
             if let Some(k) = supersample_factor(w, h) {
                 let hard = RenderOptions { anti_alias: AntiAlias::None, supersample: false, ..opts.clone() };
+                let hairline = std::mem::replace(&mut self.hairline, f64::from(k));
                 let big = self.render_as(doc, w * k, h * k, Affine::scale(f64::from(k)) * view, &hard, inks);
+                self.hairline = hairline;
                 let pixels = downsample(&big.pixels, big.width as usize, big.height as usize, k as usize);
                 self.stats.micros = now().saturating_sub(start);
                 return Rendered { width: w, height: h, pixels };
@@ -776,6 +796,7 @@ impl Renderer {
         (self.offscreen_live, self.offscreen_budget) = (0, 0);
         self.symbol_nodes = 0;
         self.twice_drawn = 0;
+        self.placed_frame = None;
     }
 
     /// End a frame: drop cache entries not used for a few frames (every render, thumbnails too,
@@ -1371,9 +1392,10 @@ impl Renderer {
                     // running far off screen (from a file) asked for millions of them. Past
                     // [`MAX_GUIDE_DASHES`] (by its control polygon, which is at least as long) it
                     // is drawn solid.
-                    if dots && polygon_length(&screen) / 4.0 <= MAX_GUIDE_DASHES {
+                    let h = self.hairline;
+                    if dots && polygon_length(&screen) / (4.0 * h) <= MAX_GUIDE_DASHES {
                         ctx.set_transform(Affine::IDENTITY);
-                        ctx.set_stroke(kurbo::Stroke::new(1.5).with_dashes(0.0, [1.5, 2.5]));
+                        ctx.set_stroke(kurbo::Stroke::new(1.5 * h).with_dashes(0.0, [1.5 * h, 2.5 * h]));
                         ctx.set_paint(f.ink.fixed([r, g, b, 255]));
                         ctx.stroke_path(&screen);
                     } else {
@@ -1570,7 +1592,7 @@ impl Renderer {
         ctx.set_transform(Affine::IDENTITY);
         let mut screen = bp.clone();
         screen.apply_affine(f.view);
-        ctx.set_stroke(kurbo::Stroke::new(1.0));
+        ctx.set_stroke(kurbo::Stroke::new(self.hairline));
         ctx.set_paint(f.ink.fixed(rgba));
         ctx.stroke_path(&screen);
     }
@@ -1931,7 +1953,7 @@ impl Renderer {
             let mut p = g.all.clone();
             p.apply_affine(xf);
             ctx.set_transform(Affine::IDENTITY);
-            ctx.set_stroke(kurbo::Stroke::new(1.0));
+            ctx.set_stroke(kurbo::Stroke::new(self.hairline));
             ctx.set_paint(peniko::Color::BLACK);
             ctx.stroke_path(&p);
             // Colour bitmap glyphs: their boxes, as images show in outline mode.
@@ -1968,10 +1990,9 @@ impl Renderer {
             self.draw_text_items(ctx, f, n, below, all, tb);
         }
         if f.opts.highlight_substitutions {
-            let setup = &f.doc.setup;
             for (on, path) in [
-                (setup.highlight_substituted_fonts, Some(&g.substituted_fonts)),
-                (setup.highlight_substituted_glyphs, Some(&g.substituted_glyphs)),
+                (f.opts.highlight_substituted_fonts, Some(&g.substituted_fonts)),
+                (f.doc.setup.highlight_substituted_glyphs, Some(&g.substituted_glyphs)),
                 // Measured only when shown: it lays the text out again.
                 (f.opts.highlight_alternate_glyphs, f.opts.highlight_alternate_glyphs.then(|| g.alternate_glyphs(t))),
             ] {
@@ -2139,11 +2160,39 @@ impl Renderer {
                     }
                 }
             }
+        } else if f.opts.mark_undecoded_images && (!outline || f.doc.setup.outline_images) {
+            self.draw_undecoded_mark(ctx, f, im, area);
         }
         if outline {
             let mut p = rect.to_path(0.1);
             p.apply_affine(im.xf);
             self.hairline(ctx, f, &p, [0, 0, 0, 255]);
+        }
+    }
+
+    /// Draw the mark of image `im` whose pixels can't be had ([`RenderOptions::mark_undecoded_images`]):
+    /// a light gray box over its frame, crossed from corner to corner with a gray hairline, and
+    /// with `area` (see [`Self::draw_image_in`]) only inside that region.
+    fn draw_undecoded_mark(&mut self, ctx: &mut RenderContext, f: &Frame, im: &vectorcraft_doc::ImageObject, area: Option<&(BezPath, FillRule)>) {
+        let (w, h) = (im.width as f64, im.height as f64);
+        if let Some((bp, rule)) = area {
+            ctx.set_transform(f.view);
+            ctx.set_fill_rule(fill_rule(*rule));
+            ctx.push_clip_layer(bp);
+        }
+        let rect = Rect::new(0.0, 0.0, w, h);
+        ctx.set_transform(f.view * im.xf);
+        ctx.set_paint(f.ink.fixed([128, 128, 128, 40]));
+        ctx.fill_rect(&rect);
+        let mut cross = rect.to_path(0.1);
+        cross.move_to((0.0, 0.0));
+        cross.line_to((w, h));
+        cross.move_to((w, 0.0));
+        cross.line_to((0.0, h));
+        cross.apply_affine(im.xf);
+        self.hairline(ctx, f, &cross, [128, 128, 128, 255]);
+        if area.is_some() {
+            ctx.pop_layer();
         }
     }
 
@@ -2264,16 +2313,30 @@ fn blob_key(blob: &vectorcraft_doc::ImageBlob) -> (images::ImageKey, Option<Arc<
 }
 
 /// The decoded pixels of `blob` (a CMYK image's inks shown through the working CMYK profile, again
-/// when the colour settings change), from the shared store, and their key there.
+/// when the colour settings change), from the shared store, and their key there. An image whose
+/// pixels can't be decoded is noted in the store and not decoded again; each request for it counts
+/// a failure in [`decode_failures`].
 fn blob_pixmap(blob: &vectorcraft_doc::ImageBlob, touch: bool) -> Option<(images::ImageKey, Arc<Pixmap>)> {
     let (key, lut, size) = blob_key(blob);
     let pm = match lookup(&key, touch) {
         Some(pm) => pm,
         None => {
+            if images::store().is_undecodable(&key.content) {
+                paint::add_decode_failures(1);
+                return None;
+            }
             // Decoded outside the lock: other renderers carry on meanwhile.
             let pm = match lut.and_then(|lut| ink::cmyk_pixmap(blob, &lut)) {
                 Some(pm) => pm,
-                None => paint::decode_pixmap(&blob.bytes)?,
+                None => match paint::decode_pixmap_or_why(&blob.bytes) {
+                    Ok(pm) => pm,
+                    Err(why) => {
+                        if why == paint::Undecoded::Unreadable {
+                            images::store().set_undecodable(key.content.clone());
+                        }
+                        return None;
+                    }
+                },
             };
             images::store().insert(key.clone(), Arc::new(pm))
         }
@@ -2527,7 +2590,8 @@ struct TextGeom {
     spans: Vec<(usize, usize, usize)>,
     bounds: Rect,
     /// The boxes of characters whose font is missing (drawn in a substitute), and of glyphs the
-    /// font lacks (drawn from a fallback font): Document Setup's substitution highlights.
+    /// font lacks (drawn from a fallback font): Highlight Substituted Fonts and Highlight
+    /// Substituted Glyphs.
     substituted_fonts: BezPath,
     substituted_glyphs: BezPath,
     /// Glyphs OpenType may have substituted (a ligature, or not the face's cmap glyph for their
@@ -2725,7 +2789,8 @@ fn text_geom_snapped(t: &TextObject, snap: Option<Affine>) -> TextGeom {
     }
 }
 
-/// Document Setup's and Preferences › Highlight Alternate Glyphs pink (screen only).
+/// The substitution highlights' pink: Preferences › Highlight Substituted Fonts and Highlight
+/// Alternate Glyphs, and Document Setup's Highlight Substituted Glyphs (screen only).
 const SUBSTITUTED: peniko::Color = peniko::Color::from_rgba8(255, 120, 190, 110);
 /// The pixel size of `region` rendered at `scale` pixels per point (at least 1×1).
 pub fn region_pixels(region: Rect, scale: f64) -> (u32, u32) {

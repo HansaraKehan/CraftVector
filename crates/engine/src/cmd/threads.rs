@@ -50,6 +50,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_thread_selection,
             remove
         ),
+        cmd!(
+            "text.thread.break",
+            "Break Thread",
+            [],
+            None,
+            "{id, port: \"in\"|\"out\"} break the thread of area type or type on a path `id` before it (its in port) or after it (its out port), as a double-click on that port does: the story flows into the frames before the break, and the frames after it are left empty (still threaded with each other when two or more)",
+            has_doc,
+            break_thread
+        ),
         cmd!(query "text.thread.info", "Threads", [], None, "{} → [[id…]] every thread in order", has_doc, |s, _| {
             Ok(json!(s.doc()?.doc.text_threads.iter().map(|t| t.iter().map(|i| i.0).collect::<Vec<_>>()).collect::<Vec<_>>()))
         }),
@@ -329,6 +338,52 @@ pub(crate) fn leave_threads(d: &mut Document, was: &[(NodeId, TextObject)]) {
     }
 }
 
+/// Cut each frame in `art`, a copy of objects of `d` under their ids, that is the last frame of a
+/// thread with frames outside `art`, to the text it shows. When such a frame leaves its thread,
+/// [`leave_threads`] puts the text it has no room for after the text of the last frame that stays.
+pub(crate) fn keep_shown_text(d: &Document, art: &mut Node) {
+    let mut inside = vec![];
+    art.walk(&mut |n| inside.push(n.id));
+    let last: Vec<NodeId> = d
+        .text_threads
+        .iter()
+        .filter(|t| t.iter().any(|id| !inside.contains(id)))
+        .filter_map(|t| t.last().copied().filter(|id| inside.contains(id)))
+        .collect();
+    if !last.is_empty() {
+        cut_to_shown(art, &last);
+    }
+}
+
+/// Cut the area type and type on a path `ids` in `n` to the text each one shows.
+fn cut_to_shown(n: &mut Node, ids: &[NodeId]) {
+    if ids.contains(&n.id)
+        && let NodeKind::Text(t) = &mut n.kind
+        && !matches!(t.kind, TextKind::Point)
+    {
+        // Split as `take_overflow` splits it: the first part is what the frame shows.
+        let from: &TextObject = t;
+        let parts = vectorcraft_text::thread::distribute_continuing(
+            vectorcraft_text::FontDb::global(),
+            &[from, from],
+            &from.runs,
+            &from.paragraph_styles(),
+            from.first_para_continues,
+            from.list_count,
+        );
+        if let (Some(head), Some(_)) = (parts.first(), parts.get(1).filter(|p| p.runs.iter().any(|r| !r.text.is_empty()))) {
+            t.runs = head.runs.clone();
+            t.set_paragraph_styles(head.paras.clone());
+            refresh_bounds(t);
+        }
+    }
+    if let Some(children) = n.children_mut() {
+        for c in children {
+            cut_to_shown(std::sync::Arc::make_mut(c), ids);
+        }
+    }
+}
+
 /// The only area type or type on a path in the art at `id`.
 fn kept_type(d: &Document, id: NodeId) -> Option<NodeId> {
     let mut found = vec![];
@@ -597,6 +652,56 @@ fn remove(s: &mut Session, _: &Value) -> Result<Value> {
                 refresh_bounds(t);
             }
         }
+        Ok(())
+    })?;
+    ok()
+}
+
+/// `text.thread.break`: a double-click on a threaded port. The thread is split there; the whole
+/// story moves into the frames before the split, and the frames after it are emptied, staying
+/// threaded with each other when two or more remain.
+fn break_thread(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "text.thread.break";
+    let id = checked_id(s, p.get("id").unwrap_or(&Value::Null), C)?;
+    let before = match p.get("port").and_then(Value::as_str) {
+        Some("in") => true,
+        Some("out") => false,
+        _ => return Err(bad(C, "`port` must be \"in\" or \"out\"")),
+    };
+    let d = &s.doc()?.doc;
+    let thread = d.text_threads.iter().find(|t| t.contains(&id)).cloned().unwrap_or_default();
+    let at = thread.iter().position(|x| *x == id).map(|i| if before { i } else { i + 1 });
+    let Some(at) = at.filter(|at| *at > 0 && *at < thread.len()) else {
+        return Err(bad(C, if before { "no frame comes before `id` in a thread" } else { "no frame comes after `id` in a thread" }));
+    };
+    let (head, tail) = (thread[..at].to_vec(), thread[at..].to_vec());
+    s.edit("Break Thread", |d, _| {
+        let sources: Vec<TextObject> = thread.iter().filter_map(|id| text_of(d, *id).cloned()).collect();
+        let mut story: Vec<TextRun> = sources.iter().flat_map(|t| t.runs.iter().cloned()).collect();
+        let paras = vectorcraft_text::thread::story_paras(&sources.iter().collect::<Vec<_>>(), &[]);
+        let end_style = story.last().map(|r| r.style.clone()).unwrap_or_default();
+        let last_para = paras.last().cloned().unwrap_or_default();
+        // Every frame but the first holds nothing, for the re-flow to share the story out among
+        // the first part's frames once.
+        for id in head.iter().skip(1).chain(&tail) {
+            if let Some(NodeKind::Text(t)) = d.node_mut(*id).map(|n| &mut n.kind) {
+                t.runs = vec![TextRun { text: String::new(), style: end_style.clone(), inline: None }];
+                t.set_all_paras(last_para.clone());
+                t.first_para_continues = false;
+                refresh_bounds(t);
+            }
+        }
+        if let Some(NodeKind::Text(t)) = head.first().and_then(|id| d.node_mut(*id)).map(|n| &mut n.kind) {
+            vectorcraft_text::edit::normalize(&mut story);
+            t.runs = story;
+            t.set_paragraph_styles(paras);
+            t.first_para_continues = false;
+            refresh_bounds(t);
+        }
+        if let Some(i) = d.text_threads.iter().position(|t| *t == thread) {
+            d.text_threads.splice(i..=i, [head, tail]);
+        }
+        d.text_threads.retain(|t| t.len() >= 2);
         Ok(())
     })?;
     ok()
@@ -1010,6 +1115,68 @@ mod tests {
         (s, [a, b, c])
     }
 
+    fn continues(s: &Session, id: u64) -> bool {
+        text_of(&s.doc().unwrap().doc, NodeId(id)).is_some_and(|t| t.first_para_continues)
+    }
+
+    /// A double-click on a threaded port breaks the thread there: the story flows into the frames
+    /// before the break and the frames after it are left empty, still threaded with each other
+    /// when two or more. One undo step restores the thread and its text.
+    #[test]
+    fn break_splits_the_thread_and_the_story_flows_into_the_first_part() {
+        let story = TEXT.repeat(12);
+        let (mut s, [a, b, c]) = three_frames(&story, 40.0);
+        let d = new_id(s.execute("text.create", &json!({"x": 200, "y": 100, "text": "", "area": {"width": 150, "height": 100}})).unwrap());
+        s.execute("text.thread.add", &json!({"from": c, "to": d})).unwrap();
+        let all = [a, b, c, d];
+        let shown: Vec<String> = all.iter().map(|id| text(&s, *id)).collect();
+        assert!(shown.iter().all(|t| !t.is_empty()), "each frame shows part of the story");
+        let joined = |s: &Session, ids: &[u64]| ids.iter().map(|id| text(s, *id)).collect::<String>();
+        // (frame, port, threads after, the frames that hold the story, the frames left empty)
+        let cases = [
+            (a, "out", vec![vec![b, c, d]], vec![a], vec![b, c, d]),
+            (b, "in", vec![vec![b, c, d]], vec![a], vec![b, c, d]),
+            (b, "out", vec![vec![a, b], vec![c, d]], vec![a, b], vec![c, d]),
+            (d, "in", vec![vec![a, b, c]], vec![a, b, c], vec![d]),
+            (c, "out", vec![vec![a, b, c]], vec![a, b, c], vec![d]),
+        ];
+        for (id, port, after, full, empty) in cases {
+            let case = format!("{port} port of {id}");
+            s.execute("text.thread.break", &json!({"id": id, "port": port})).unwrap();
+            assert_eq!(threads(&s), after, "{case}");
+            assert_eq!(joined(&s, &full), story, "{case}: the story flows into the first part");
+            assert!(empty.iter().all(|id| text(&s, *id).is_empty()), "{case}: the frames after the break are empty");
+            assert!(!continues(&s, empty[0]), "{case}: the first frame after the break starts a paragraph");
+            assert!(!continues(&s, a), "{case}: the first frame starts the story");
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(threads(&s), [all.to_vec()], "{case}: undo");
+            assert_eq!(all.iter().map(|id| text(&s, *id)).collect::<Vec<_>>(), shown, "{case}: undo");
+        }
+    }
+
+    #[test]
+    fn break_refuses_a_port_with_no_thread_and_bad_params() {
+        let (mut s, [a, b, c]) = three_frames(&TEXT.repeat(4), 200.0);
+        let lone = new_id(s.execute("text.create", &json!({"x": 400, "y": 10, "text": "Alone.", "area": {"width": 100, "height": 100}})).unwrap());
+        let ids = [a, b, c, lone];
+        let shown: Vec<String> = ids.iter().map(|id| text(&s, *id)).collect();
+        let before = threads(&s);
+        for params in [
+            json!({"id": a, "port": "in"}),
+            json!({"id": c, "port": "out"}),
+            json!({"id": lone, "port": "out"}),
+            json!({"id": lone, "port": "in"}),
+            json!({"id": a, "port": "up"}),
+            json!({"id": a}),
+            json!({"port": "out"}),
+            json!({"id": 9999, "port": "out"}),
+        ] {
+            assert!(s.execute("text.thread.break", &params).is_err(), "{params}");
+        }
+        assert_eq!(threads(&s), before);
+        assert_eq!(ids.iter().map(|id| text(&s, *id)).collect::<Vec<_>>(), shown);
+    }
+
     /// Whether the document holds area type or type on a path `id`.
     fn is_frame(s: &Session, id: u64) -> bool {
         text_of(&s.doc().unwrap().doc, NodeId(id)).is_some()
@@ -1174,6 +1341,50 @@ mod tests {
         assert_eq!(threads(&s), [[a, b]]);
         s.execute("edit.undo", &json!({})).unwrap();
         assert_eq!([a, b, c].map(|id| text(&s, id)), shown);
+    }
+
+    /// Object › Rasterize on frames of threaded text takes them out of their thread with the text
+    /// they show, which the image draws, and the other frames keep the text they hold. Undo threads
+    /// the frames again. When the last frame is rasterized, the frame before it takes the text it
+    /// has no room for.
+    #[test]
+    fn rasterized_frames_leave_their_thread_with_their_text() {
+        for clip in [false, true] {
+            for out in [&[0][..], &[1], &[2], &[0, 2]] {
+                let case = format!("clippingMask {clip} {out:?}");
+                let (mut s, frames) = three_frames(&TEXT.repeat(4), 200.0);
+                let shown = frames.map(|id| text(&s, id));
+                assert_eq!(shown.concat(), TEXT.repeat(4));
+                let ids: Vec<u64> = out.iter().map(|k| frames[*k]).collect();
+                s.execute("select.set", &json!({"ids": ids})).unwrap();
+                s.execute("object.rasterize", &json!({"ppi": 36, "clippingMask": clip})).unwrap();
+                let rest: Vec<u64> = frames.iter().copied().filter(|id| !ids.contains(id)).collect();
+                for id in &ids {
+                    assert!(!is_frame(&s, *id), "{case}: frame {id} is rasterized");
+                }
+                for (id, before) in frames.iter().zip(&shown).filter(|(id, _)| rest.contains(id)) {
+                    assert_eq!(text(&s, *id), *before, "{case}: frame {id} keeps its text");
+                }
+                assert_eq!(threads(&s), if rest.len() >= 2 { vec![rest] } else { vec![] }, "{case}");
+                s.execute("edit.undo", &json!({})).unwrap();
+                assert_eq!(threads(&s), [frames], "{case}: undo");
+                assert_eq!(frames.map(|id| text(&s, id)), shown, "{case}: undo");
+            }
+        }
+        let (mut s, [a, b, c]) = three_frames(&TEXT.repeat(12), 100.0);
+        let shown = [a, b, c].map(|id| text(&s, id));
+        let laid = {
+            let Some(t) = text_of(&s.doc().unwrap().doc, NodeId(c)) else { panic!("not area type") };
+            vectorcraft_text::layout(vectorcraft_text::FontDb::global(), t)
+        };
+        assert!(laid.overflow, "the last frame has more text than it shows");
+        let end = laid.lines.last().map_or(0, |l| l.end);
+        let hidden = shown[2][end..].trim_start_matches(' ');
+        s.execute("select.set", &json!({"ids": [c]})).unwrap();
+        s.execute("object.rasterize", &json!({"ppi": 36})).unwrap();
+        assert_eq!(text(&s, a), shown[0]);
+        assert_eq!(text(&s, b), format!("{}{hidden}", shown[1]), "the frame before it keeps its text and takes the rest");
+        assert_eq!(threads(&s), [[a, b]]);
     }
 
     /// Frame `id`'s first line: whether its first paragraph continues from the frame before, where
@@ -1606,6 +1817,89 @@ mod tests {
         s.execute("symbol.breakLink", &json!({})).unwrap();
         let doc = &s.doc().unwrap().doc;
         assert_eq!(doc.layers.iter().flat_map(|l| counts(l)).collect::<Vec<_>>(), [0, 0]);
+    }
+
+    /// The text of each frame in symbol `name`'s art, sorted.
+    fn symbol_texts(s: &Session, name: &str) -> Vec<String> {
+        let doc = &s.doc().unwrap().doc;
+        let Some(sym) = doc.symbols.iter().find(|x| x.name == name) else { panic!("no symbol {name}") };
+        let mut texts = vec![];
+        sym.art.walk(&mut |n| {
+            if let NodeKind::Text(t) = &n.kind {
+                texts.push(t.plain_text());
+            }
+        });
+        texts.sort();
+        texts
+    }
+
+    /// New Symbol and Redefine Symbol on frames of threaded text replace them with an instance
+    /// whose art holds the text they show, and the frames leave their thread: the other frames keep
+    /// the text they hold, so each character is drawn once. Undo threads the frames again. When the
+    /// last frame goes into the symbol, the frame before it takes the text it has no room for, and
+    /// the symbol's art holds only the text the frame shows.
+    #[test]
+    fn frames_made_into_a_symbol_leave_their_thread_with_their_text() {
+        let symbol = |s: &mut Session, command: &str, ids: &[u64]| {
+            let name = if command == "symbol.update" {
+                let mark = new_id(s.execute("shape.rectangle", &json!({"x": 400, "y": 200, "width": 20, "height": 20})).unwrap());
+                s.execute("select.set", &json!({"ids": [mark]})).unwrap();
+                s.execute("symbol.new", &json!({"name": "Mark"})).unwrap();
+                "Mark"
+            } else {
+                "Story"
+            };
+            s.execute("select.set", &json!({"ids": ids})).unwrap();
+            s.execute(command, &json!({"name": name})).unwrap();
+            name
+        };
+        for command in ["symbol.new", "symbol.update"] {
+            for out in [&[0][..], &[1], &[2], &[0, 2]] {
+                let case = format!("{command} {out:?}");
+                let (mut s, frames) = three_frames(&TEXT.repeat(4), 200.0);
+                let shown = frames.map(|id| text(&s, id));
+                assert_eq!(shown.concat(), TEXT.repeat(4));
+                let ids: Vec<u64> = out.iter().map(|k| frames[*k]).collect();
+                let name = symbol(&mut s, command, &ids);
+                let rest: Vec<u64> = frames.iter().copied().filter(|id| !ids.contains(id)).collect();
+                for id in &ids {
+                    assert!(!is_frame(&s, *id), "{case}: frame {id} is in the symbol");
+                }
+                let mut held: Vec<String> = out.iter().map(|k| shown[*k].clone()).collect();
+                held.sort();
+                assert_eq!(symbol_texts(&s, name), held, "{case}: the symbol's art holds the text the frames show");
+                for (id, before) in frames.iter().zip(&shown).filter(|(id, _)| rest.contains(id)) {
+                    assert_eq!(text(&s, *id), *before, "{case}: frame {id} keeps its text");
+                }
+                assert_eq!(threads(&s), if rest.len() >= 2 { vec![rest] } else { vec![] }, "{case}");
+                s.execute("edit.undo", &json!({})).unwrap();
+                assert_eq!(threads(&s), [frames], "{case}: undo");
+                assert_eq!(frames.map(|id| text(&s, id)), shown, "{case}: undo");
+            }
+            let (mut s, [a, b, c]) = three_frames(&TEXT.repeat(12), 100.0);
+            let shown = [a, b, c].map(|id| text(&s, id));
+            let laid = {
+                let Some(t) = text_of(&s.doc().unwrap().doc, NodeId(c)) else { panic!("not area type") };
+                vectorcraft_text::layout(vectorcraft_text::FontDb::global(), t)
+            };
+            assert!(laid.overflow, "the last frame has more text than it shows");
+            let end = laid.lines.last().map_or(0, |l| l.end);
+            let hidden = shown[2][end..].trim_start_matches(' ');
+            let name = symbol(&mut s, command, &[c]);
+            assert_eq!(text(&s, a), shown[0], "{command}");
+            assert_eq!(text(&s, b), format!("{}{hidden}", shown[1]), "{command}: the frame before it keeps its text and takes the rest");
+            assert_eq!(threads(&s), [[a, b]], "{command}");
+            let held = symbol_texts(&s, name);
+            let held: Vec<&str> = held.iter().map(|t| t.trim_end()).collect();
+            assert_eq!(held, [shown[2][..end].trim_end()], "{command}: the symbol's art holds what the frame shows");
+            // With every frame of the thread in the symbol, the last frame keeps all its text.
+            let (mut s, frames) = three_frames(&TEXT.repeat(12), 100.0);
+            let mut shown = frames.map(|id| text(&s, id)).to_vec();
+            shown.sort();
+            let name = symbol(&mut s, command, &frames);
+            assert_eq!(symbol_texts(&s, name), shown, "{command}: the whole thread");
+            assert!(threads(&s).is_empty(), "{command}: the whole thread");
+        }
     }
 
     /// A frame of a numbered thread pasted while an opacity mask is edited numbers from 1 in the

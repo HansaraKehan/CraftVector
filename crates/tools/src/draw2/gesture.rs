@@ -2,7 +2,8 @@
 //! Knife, Smooth, Path Eraser and Join.
 //!
 //! Pencil and Paintbrush preview the fitted path live (`path.freehand` re-applied on the snapshot)
-//! and commit on release; Alt on release (or ending near the start) closes the path, and starting
+//! and commit on release; with Live curve fitting off, the Pencil's preview joins the stroke's
+//! points with straight segments and the release fits them; Alt on release (or ending near the start) closes the path, and starting
 //! near an end of a selected open path continues it. Shift held at the press draws a straight
 //! Pencil line at 45° steps from the Constrain Angle instead, and Alt held at the press (with Alt
 //! key toggles to Smooth Tool off) draws a straight line at any angle. The Pencil's new path starts and ends on
@@ -14,10 +15,10 @@
 //! vertical line through the press point.
 
 use serde_json::{Value, json};
-use vectorcraft_doc::NodeId;
+use vectorcraft_doc::{NodeId, NodeKind};
 use vectorcraft_geom::Point;
 
-use super::{FEEDBACK, points_json, polyline};
+use super::{FEEDBACK, eraser_area, points_json, polyline};
 use crate::guides::DrawSnap;
 use crate::{Action, Cursor, Mods, Overlay, PointerEvent, PointerKind, Tool, ToolContext, ToolKey};
 
@@ -35,13 +36,20 @@ pub struct GestureTool {
     near_start: bool,
     /// Pencil/Paintbrush continuing a selected open path: (path, continue from its start).
     extend: Option<(NodeId, bool)>,
+    /// A Pencil stroke continuing a selected open path: the other paths selected at the press,
+    /// whose open ends it connects to.
+    connect_to: Vec<NodeId>,
     /// Pencil/Paintbrush starting on a selected path away from its ends: (path, Edit Selected
     /// Paths' distance in points); the stroke redraws the section it ends on (#2850).
     redraw: Option<(NodeId, f64)>,
     /// Fit tolerance in points (Pencil/Paintbrush/Smooth "Fidelity").
     pub fidelity: f64,
-    /// Brush / eraser diameter in points.
+    /// Brush / eraser diameter in points (the Eraser's across its tip's long axis).
     pub size: f64,
+    /// The angle of the Eraser tip's long axis, in degrees counter-clockwise from horizontal.
+    pub angle: f64,
+    /// The Eraser tip's short axis in percent of its long one (100: round).
+    pub roundness: f64,
     /// Fill new pencil/brush strokes.
     pub fill: bool,
     /// "Keep selected": select the path a Pencil, Paintbrush or Blob Brush stroke draws, continues
@@ -50,6 +58,14 @@ pub struct GestureTool {
     /// "Alt key toggles to Smooth Tool": holding Alt with the Pencil tool smooths selected paths
     /// instead of closing the path (Pencil only, off by default).
     pub alt_smooth: bool,
+    /// "Live preview" (Pencil only, on by default): the stroke shows with its fill and stroke as it
+    /// is drawn. Off, only a thin line follows the pen while drawing, and the path takes its fill
+    /// and stroke on release.
+    pub live_preview: bool,
+    /// "Live curve fitting": the Pencil's preview fits the stroke while it is drawn; off, the
+    /// preview shows the points joined by straight segments and the release fits them (Pencil
+    /// only, on by default).
+    pub live_fit: bool,
     /// Active drag is smoothing with the Pencil tool.
     smoothing: bool,
     /// Active Pencil drag draws a straight line (Shift or Alt held at the press): the stroke is
@@ -76,6 +92,17 @@ pub struct GestureTool {
     snap: DrawSnap,
 }
 
+/// The paths a stroke can redraw for selected object `id`: the path itself, or a compound path's
+/// member paths.
+fn redraw_targets(cx: &ToolContext, id: NodeId) -> Vec<NodeId> {
+    let Some(n) = cx.doc.node(id) else { return vec![] };
+    match &n.kind {
+        NodeKind::Path { .. } => vec![id],
+        NodeKind::Compound { children, .. } => children.iter().filter(|c| c.path_data().is_some()).map(|c| c.id).collect(),
+        _ => vec![],
+    }
+}
+
 impl GestureTool {
     pub fn new(id: &str) -> Self {
         let id: &'static str = match id {
@@ -98,13 +125,18 @@ impl GestureTool {
             began: false,
             near_start: false,
             extend: None,
+            connect_to: vec![],
             redraw: None,
             fidelity,
             size: 10.0,
+            angle: 0.0,
+            roundness: 100.0,
             fill: false,
             keep_selected: id != "blobBrush",
             // Off, as Pencil Tool Options ships it: Alt keeps drawing a closed path until it is on.
             alt_smooth: false,
+            live_preview: true,
+            live_fit: true,
             smoothing: false,
             straight: false,
             unconstrained: false,
@@ -125,6 +157,12 @@ impl GestureTool {
 
     fn draws_path(&self) -> bool {
         matches!(self.id, "pencil" | "paintbrush")
+    }
+
+    /// Does a stroke show as the path it draws while it is drawn? Not with the Pencil's Live preview
+    /// off: then the drag shows as a thin line (an overlay) until the release.
+    fn previews(&self) -> bool {
+        self.id != "pencil" || self.live_preview
     }
 
     /// Add a stroke sample.
@@ -220,12 +258,17 @@ impl GestureTool {
     /// The selected open path whose end is near `p` (Edit Selected Paths, off at 0 pixels), and
     /// that end.
     fn find_extend(&self, cx: &ToolContext, p: Point) -> Option<(NodeId, bool, Point)> {
+        self.find_end(cx, p, &cx.selection.objects)
+    }
+
+    /// [`Self::find_extend`] among `ids`.
+    fn find_end(&self, cx: &ToolContext, p: Point, ids: &[NodeId]) -> Option<(NodeId, bool, Point)> {
         if self.edit_within <= 0.0 {
             return None;
         }
         let tol = cx.tol(self.edit_within);
         let editable = cx.doc.editable();
-        for id in &cx.selection.objects {
+        for id in ids {
             let Some(pd) = cx.doc.node(*id).and_then(|n| n.path_data()) else { continue };
             if !editable(*id) {
                 continue;
@@ -248,9 +291,16 @@ impl GestureTool {
         if self.edit_within <= 0.0 || !tol.is_finite() {
             return None;
         }
+        // A selected compound path (a shape with a hole) redraws the member path the stroke starts
+        // on, the nearest of them: a compound path has no path of its own.
         cx.selection.objects.iter().find_map(|id| {
-            let pd = cx.doc.node(*id).and_then(|n| n.path_data()).filter(|_| cx.doc.is_editable(*id))?;
-            pd.nearest(p).filter(|n| n.4 <= tol).map(|_| (*id, tol))
+            redraw_targets(cx, *id)
+                .into_iter()
+                .filter(|m| cx.doc.is_editable(*m))
+                .filter_map(|m| Some((m, cx.doc.node(m)?.path_data()?.nearest(p)?.4)))
+                .filter(|(_, d)| *d <= tol)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(m, _)| (m, tol))
         })
     }
 
@@ -304,7 +354,14 @@ impl GestureTool {
                 let near = pts.last().is_some_and(|&end| self.ends_near_start(cx, end));
                 // A straight line has two points: closing it would draw it back over itself.
                 let closed = !self.straight && ((m.alt && !self.alt_smooth) || (self.extend.is_none() && near));
-                vec![Action::Preview("path.freehand".into(), self.freehand_params(closed)), Action::Commit]
+                let mut params = self.freehand_params(closed);
+                // A Pencil stroke that continues a selected path and ends on an open end of another
+                // path selected at the press connects the two.
+                let connect = pts.last().and_then(|&end| self.find_end(cx, end, &self.connect_to));
+                if let Some((other, at_start, _)) = connect {
+                    params["connect"] = json!({"id": other.0, "end": if at_start { "start" } else { "end" }});
+                }
+                vec![Action::Preview("path.freehand".into(), params), Action::Commit]
             }
             "blobBrush" => vec![Action::Exec(
                 "path.blob".into(),
@@ -315,7 +372,10 @@ impl GestureTool {
                     "mergeOnlySelection": self.merge_only_selection
                 }),
             )],
-            "eraser" => vec![Action::Exec("path.eraseRegion".into(), json!({"points": points_json(pts), "size": self.size}))],
+            "eraser" => vec![Action::Exec(
+                "path.eraseRegion".into(),
+                json!({"points": points_json(pts), "size": self.size, "angle": self.angle, "roundness": self.roundness}),
+            )],
             "knife" if pts.len() >= 2 => vec![Action::Exec("path.knife".into(), json!({"points": points_json(pts)}))],
             "smooth" if has_sel && pts.len() >= 2 => {
                 vec![Action::Exec("path.smoothRegion".into(), json!({"points": points_json(pts), "radius": tol, "fidelity": self.fidelity}))]
@@ -352,6 +412,11 @@ impl Tool for GestureTool {
                 self.unconstrained = self.straight && !ev.mods.shift;
                 let extend = if self.draws_path() && !self.smoothing { self.find_extend(cx, p) } else { None };
                 self.extend = extend.map(|(id, at_start, _)| (id, at_start));
+                // The stroke's previews select the path it continues, so the others are kept now.
+                self.connect_to = match self.extend {
+                    Some((id, _)) if self.id == "pencil" => cx.selection.objects.iter().copied().filter(|o| *o != id).collect(),
+                    _ => vec![],
+                };
                 self.redraw = if self.draws_path() && !self.smoothing && self.extend.is_none() { self.find_redraw(cx, p) } else { None };
                 // A path continued starts at its end, one redrawn on it; a new one where it snaps.
                 // A straight line is constrained from the end it continues, so it starts there.
@@ -415,9 +480,15 @@ impl Tool for GestureTool {
                     self.began = true;
                     out.push(Action::Begin(self.label().into()));
                 }
-                if crate::previews_at(self.points.len()) {
+                // With the Pencil's Live preview off a thin line shows instead (`overlays`).
+                if self.previews() && crate::previews_at(self.points.len()) {
                     self.previewed = self.points.len();
-                    out.push(Action::Preview("path.freehand".into(), self.freehand_params(false)));
+                    let mut v = self.freehand_params(false);
+                    if !self.live_fit {
+                        // Live curve fitting off: the release fits the stroke (`finish`).
+                        v["fit"] = json!(false);
+                    }
+                    out.push(Action::Preview("path.freehand".into(), v));
                 }
                 out
             }
@@ -455,11 +526,17 @@ impl Tool for GestureTool {
                 self.unconstrained = false;
                 self.clear();
                 self.extend = None;
+                self.connect_to.clear();
                 self.redraw = None;
                 out
             }
             _ => vec![],
         }
+    }
+    /// The freehand tools build their stroke from every position the pointer passed; the Join tool
+    /// only needs where its scribble crosses the ends.
+    fn wants_samples(&self) -> bool {
+        matches!(self.id, "pencil" | "paintbrush" | "blobBrush" | "eraser" | "knife" | "smooth" | "pathEraser")
     }
     /// `[` and `]` are the Blob Brush's and the Eraser's: their size (#1661).
     fn claims_key(&self, _cx: &ToolContext, key: ToolKey) -> bool {
@@ -492,8 +569,9 @@ impl Tool for GestureTool {
     }
     fn deactivate(&mut self, _cx: &ToolContext) -> Vec<Action> {
         let began = self.began;
-        // Drags past the last preview are in the stroke kept, too.
-        let stale = (began && self.previewed != self.points.len() && self.draws_path() && !self.smoothing)
+        // Drags past the last preview are in the stroke kept, too, and with Live curve fitting
+        // off the stroke kept is fitted.
+        let stale = (began && (self.previewed != self.points.len() || !self.live_fit) && self.draws_path() && !self.smoothing)
             .then(|| Action::Preview("path.freehand".into(), self.freehand_params(false)));
         self.snap.clear();
         self.active = false;
@@ -506,7 +584,8 @@ impl Tool for GestureTool {
     }
     fn overlays(&self, cx: &ToolContext) -> Vec<Overlay> {
         let mut o = self.snap.guides().to_vec();
-        if !self.active || self.points.len() < 2 || self.began {
+        // A path being drawn shows itself, except with the Pencil's Live preview off.
+        if !self.active || self.points.len() < 2 || (self.began && self.previews()) {
             return o;
         }
         let width = match self.id {
@@ -514,18 +593,30 @@ impl Tool for GestureTool {
             _ => 1.0,
         };
         let color = if self.id == "eraser" { [0x80, 0x80, 0x80] } else { FEEDBACK };
+        // A tip that is not round shows the outline of the area it covers.
+        if self.id == "eraser" && self.roundness < 100.0 {
+            let area = eraser_area(&self.points, self.size, self.angle, self.roundness);
+            o.push(Overlay::Path { path: area.to_bezpath(), color, width: 1.0, dashed: false });
+            return o;
+        }
         o.push(Overlay::Path { path: polyline(&self.points), color, width, dashed: self.id == "knife" });
+        if cx.measurement_labels && self.id == "blobBrush" {
+            let last = self.points[self.points.len() - 1];
+            let length = self.points.windows(2).map(|w| w[0].distance(w[1])).sum();
+            o.push(Overlay::Measure { p: last + vectorcraft_geom::Vec2::new(cx.tol(12.0), cx.tol(12.0)), text: format!("L: {}", cx.len(length)) });
+        }
         o
     }
-    fn cursor(&self, _cx: &ToolContext, _p: Point, m: Mods) -> Cursor {
+    fn cursor(&self, cx: &ToolContext, p: Point, m: Mods) -> Cursor {
         // A drag that smooths, or Alt before a Pencil stroke has begun to draw (a stroke that
         // has begun keeps drawing with Alt).
         if self.smoothing || (self.id == "pencil" && self.alt_smooth && m.alt && !self.began) {
             return Cursor::Smooth;
         }
-        // Before a press that would draw a straight line.
+        // Before a press that would draw a straight line: over an end of a selected open path,
+        // the line continues that path from the end (`PointerKind::Down`).
         if !self.active && self.straight_at_press(m) {
-            return Cursor::PencilStraight;
+            return if self.find_extend(cx, p).is_some() { Cursor::PencilContinue } else { Cursor::PencilStraight };
         }
         // Alt held at the release closes the path (`finish`).
         // A straight line stays open, so its release has nothing to close, and before a press Alt
@@ -546,6 +637,9 @@ impl Tool for GestureTool {
             "smooth" => Cursor::Smooth,
             "pathEraser" => Cursor::PathEraser,
             "join" => Cursor::Join,
+            // Before a press that draws a new path the Pencil shows its star; over a selected path
+            // that the press continues from an end or redraws (`PointerKind::Down`), it does not.
+            _ if !self.active && self.find_extend(cx, p).is_none() && self.find_redraw(cx, p).is_none() => Cursor::PencilNew,
             _ => Cursor::Pencil,
         }
     }
@@ -556,6 +650,8 @@ impl Tool for GestureTool {
                     "fidelity": self.fidelity,
                     "fill": self.fill,
                     "altSmooth": self.alt_smooth,
+                    "livePreview": self.live_preview,
+                    "liveFit": self.live_fit,
                     "keepSelected": self.keep_selected,
                     "editWithin": self.edit_within,
                     "closeWithin": self.close_within
@@ -572,16 +668,20 @@ impl Tool for GestureTool {
             }
             "smooth" => json!({"fidelity": self.fidelity}),
             "blobBrush" => json!({"size": self.size, "keepSelected": self.keep_selected, "mergeOnlySelection": self.merge_only_selection}),
-            "eraser" => json!({"size": self.size}),
+            "eraser" => json!({"size": self.size, "angle": self.angle, "roundness": self.roundness}),
             _ => Value::Null,
         }
     }
     fn set_option(&mut self, key: &str, v: &Value) {
         match key {
-            "fidelity" => self.fidelity = v.as_f64().unwrap_or(self.fidelity).clamp(0.05, 100.0),
+            "fidelity" => self.fidelity = v.as_f64().unwrap_or(self.fidelity).clamp(super::min_fidelity(self.id), 100.0),
             "size" => self.size = v.as_f64().unwrap_or(self.size).clamp(0.1, 1000.0),
+            "angle" => self.angle = v.as_f64().unwrap_or(self.angle).clamp(-180.0, 180.0),
+            "roundness" => self.roundness = v.as_f64().unwrap_or(self.roundness).clamp(1.0, 100.0),
             "fill" => self.fill = v.as_bool().unwrap_or(self.fill),
             "altSmooth" => self.alt_smooth = v.as_bool().unwrap_or(self.alt_smooth),
+            "livePreview" if self.id == "pencil" => self.live_preview = v.as_bool().unwrap_or(self.live_preview),
+            "liveFit" if self.id == "pencil" => self.live_fit = v.as_bool().unwrap_or(self.live_fit),
             "keepSelected" => self.keep_selected = v.as_bool().unwrap_or(self.keep_selected),
             "mergeOnlySelection" => self.merge_only_selection = v.as_bool().unwrap_or(self.merge_only_selection),
             "editWithin" => self.edit_within = v.as_f64().unwrap_or(self.edit_within).clamp(0.0, 100.0),
@@ -676,6 +776,47 @@ mod tests {
         assert!(!t.busy());
     }
 
+    /// Live curve fitting is the Pencil's, on by default. Off, the previews while a stroke is drawn
+    /// ask for the points unfitted (`fit: false`), and the release's preview is fitted as before.
+    #[test]
+    fn pencil_with_live_curve_fitting_off_previews_the_stroke_unfitted() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let stroke = [(0.0, 0.0), (10.0, 5.0), (20.0, 0.0), (30.0, 6.0), (40.0, 0.0)];
+        // The `fit` each preview sends: those while drawn, then the release's.
+        let fits = |t: &mut GestureTool| {
+            let acts = drag(t, &cx, &stroke, Mods::default());
+            let fit = |a: &Action| if let Action::Preview(_, v) = a { Some(v.get("fit").cloned()) } else { None };
+            let (drawn, release) = acts.split_at(acts.len() - 1);
+            (drawn.iter().flatten().filter_map(fit).collect::<Vec<_>>(), release[0].iter().filter_map(fit).collect::<Vec<_>>())
+        };
+        let mut t = GestureTool::new("pencil");
+        assert_eq!(t.options()["liveFit"], json!(true));
+        let (drawn, release) = fits(&mut t);
+        assert!(!drawn.is_empty() && drawn.iter().all(Option::is_none), "{drawn:?}");
+        assert_eq!(release, [None]);
+        t.set_option("liveFit", &json!(false));
+        assert_eq!(t.options()["liveFit"], json!(false));
+        let (drawn, release) = fits(&mut t);
+        assert!(!drawn.is_empty() && drawn.iter().all(|f| *f == Some(json!(false))), "{drawn:?}");
+        assert_eq!(release, [None], "the release fits the stroke");
+        // Choosing another tool while the stroke is drawn keeps it fitted, too.
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 0.0, 0.0));
+        for &(x, y) in &stroke[1..] {
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, x, y));
+        }
+        let acts = t.deactivate(&cx);
+        assert!(matches!(acts.as_slice(), [Action::Preview(_, v), Action::Commit] if v.get("fit").is_none()), "{acts:?}");
+        // The Paintbrush has no such option, and its previews are fitted.
+        let mut t = GestureTool::new("paintbrush");
+        t.set_option("liveFit", &json!(false));
+        assert!(t.options().get("liveFit").is_none());
+        let (drawn, _) = fits(&mut t);
+        assert!(!drawn.is_empty() && drawn.iter().all(Option::is_none), "{drawn:?}");
+    }
+
     /// Keep selected is on by default, and every Pencil and Paintbrush preview sends it.
     #[test]
     fn pencil_and_paintbrush_send_keep_selected() {
@@ -696,9 +837,63 @@ mod tests {
         }
     }
 
+    /// With the Pencil's Live preview off, a stroke previews nothing while it is drawn: a thin line
+    /// follows the pen (an overlay), and the release draws the path with its fill and stroke. On (the
+    /// default), every step previews the path and no line is shown. The Paintbrush has no such option.
+    #[test]
+    fn pencil_with_live_preview_off_shows_a_thin_line_until_the_release() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let previews = |acts: &[Action]| acts.iter().filter(|a| matches!(a, Action::Preview(..))).count();
+        let line = |t: &GestureTool| t.overlays(&cx).iter().any(|o| matches!(o, Overlay::Path { width, .. } if *width == 1.0));
+        let pts = [(0.0, 0.0), (10.0, 5.0), (20.0, 0.0), (30.0, 5.0)];
+        for live in [true, false] {
+            let mut t = GestureTool::new("pencil");
+            assert_eq!(t.options()["livePreview"], json!(true), "on by default");
+            t.set_option("livePreview", &json!(live));
+            assert_eq!(t.options()["livePreview"], json!(live));
+            t.pointer(&cx, &PointerEvent::new(PointerKind::Down, pts[0].0, pts[0].1));
+            let mut during = vec![];
+            for &(x, y) in &pts[1..] {
+                during.extend(t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, x, y)));
+            }
+            assert!(matches!(during.first(), Some(Action::Begin(_))), "live {live}: {during:?}");
+            assert_eq!(previews(&during), if live { 3 } else { 0 }, "live {live}: {during:?}");
+            assert_eq!(line(&t), !live, "live {live}: the thin line shows only with Live preview off");
+            let up = t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 30.0, 5.0));
+            assert!(matches!(up.as_slice(), [Action::Preview(c, _), Action::Commit] if c == "path.freehand"), "live {live}: {up:?}");
+            assert!(!line(&t), "live {live}: no line after the release");
+        }
+        // Escape mid-stroke with Live preview off cancels the stroke it began.
+        let mut t = GestureTool::new("pencil");
+        t.set_option("livePreview", &json!(false));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 0.0, 0.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 10.0, 5.0));
+        assert_eq!(t.key(&cx, ToolKey::Escape, Mods::default()), vec![Action::Cancel]);
+        // The Paintbrush keeps previewing: Live preview isn't one of its options.
+        let mut b = GestureTool::new("paintbrush");
+        assert!(b.options().get("livePreview").is_none());
+        b.set_option("livePreview", &json!(false));
+        b.pointer(&cx, &PointerEvent::new(PointerKind::Down, 0.0, 0.0));
+        let acts = b.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 10.0, 5.0));
+        assert_eq!(previews(&acts), 1, "{acts:?}");
+    }
+
     /// Holding Alt shows the Paintbrush's closing cursor before the press, and the Pencil's and the
     /// Paintbrush's while drawing (before a press, Alt gives the Pencil its straight-line cursor); a release
     /// with Alt still held closes the path, and Alt let go before the release leaves it open.
+    /// The freehand tools take every position the pointer passed (`wants_samples`); the Join tool
+    /// doesn't need them.
+    #[test]
+    fn the_freehand_tools_want_every_sample() {
+        for id in ["pencil", "paintbrush", "blobBrush", "eraser", "knife", "smooth", "pathEraser"] {
+            assert!(GestureTool::new(id).wants_samples(), "{id}");
+        }
+        assert!(!GestureTool::new("join").wants_samples());
+    }
+
     #[test]
     fn alt_shows_the_closing_cursor_and_a_release_with_alt_closes() {
         let (d, _) = doc_with_rect();
@@ -711,7 +906,7 @@ mod tests {
             [("pencil", Cursor::Pencil, Cursor::PencilClose, "pencil"), ("paintbrush", Cursor::Paintbrush, Cursor::PaintbrushClose, "brush")]
         {
             let mut t = GestureTool::new(id);
-            assert_eq!(t.cursor(&cx, at, Mods::default()), own, "{id}");
+            assert_eq!(t.cursor(&cx, at, Mods::default()), if id == "pencil" { Cursor::PencilNew } else { own }, "{id}");
             assert_eq!(t.cursor(&cx, at, alt), if id == "pencil" { Cursor::PencilStraight } else { closing }, "{id}");
             for alt_at_release in [true, false] {
                 t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 0.0, 0.0));
@@ -742,6 +937,24 @@ mod tests {
         assert_eq!(t.cursor(&cx, at, Mods::default()), Cursor::Smooth, "a smoothing drag");
     }
 
+    #[test]
+    fn blob_brush_drag_shows_scrub_length_measurement_labels() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let on = ToolContext { measurement_labels: true, ..cx(&d, &s, &p) };
+        let off = ToolContext { measurement_labels: false, ..cx(&d, &s, &p) };
+        let mut t = GestureTool::new("blobBrush");
+        t.pointer(&on, &PointerEvent::new(PointerKind::Down, 50.0, 150.0));
+        t.pointer(&on, &PointerEvent::new(PointerKind::Drag, 150.0, 150.0));
+        let want = format!("L: {}", on.len(100.0));
+        assert!(t.overlays(&on).iter().any(|o| matches!(o, Overlay::Measure { text, .. } if text == &want)));
+        let mut quiet = GestureTool::new("blobBrush");
+        quiet.pointer(&off, &PointerEvent::new(PointerKind::Down, 50.0, 150.0));
+        quiet.pointer(&off, &PointerEvent::new(PointerKind::Drag, 150.0, 150.0));
+        assert!(!quiet.overlays(&off).iter().any(|o| matches!(o, Overlay::Measure { .. })));
+    }
+
     /// The Blob Brush has Keep selected and Merge only with selection, both off by default, and its
     /// stroke sends both.
     #[test]
@@ -761,8 +974,8 @@ mod tests {
                 "{acts:?}"
             );
         }
-        // The Eraser keeps Size only.
-        assert_eq!(GestureTool::new("eraser").options(), json!({"size": 10.0}));
+        // The Eraser keeps Size, Angle and Roundness: a round tip by default.
+        assert_eq!(GestureTool::new("eraser").options(), json!({"size": 10.0, "angle": 0.0, "roundness": 100.0}));
     }
 
     /// Shift keeps a Blob Brush stroke on the horizontal or vertical line through the press point,
@@ -909,7 +1122,7 @@ mod tests {
             }
         }
         let mut t = GestureTool::new("pencil");
-        assert_eq!(t.cursor(&cx, at, Mods::default()), Cursor::Pencil);
+        assert_eq!(t.cursor(&cx, at, Mods::default()), Cursor::PencilNew);
         assert_eq!(t.cursor(&cx, at, shift), Cursor::PencilStraight);
         assert_eq!(t.cursor(&cx, at, alt), Cursor::PencilStraight, "Alt alone draws a line at any angle");
         assert_eq!(t.cursor(&cx, at, shift_alt), Cursor::PencilStraight, "Alt at the release leaves a straight line open");
@@ -925,6 +1138,59 @@ mod tests {
         assert_eq!(t.cursor(&cx, at, shift), Cursor::Pencil, "a freehand stroke");
         assert_eq!(GestureTool::new("paintbrush").cursor(&cx, at, shift), Cursor::Paintbrush);
         assert_eq!(Cursor::PencilStraight.precise(), Cursor::Crosshair, "Use Precise Cursors");
+    }
+
+    /// Before a press, the Pencil shows its new-path cursor (the star) exactly when the press draws
+    /// a new path: over an end of a selected open path, which the stroke continues, and over a
+    /// selected path, which it redraws, it does not. With nothing selected, with Edit Selected Paths
+    /// off and away from the paths, it does; while a stroke is drawn, it does not.
+    #[test]
+    fn pencil_shows_the_star_before_a_press_that_draws_a_new_path() {
+        let (mut d, _) = doc_with_rect();
+        let l = d.layers[0].id;
+        let id = d.alloc_id();
+        let line = vectorcraft_geom::PathData::from_bezpath(&vectorcraft_geom::BezPath::from_vec(vec![
+            vectorcraft_geom::PathEl::MoveTo(Point::new(300.0, 300.0)),
+            vectorcraft_geom::PathEl::LineTo(Point::new(400.0, 300.0)),
+        ]));
+        d.insert(Some(l), 1, vectorcraft_doc::Node::path(id, line, vectorcraft_doc::Appearance::default_art())).unwrap();
+        let mut s = Selection::default();
+        s.set([id]);
+        let p = paint();
+        let mut cx = cx(&d, &s, &p);
+        cx.smart_guides = false;
+        // The stroke edits the selected path when its previews continue or redraw it.
+        let edits = |acts: &[Vec<Action>]| {
+            acts.iter().flatten().any(|a| matches!(a, Action::Preview(_, v) if v.get("extend").is_some() || v.get("redraw").is_some()))
+        };
+        let (end, middle, away) = (Point::new(405.0, 303.0), Point::new(350.0, 304.0), Point::new(350.0, 360.0));
+        for edit_within in [12.0, 0.0] {
+            for at in [end, Point::new(296.0, 302.0), middle, away, Point::new(200.0, 200.0)] {
+                let mut t = GestureTool::new("pencil");
+                t.set_option("editWithin", &json!(edit_within));
+                let shown = t.cursor(&cx, at, Mods::default()) == Cursor::PencilNew;
+                let acts = drag(&mut t, &cx, &[(at.x, at.y), (360.0, 330.0), (420.0, 350.0)], Mods::default());
+                assert_eq!(shown, !edits(&acts), "editWithin {edit_within} at {at:?}");
+            }
+        }
+        let mut t = GestureTool::new("pencil");
+        assert_eq!(t.cursor(&cx, end, Mods::default()), Cursor::Pencil, "over an end the stroke continues");
+        assert_eq!(t.cursor(&cx, middle, Mods::default()), Cursor::Pencil, "over the path the stroke redraws");
+        assert_eq!(t.cursor(&cx, away, Mods::default()), Cursor::PencilNew, "away from the path");
+        // While a stroke is drawn, the Pencil's own cursor.
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, away.x, away.y));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 380.0, 380.0));
+        assert_eq!(t.cursor(&cx, Point::new(380.0, 380.0), Mods::default()), Cursor::Pencil, "while a stroke is drawn");
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 380.0, 380.0));
+        assert_eq!(t.cursor(&cx, away, Mods::default()), Cursor::PencilNew, "after the release");
+        // With nothing selected, every press draws a new path.
+        let none = Selection::default();
+        let cx_none = crate::testutil::cx(&d, &none, &p);
+        assert_eq!(GestureTool::new("pencil").cursor(&cx_none, middle, Mods::default()), Cursor::PencilNew, "nothing selected");
+        // Shift held: a straight line, with its own cursor; the Paintbrush keeps its cursor.
+        let shift = Mods { shift: true, ..Default::default() };
+        assert_eq!(GestureTool::new("pencil").cursor(&cx, away, shift), Cursor::PencilStraight);
+        assert_eq!(GestureTool::new("paintbrush").cursor(&cx, away, Mods::default()), Cursor::Paintbrush);
     }
 
     /// #3799: a Shift line started on an end of a selected open path continues the path from that
@@ -950,6 +1216,66 @@ mod tests {
         let Some(Action::Preview(_, v)) = acts.last().and_then(|a| a.first()) else { panic!("{acts:?}") };
         assert_eq!(v["extend"], json!({"id": id.0, "end": "end"}));
         assert_eq!(v["points"], json!([[400.0, 300.0], [400.0 + 100f64.hypot(4.0), 300.0]]));
+    }
+
+    /// Before a press over an end of a selected open path, the Pencil shows its continuation cursor
+    /// exactly when the press would draw a straight line that continues the path; away from the
+    /// ends, with nothing selected, with Edit Selected Paths off, once the press is down and with
+    /// the Paintbrush, it does not.
+    #[test]
+    fn pencil_shows_the_continuation_cursor_over_an_end_a_line_continues() {
+        let (mut d, _) = doc_with_rect();
+        let l = d.layers[0].id;
+        let id = d.alloc_id();
+        let line = vectorcraft_geom::PathData::from_bezpath(&vectorcraft_geom::BezPath::from_vec(vec![
+            vectorcraft_geom::PathEl::MoveTo(Point::new(300.0, 300.0)),
+            vectorcraft_geom::PathEl::LineTo(Point::new(400.0, 300.0)),
+        ]));
+        d.insert(Some(l), 1, vectorcraft_doc::Node::path(id, line, vectorcraft_doc::Appearance::default_art())).unwrap();
+        let mut s = Selection::default();
+        s.set([id]);
+        let p = paint();
+        let mut cx = cx(&d, &s, &p);
+        cx.smart_guides = false;
+        let shift = Mods { shift: true, ..Default::default() };
+        let alt = Mods { alt: true, ..Default::default() };
+        let shift_alt = Mods { shift: true, alt: true, ..Default::default() };
+        // The release's stroke: a straight line that continues the path.
+        let continues = |acts: &[Vec<Action>]| {
+            acts.last().and_then(|a| a.first()).is_some_and(
+                |a| matches!(a, Action::Preview(_, v) if v.get("extend").is_some() && v["points"].as_array().is_some_and(|q| q.len() == 2)),
+            )
+        };
+        for alt_smooth in [false, true] {
+            for m in [Mods::default(), shift, alt, shift_alt] {
+                for (at, other_end) in [(Point::new(405.0, 303.0), (500.0, 296.0)), (Point::new(296.0, 302.0), (200.0, 310.0))] {
+                    let mut t = GestureTool::new("pencil");
+                    t.set_option("altSmooth", &json!(alt_smooth));
+                    let shown = t.cursor(&cx, at, m) == Cursor::PencilContinue;
+                    let acts = drag_held(&mut t, &cx, &[(at.x, at.y), (450.0, 250.0), other_end], m);
+                    assert_eq!(shown, continues(&acts), "altSmooth {alt_smooth}, {m:?} at {at:?}");
+                }
+            }
+        }
+        let mut t = GestureTool::new("pencil");
+        let end = Point::new(405.0, 303.0);
+        assert_eq!(t.cursor(&cx, end, shift), Cursor::PencilContinue);
+        assert_eq!(t.cursor(&cx, end, alt), Cursor::PencilContinue, "Alt alone continues at any angle");
+        assert_eq!(t.cursor(&cx, end, Mods::default()), Cursor::Pencil, "without Shift or Alt the stroke is freehand");
+        assert_eq!(t.cursor(&cx, Point::new(350.0, 360.0), shift), Cursor::PencilStraight, "away from the ends");
+        // While the line is drawn, the Pencil's own cursor.
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, end.x, end.y).with_mods(shift));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 450.0, 303.0).with_mods(shift));
+        assert_eq!(t.cursor(&cx, end, shift), Cursor::Pencil, "while the line is drawn");
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 450.0, 303.0).with_mods(shift));
+        // Edit Selected Paths off: the press draws a new line.
+        t.set_option("editWithin", &json!(0.0));
+        assert_eq!(t.cursor(&cx, end, shift), Cursor::PencilStraight, "Edit Selected Paths off");
+        let none = Selection::default();
+        let cx_none = crate::testutil::cx(&d, &none, &p);
+        assert_eq!(GestureTool::new("pencil").cursor(&cx_none, end, shift), Cursor::PencilStraight, "nothing selected");
+        assert_eq!(GestureTool::new("paintbrush").cursor(&cx, end, shift), Cursor::Paintbrush);
+        assert_eq!(Cursor::PencilContinue.precise(), Cursor::Crosshair, "Use Precise Cursors");
     }
 
     /// #3846: Alt during a Shift line doesn't promise a close the release can't do, and with Alt
@@ -1155,6 +1481,48 @@ mod tests {
         }
     }
 
+    /// A Pencil stroke from an end of a selected open path to an end of another selected open path
+    /// connects the two; it does not when the other path is not selected, and the Paintbrush does
+    /// not connect.
+    #[test]
+    fn pencil_connects_a_stroke_from_one_selected_path_to_an_end_of_another() {
+        let (mut d, _) = doc_with_rect();
+        let l = d.layers[0].id;
+        let add = |d: &mut vectorcraft_doc::Document, a: (f64, f64), b: (f64, f64)| {
+            let id = d.alloc_id();
+            let line = vectorcraft_geom::PathData::from_bezpath(&vectorcraft_geom::BezPath::from_vec(vec![
+                vectorcraft_geom::PathEl::MoveTo(Point::new(a.0, a.1)),
+                vectorcraft_geom::PathEl::LineTo(Point::new(b.0, b.1)),
+            ]));
+            d.insert(Some(l), 1, vectorcraft_doc::Node::path(id, line, vectorcraft_doc::Appearance::default_art())).unwrap();
+            id
+        };
+        let a = add(&mut d, (300.0, 300.0), (400.0, 300.0));
+        let b = add(&mut d, (500.0, 400.0), (600.0, 400.0));
+        let p = paint();
+        let stroke = [(400.0, 300.0), (450.0, 350.0), (499.0, 401.0)];
+        let mut both = Selection::default();
+        both.set([a, b]);
+        let mut one = Selection::default();
+        one.set([a]);
+        // The previews select the path continued: after the press only it is selected.
+        let last = |tool: &str, at_press: &Selection| {
+            let mut t = GestureTool::new(tool);
+            t.pointer(&cx(&d, at_press, &p), &PointerEvent::new(PointerKind::Down, stroke[0].0, stroke[0].1));
+            let after = cx(&d, &one, &p);
+            t.pointer(&after, &PointerEvent::new(PointerKind::Drag, stroke[1].0, stroke[1].1));
+            t.pointer(&after, &PointerEvent::new(PointerKind::Drag, stroke[2].0, stroke[2].1));
+            let acts = t.pointer(&after, &PointerEvent::new(PointerKind::Up, stroke[2].0, stroke[2].1));
+            let Some(Action::Preview(_, v)) = acts.first() else { panic!("{acts:?}") };
+            v.clone()
+        };
+        let v = last("pencil", &both);
+        assert_eq!((v["extend"].clone(), v["connect"].clone()), (json!({"id": a.0, "end": "end"}), json!({"id": b.0, "end": "start"})));
+        assert!(last("paintbrush", &both).get("connect").is_none(), "the Paintbrush");
+        let v = last("pencil", &one);
+        assert!(v.get("extend").is_some() && v.get("connect").is_none(), "{v}");
+    }
+
     /// Close paths when ends are within 0 turns closing off: a stroke that ends exactly where it
     /// started stays open; at 15 px it is closed.
     #[test]
@@ -1204,7 +1572,7 @@ mod tests {
                 let (acts, after) = at(PointerKind::Up, 318.0, 335.0);
                 let Some(Action::Preview(_, v)) = acts.first() else { panic!("{tool}: {acts:?}") };
                 assert_eq!(v["closed"], json!(within > 0.0), "{tool}: the release does what the cursor showed");
-                assert_eq!(after, own, "{tool} after the release");
+                assert_eq!(after, if tool == "pencil" { Cursor::PencilNew } else { own }, "{tool} after the release");
             }
         }
         // A straight Pencil line (Shift or Alt held at the press) stays open, so it shows no ring
@@ -1219,6 +1587,31 @@ mod tests {
                 assert_eq!(t.cursor(&cx, Point::new(318.0, 335.0), m), Cursor::Pencil, "a straight line, {held:?}, {m:?}");
             }
         }
+    }
+
+    /// A Paintbrush sample under a pixel from the last point is dropped, and a release there keeps
+    /// the last point: the closing cursor follows that point, not the pointer.
+    #[test]
+    fn the_paintbrush_closing_cursor_follows_the_point_a_release_keeps() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let none = Mods::default();
+        let mut t = GestureTool::new("paintbrush");
+        t.set_option("closeWithin", &json!(15.0));
+        for (k, x, y) in [(PointerKind::Down, 310.0, 330.0), (PointerKind::Drag, 360.0, 350.0), (PointerKind::Drag, 330.0, 390.0)] {
+            t.pointer(&cx, &PointerEvent::new(k, x, y));
+        }
+        // The last point kept is 15.5 from the start, outside Close Paths When Ends Are Within.
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 325.5, 330.0));
+        assert_eq!(t.cursor(&cx, Point::new(325.5, 330.0), none), Cursor::Paintbrush, "outside the closing distance");
+        // The pointer moves 0.7 to 14.8 from the start; the sample is dropped.
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 324.8, 330.0));
+        assert_eq!(t.cursor(&cx, Point::new(324.8, 330.0), none), Cursor::Paintbrush, "the dropped sample shows no ring");
+        let acts = t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 324.8, 330.0));
+        let Some(Action::Preview(_, v)) = acts.first() else { panic!("{acts:?}") };
+        assert_eq!(v["closed"], json!(false), "the release keeps the last point and leaves the path open");
     }
 
     #[test]
@@ -1237,6 +1630,47 @@ mod tests {
         assert_eq!(k.overlays(&cx).len(), 1);
         let a = k.pointer(&cx, &PointerEvent::new(PointerKind::Up, 250.0, 150.0));
         assert!(matches!(&a[0], Action::Exec(c, v) if c == "path.knife" && v["points"].as_array().unwrap().len() == 3));
+    }
+
+    /// The Eraser's Angle and Roundness (Eraser Tool Options) go with its stroke, kept within
+    /// −180–180° and 1–100%; while it drags, a tip that is not round shows the outline of the area
+    /// it covers, and a round one the drag as wide as the tip.
+    #[test]
+    fn the_eraser_sends_its_tip_and_shows_the_area_it_covers() {
+        let (d, _) = doc_with_rect();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let mut t = GestureTool::new("eraser");
+        t.set_option("size", &json!(20));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 50.0, 150.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 150.0, 150.0));
+        let round = t.overlays(&cx);
+        assert!(matches!(&round[..], [Overlay::Path { width, .. }] if *width == 20.0), "{round:?}");
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 250.0, 150.0));
+        for (angle, roundness, sent) in [(90.0, 25.0, (90.0, 25.0)), (400.0, 0.0, (180.0, 1.0)), (-400.0, 250.0, (-180.0, 100.0))] {
+            t.set_option("angle", &json!(angle));
+            t.set_option("roundness", &json!(roundness));
+            assert_eq!((t.options()["angle"].as_f64(), t.options()["roundness"].as_f64()), (Some(sent.0), Some(sent.1)));
+            let acts = drag(&mut t, &cx, &[(50.0, 150.0), (250.0, 150.0)], Mods::default());
+            assert!(
+                matches!(&acts[2][0], Action::Exec(c, v) if c == "path.eraseRegion" && v["size"] == 20.0 && v["angle"] == sent.0 && v["roundness"] == sent.1),
+                "{acts:?}"
+            );
+        }
+        // A tip 20 pt long and 5 pt wide, standing upright: along a horizontal drag from x 50 to
+        // x 150 the outline reaches 2.5 pt either side of the drag and 10 pt above and below
+        // its ends.
+        t.set_option("angle", &json!(90));
+        t.set_option("roundness", &json!(25));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 50.0, 150.0));
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 150.0, 150.0));
+        let o = t.overlays(&cx);
+        let [Overlay::Path { path, width, .. }] = &o[..] else { panic!("{o:?}") };
+        assert_eq!(*width, 1.0);
+        let b = vectorcraft_geom::Shape::bounding_box(path);
+        assert!((b.x0 - 47.5).abs() < 0.1 && (b.x1 - 152.5).abs() < 0.1, "{b:?}");
+        assert!((b.y0 - 140.0).abs() < 0.1 && (b.y1 - 160.0).abs() < 0.1, "{b:?}");
     }
 
     #[test]
@@ -1269,7 +1703,7 @@ mod tests {
         // When alt is pressed, cursor shows smooth tool.
         let alt_mod = Mods { alt: true, ..Default::default() };
         assert_eq!(t.cursor(&cx, Point::new(50.0, 50.0), alt_mod), Cursor::Smooth);
-        assert_eq!(t.cursor(&cx, Point::new(50.0, 50.0), Mods::default()), Cursor::Pencil);
+        assert_eq!(t.cursor(&cx, Point::new(50.0, 50.0), Mods::default()), Cursor::PencilNew);
 
         // Alt-drag over selected path smooths it.
         let acts = drag_held(&mut t, &cx, &[(50.0, 150.0), (150.0, 150.0), (250.0, 150.0)], alt_mod);

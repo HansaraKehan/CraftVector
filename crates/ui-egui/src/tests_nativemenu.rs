@@ -312,7 +312,7 @@ impl Mac {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600.0, 850.0))),
             ..Default::default()
         };
-        self.app.raw_input_hook(&mut raw);
+        self.app.raw_input_hook(&self.ctx, &mut raw);
         let app = &mut self.app;
         let mut out = self.ctx.run_ui(raw, |ui| {
             app.logic(ui.ctx());
@@ -664,7 +664,7 @@ fn the_menu_bar_is_inert_while_a_file_dialog_is_open() {
     k.modifiers.mac_cmd = k.modifiers.command;
     m.fake.report(native_menu::Event::Key(k));
     let mut raw = egui::RawInput::default();
-    m.app.raw_input_hook(&mut raw);
+    m.app.raw_input_hook(&m.ctx, &mut raw);
     assert!(!raw.events.iter().any(|e| matches!(e, Event::Key { .. })), "{:?}", raw.events);
     m.key_equivalent("Cmd+A");
     assert_eq!(m.selected(), 0, "⌘A selected nothing");

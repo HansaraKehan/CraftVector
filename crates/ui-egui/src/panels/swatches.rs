@@ -609,14 +609,21 @@ pub(crate) fn drag_preview(app: &VectorcraftApp, ctx: &egui::Context) {
         },
         PanelDrag::GraphicStyle(name) => return pointer_chip(ctx, |ui, r| super::graphic_styles::paint_style(app, ui, r, name)),
         PanelDrag::Symbol(name) => match app.session.active() {
-            Some(st) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &st.doc, super::symbols::resources_key(&st.doc), r, name)),
+            Some(st) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &st.doc, &super::symbols::document_symbols(st), r, name)),
             None => return,
         },
         PanelDrag::LibrarySymbol { library, name } => match vectorcraft_engine::cmd::symbollib::library(&app.session, library) {
-            Some((_, lib)) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &lib.doc, super::symbols::resources_key(&lib.doc), r, name)),
+            Some((_, lib)) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &lib.doc, &super::symbols::library_symbols(&lib), r, name)),
             None => return,
         },
-        PanelDrag::Brush { def, .. } => return pointer_chip(ctx, |ui, r| super::brushes::chip(ui, r, def)),
+        PanelDrag::Brush { name, .. } => match app.session.active() {
+            Some(st) => return pointer_chip(ctx, |ui, r| super::brushes::document_chip(ui, r, st, name)),
+            None => return,
+        },
+        PanelDrag::LibraryBrush { library, name } => match vectorcraft_engine::cmd::brushlib::library(&app.session, library) {
+            Some((_, lib)) => return pointer_chip(ctx, |ui, r| super::brushes::library_chip(ui, r, &lib, name)),
+            None => return,
+        },
         PanelDrag::LibraryGraphic { library, item } => return pointer_chip(ctx, |ui, r| super::libraries::chip(app, ui, r, library, item)),
         PanelDrag::LibraryItem { .. } | PanelDrag::LibraryGroup { .. } => return,
     };
@@ -633,7 +640,7 @@ pub(crate) fn drag_preview(app: &VectorcraftApp, ctx: &egui::Context) {
 /// A 16-point chip `draw` paints, following the pointer.
 fn pointer_chip(ctx: &egui::Context, draw: impl FnOnce(&Ui, Rect)) {
     let Some(at) = ctx.pointer_hover_pos() else { return };
-    let area = egui::Area::new(egui::Id::new("swatch-drag-preview")).order(egui::Order::Tooltip).fixed_pos(at + vec2(12.0, 12.0));
+    let area = egui::Area::new(egui::Id::unique("swatch-drag-preview")).order(egui::Order::Tooltip).fixed_pos(at + vec2(12.0, 12.0));
     area.interactable(false).show(ctx, |ui| {
         let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
         draw(ui, r);
@@ -642,7 +649,7 @@ fn pointer_chip(ctx: &egui::Context, draw: impl FnOnce(&Ui, Rect)) {
 
 /// The id of the find field's text (shown with the panel menu's Show Find Field).
 fn find_id() -> egui::Id {
-    egui::Id::new("swatch-find")
+    egui::Id::unique("swatch-find")
 }
 
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
@@ -741,7 +748,7 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, salt: &'static str) {
                 }
             }
         });
-        let zone = ui.interact(out.inner_rect, ui.id().with("swatch-drop"), Sense::hover());
+        let zone = ui.interact(out.inner_rect, ui.scope_id().with("swatch-drop"), Sense::hover());
         zone_input(ui, &zone, &mut ev);
     });
     match ev.edit {
@@ -905,7 +912,7 @@ pub(crate) fn folder_tile(ui: &Ui, cell: Rect, selected: bool) {
 
 /// The interaction id of a tile or list row (stable per swatch or group name and host `salt`).
 fn tile_id(salt: &'static str, e: &Entry) -> egui::Id {
-    egui::Id::new((salt, e.name()))
+    egui::Id::unique((salt, e.name()))
 }
 
 /// The selected swatches and groups that can be deleted (all but None and Registration).
@@ -1332,14 +1339,14 @@ mod tests {
     /// Double-click the thumbnail of swatch `name` in the panel.
     fn double_click_tile(app: &mut VectorcraftApp, ctx: &egui::Context, name: &str) {
         frame(app, ctx, vec![], 0.0, show);
-        let tile = ctx.read_response(egui::Id::new(("swatch-tile", name))).unwrap_or_else(|| panic!("no tile for {name}")).rect;
+        let tile = ctx.read_response(egui::Id::unique(("swatch-tile", name))).unwrap_or_else(|| panic!("no tile for {name}")).rect;
         frame(app, ctx, double_click(tile.center()), 1.0, show);
     }
 
     /// Click the thumbnail of swatch or group `name` with `modifiers` held (frames at `time`, `time + 0.5`).
     fn click_tile(app: &mut VectorcraftApp, ctx: &egui::Context, name: &str, modifiers: Modifiers, time: f64) {
         frame(app, ctx, vec![], time, show);
-        let at = ctx.read_response(egui::Id::new(("swatch-tile", name))).unwrap_or_else(|| panic!("no tile for {name}")).rect.center();
+        let at = ctx.read_response(egui::Id::unique(("swatch-tile", name))).unwrap_or_else(|| panic!("no tile for {name}")).rect.center();
         let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers };
         frame_with(app, ctx, vec![Event::PointerMoved(at), button(true), button(false)], modifiers, time + 0.5, show);
     }
@@ -1652,7 +1659,7 @@ mod tests {
 
     /// The centre of the tile or row of `name` as laid out by the last frame.
     fn tile_center(ctx: &egui::Context, name: &str) -> Pos2 {
-        ctx.read_response(egui::Id::new(("swatch-tile", name))).unwrap_or_else(|| panic!("no tile for {name}")).rect.center()
+        ctx.read_response(egui::Id::unique(("swatch-tile", name))).unwrap_or_else(|| panic!("no tile for {name}")).rect.center()
     }
 
     /// Press at `from`, drag to `to` and release there, a frame per step from `time`.
@@ -1685,7 +1692,7 @@ mod tests {
         set_pstate(&ctx, "swatch-show-find", true);
         ctx.data_mut(|d| d.insert_temp(find_id(), "BRIGHT".to_string()));
         frame(&mut app, &ctx, vec![], 0.0, show);
-        assert!(ctx.read_response(egui::Id::new(("swatch-tile", "Red"))).is_none(), "Red doesn't match");
+        assert!(ctx.read_response(egui::Id::unique(("swatch-tile", "Red"))).is_none(), "Red doesn't match");
         click_tile(&mut app, &ctx, "Bright Red", Modifiers::NONE, 1.0);
         click_tile(&mut app, &ctx, "Bright Blue", Modifiers::SHIFT, 2.0);
         assert_eq!(selected(&ctx), ["Bright Red", "Bright Yellow", "Bright Green", "Bright Blue"]);
@@ -1693,8 +1700,8 @@ mod tests {
         ctx.data_mut(|d| d.insert_temp(find_id(), "grays".to_string()));
         frame(&mut app, &ctx, vec![], 3.0, show);
         frame(&mut app, &ctx, vec![], 3.5, show);
-        assert!(ctx.read_response(egui::Id::new(("swatch-tile", "K=50"))).is_some());
-        assert!(ctx.read_response(egui::Id::new(("swatch-tile", "Bright Red"))).is_none());
+        assert!(ctx.read_response(egui::Id::unique(("swatch-tile", "K=50"))).is_some());
+        assert!(ctx.read_response(egui::Id::unique(("swatch-tile", "Bright Red"))).is_none());
     }
 
     #[test]
@@ -1912,7 +1919,7 @@ mod tests {
         app.run("paint.setFill", json!({"ids": [id], "swatch": "Last Ink"})).unwrap();
         app.run("select.none", json!({})).unwrap();
         let ctx = context();
-        let tile = |ctx: &egui::Context| ctx.read_response(egui::Id::new(("swatch-tile", "Last Ink"))).unwrap().rect;
+        let tile = |ctx: &egui::Context| ctx.read_response(egui::Id::unique(("swatch-tile", "Last Ink"))).unwrap().rect;
         frame(&mut app, &ctx, vec![], 0.0, show);
         frame(&mut app, &ctx, vec![], 0.1, show);
         let far = tile(&ctx).top();
@@ -1925,7 +1932,7 @@ mod tests {
         assert!(near < far - 100.0, "scrolled to the swatch: {far} → {near}");
         assert!(selected(&ctx).is_empty(), "the art's swatch is highlighted");
         // Once: later frames leave the scroll where the user puts it.
-        assert_eq!(focus_swatch(&app, &egui::Ui::new(ctx.clone(), egui::Id::new("t"), egui::UiBuilder::new()), Some("Last Ink")), None);
+        assert_eq!(focus_swatch(&app, &egui::Ui::new(ctx.clone(), egui::Id::unique("t"), egui::UiBuilder::new()), Some("Last Ink")), None);
     }
 
     /// Deselecting art keeps its swatch highlighted (not the White new art gets) until the paints for
@@ -1940,7 +1947,7 @@ mod tests {
         // New art's paints back to the defaults, as for art that came in with a file.
         app.run("paint.default", json!({})).unwrap();
         let ctx = context();
-        let ui = egui::Ui::new(ctx.clone(), egui::Id::new("t"), egui::UiBuilder::new());
+        let ui = egui::Ui::new(ctx.clone(), egui::Id::unique("t"), egui::UiBuilder::new());
         let shown = |app: &VectorcraftApp| kept_swatch(app, &ui, active_swatch(app));
         assert_ne!(shown(&app).as_deref(), Some("Ink 185"), "nothing selected yet: new art's paint");
         app.run("select.set", json!({"ids": [id]})).unwrap();

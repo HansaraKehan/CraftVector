@@ -172,7 +172,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     });
     ui.add_space(4.0);
     let empty = lib.items().next().is_none() && lib.groups.is_empty();
-    let query = if empty { String::new() } else { widgets::search_field(ui, egui::Id::new("library-search"), tl!("Search")) };
+    let query = if empty { String::new() } else { widgets::search_field(ui, egui::Id::unique("library-search"), tl!("Search")) };
     let query = query.trim().to_lowercase();
     let searching = !query.is_empty();
     let shown = |name: &str| !searching || name.to_lowercase().contains(&query);
@@ -188,7 +188,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     ui.add_space(4.0);
     // The list takes the panel's height down to the bottom bar (as tall as it was last frame), and
     // scrolls.
-    let bar_id = egui::Id::new("library-bottom-bar");
+    let bar_id = egui::Id::unique("library-bottom-bar");
     let bar: f32 = ui.data(|d| d.get_temp(bar_id)).unwrap_or(BAR);
     let list_h = ui.available_height() - bar;
     let list_h = if list_h.is_finite() { list_h.max(MIN_LIST) } else { MIN_LIST };
@@ -286,7 +286,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     // Art dragged off the canvas, or a swatch (not one of this library's colours), dropped on the
     // list is added to the library.
-    let zone = ui.interact(list_rect, ui.id().with("libraries-drop"), Sense::hover());
+    let zone = ui.interact(list_rect, ui.scope_id().with("libraries-drop"), Sense::hover());
     if let Some(ids) = widgets::art_drop(ui, &zone) {
         act = Some(Act::Run("library.add", json!({ "kind": "graphic", "ids": ids })));
     }
@@ -825,7 +825,7 @@ mod tests {
     fn texts(app: &mut VectorcraftApp, query: &str) -> Vec<String> {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
-        ctx.data_mut(|d| d.insert_temp(egui::Id::new("library-search"), query.to_string()));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("library-search"), query.to_string()));
         let mut shapes = vec![];
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| show(app, ui));
         out.textures_delta.clear();

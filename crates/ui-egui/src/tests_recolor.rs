@@ -130,7 +130,7 @@ fn double_clicking_a_colour_group_opens_it_and_ok_rewrites_it() {
     let ctx = context();
     let show: fn(&mut VectorcraftApp, &mut egui::Ui) = panels::swatches::show;
     frame(&mut app, &ctx, vec![], 0.0, show);
-    let folder = ctx.read_response(egui::Id::new(("swatch-tile", "Brights"))).expect("the Brights folder").rect.center();
+    let folder = ctx.read_response(egui::Id::unique(("swatch-tile", "Brights"))).expect("the Brights folder").rect.center();
     frame(&mut app, &ctx, press(folder, 2), 1.0, show);
     let d = app.ui.dialog.as_ref().expect("a dialog opened");
     assert_eq!((d.kind.as_str(), d.str("group")), (dialogs::recolor::KIND, "Brights".to_string()));
@@ -158,7 +158,7 @@ fn the_options_button_edits_a_selected_group_and_applies_it_to_the_art() {
     art(&mut app, &["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff"]);
     let show: fn(&mut VectorcraftApp, &mut egui::Ui) = panels::swatches::show;
     frame(&mut app, &ctx, vec![], 0.0, show);
-    let folder = ctx.read_response(egui::Id::new(("swatch-tile", "Brights"))).unwrap().rect.center();
+    let folder = ctx.read_response(egui::Id::unique(("swatch-tile", "Brights"))).unwrap().rect.center();
     frame(&mut app, &ctx, press(folder, 1), 1.0, show);
     frame(&mut app, &ctx, vec![], 2.0, show);
     // The bottom bar's third button: Swatch Options, or Edit or Apply Color Group for a group.
@@ -224,6 +224,18 @@ fn edit_harness(colors: &[&str]) -> egui_kittest::Harness<'static, VectorcraftAp
     );
     h.run_steps(4);
     h
+}
+
+/// The Assign tab's per-row hex fields are named by their row, not all "Color": a screen reader can
+/// tell the second from the first.
+#[test]
+fn each_recolor_hex_field_has_its_row_number() {
+    let mut h = edit_harness(&["#ff0000", "#0000ff"]);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Assign").click();
+    h.run_steps(4);
+    let _ = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Color 1");
+    let _ = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Color 2");
+    assert!(h.query_by_role_and_label(egui::accesskit::Role::TextInput, "Color").is_none(), "no ambiguous Color field");
 }
 
 /// The rect of the widget drawn `size` big (the wheel is 220 across, its Brightness slider 220 by 22).
@@ -382,7 +394,7 @@ fn many_edit_colors_keep_the_dialog_on_screen() {
             }
             let screen = h.ctx.content_rect();
             assert_eq!(screen.size(), physical / zoom, "the requested effective screen size");
-            let dialog = h.ctx.memory(|m| m.area_rect(egui::Id::new(("dialog", "recolor")))).unwrap();
+            let dialog = h.ctx.memory(|m| m.area_rect(egui::Id::unique(("dialog", "recolor")))).unwrap();
             assert!(screen.contains_rect(dialog), "{count} colors, {physical:?} at {zoom}: dialog {dialog:?} in {screen:?}");
             let wheel = widget_of_size(&h, vec2(220.0, 220.0));
             assert!(screen.contains_rect(wheel), "the wheel is accessible");
@@ -433,6 +445,7 @@ fn the_last_edit_color_can_be_selected_edited_and_undone() {
                 delta: vec2(0.0, -10000.0),
                 phase: egui::TouchPhase::Move,
                 modifiers: Modifiers::NONE,
+                source: egui::MouseWheelSource::Unknown,
             },
         ]);
         h.run_steps(12);

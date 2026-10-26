@@ -675,6 +675,19 @@ impl ParaList {
             ..first.clone()
         }
     }
+
+    /// The list that the Type tool starts when `typed` and a space are typed at the start of a
+    /// paragraph: "1." or "1)" starts a numbered list in 1, 2, 3, "A." or "A)" starts one in A, B,
+    /// C, and "*", "#", ">" or "+" starts a bulleted list with the filled dot. Any other text starts
+    /// none.
+    pub fn typed(typed: &str) -> Option<ParaList> {
+        match typed {
+            "1." | "1)" => Some(Self::numbered(NumberStyle::Arabic)),
+            "A." | "A)" => Some(Self::numbered(NumberStyle::UpperLetters)),
+            "*" | "#" | ">" | "+" => Some(Self::bulleted(Bullet::Dot)),
+            _ => None,
+        }
+    }
 }
 
 /// The left and first-line indents (pt) a list gives a paragraph whose indents are both 0: the
@@ -1524,6 +1537,14 @@ impl TextKind {
     }
 }
 
+/// Move anchors `refs` of `path`, in text space, by `d` in document space (`to_text`: the
+/// document → text map). False when an anchor doesn't exist.
+fn move_anchors(path: &mut PathData, to_text: Affine, refs: &[(usize, usize)], d: Vec2) -> bool {
+    // A distance: only the linear part of the document → text map applies.
+    let local = to_text * d.to_point() - to_text * Point::ZERO;
+    refs.iter().all(|&(si, ai)| path.anchor_mut(si, ai).map(|a| a.translate(local)).is_some())
+}
+
 /// `x` as a fraction of a path's length (0..1; 0 when not finite).
 fn fraction(x: f64) -> f64 {
     if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 }
@@ -1880,6 +1901,17 @@ impl TextObject {
         let index = |byte: usize| text.as_bytes().get(..byte).map_or(0, |s| s.iter().filter(|&&c| c == b'\n').count());
         index(a)..index(b) + 1
     }
+    /// The list that the characters before byte `at` start ([`ParaList::typed`]) with the byte
+    /// where their paragraph starts: when the plain text from the start of the paragraph up to
+    /// `at` is a list's start followed by a space, and the paragraph is in no list. None otherwise.
+    pub fn typed_list_at(&self, at: usize) -> Option<(usize, ParaList)> {
+        let text = self.plain_text();
+        let before = text.get(..at)?;
+        let start = before.rfind('\n').map_or(0, |i| i + 1);
+        let list = ParaList::typed(before[start..].strip_suffix(' ')?)?;
+        let index = before.bytes().filter(|&b| b == b'\n').count();
+        self.para_at(index).list.is_none().then_some((start, list))
+    }
     /// Apply `f` to the attributes of paragraphs `range` (indices; None = every paragraph).
     pub fn edit_paras(&mut self, range: Option<std::ops::Range<usize>>, mut f: impl FnMut(&mut ParaStyle)) {
         match range {
@@ -2008,21 +2040,28 @@ impl TextObject {
     /// their handles (a Direct Selection drag of a frame corner or edge). False, changing
     /// nothing, when an anchor doesn't exist, or as [`Self::transform_area`].
     pub fn move_area_anchors(&mut self, refs: &[(usize, usize)], d: Vec2) -> bool {
-        self.reshape_area(|frame, to_text| {
-            // A distance: only the linear part of the document → text map applies.
-            let local = to_text * d.to_point() - to_text * Point::ZERO;
-            refs.iter().all(|&(si, ai)| frame.anchor_mut(si, ai).map(|a| a.translate(local)).is_some())
-        })
+        self.reshape_area(|frame, to_text| move_anchors(frame, to_text, refs, d))
+    }
+    /// Move anchors `refs` (subpath, anchor) of type on a path's path by `d` in document space,
+    /// with their handles (a Direct Selection drag of an anchor); the brackets keep their
+    /// fractions of the path. False, changing nothing, for other type, when an anchor doesn't
+    /// exist, a degenerate `xf` or a path that would not be finite.
+    pub fn move_path_anchors(&mut self, refs: &[(usize, usize)], d: Vec2) -> bool {
+        matches!(self.kind, TextKind::OnPath { .. }) && self.reshape_local(|path, to_text| move_anchors(path, to_text, refs, d))
     }
     /// Edit a copy of the area frame with `f` (given the document → text space map) and keep it
     /// when `f` succeeds and the result is finite.
     fn reshape_area(&mut self, f: impl FnOnce(&mut PathData, Affine) -> bool) -> bool {
+        matches!(self.kind, TextKind::Area { .. }) && self.reshape_local(f)
+    }
+    /// [`Self::reshape_area`] for the area frame or type on a path's path.
+    fn reshape_local(&mut self, f: impl FnOnce(&mut PathData, Affine) -> bool) -> bool {
         let det = self.xf.determinant();
         if !det.is_finite() || det.abs() < 1e-12 {
             return false;
         }
         let to_text = self.xf.inverse();
-        let TextKind::Area { frame } = &mut self.kind else { return false };
+        let (TextKind::Area { frame } | TextKind::OnPath { path: frame, .. }) = &mut self.kind else { return false };
         let mut next = frame.clone();
         if !f(&mut next, to_text) || !next.anchors().all(|(_, _, a)| a.p.is_finite() && a.h_in.is_finite() && a.h_out.is_finite()) {
             return false;
@@ -2311,6 +2350,34 @@ mod tests {
             serde_json::to_value(ParaList::numbered(NumberStyle::LowerRoman)).unwrap(),
             serde_json::json!({"bullet": "dot", "number": "lowerRoman"})
         );
+    }
+
+    /// Typed list detection: "1.", "1)", "A." and "A)" and a space at the start of a paragraph
+    /// start a numbered list, and "*", "#", ">" and "+" and a space start a bulleted list with the
+    /// filled dot. Other text, the same characters later in a paragraph or without the space, and
+    /// a paragraph already in a list start nothing.
+    #[test]
+    fn typed_list_starts_are_found_at_a_paragraphs_start() {
+        let (arabic, letters, dot) =
+            (ParaList::numbered(NumberStyle::Arabic), ParaList::numbered(NumberStyle::UpperLetters), ParaList::bulleted(Bullet::Dot));
+        let typed = ["1.", "1)", "A.", "A)", "*", "#", ">", "+"].map(ParaList::typed);
+        assert_eq!(typed, [arabic, arabic, letters, letters, dot, dot, dot, dot].map(Some));
+        for other in ["", "2.", "a.", "a)", "I.", "1", "A", "1:", "-", "•", "1.)", " 1.", "*1", "１."] {
+            assert_eq!(ParaList::typed(other), None, "{other:?}");
+        }
+        let mut t = TextObject::point(Point::ZERO, "Fruit\n1. Apples\nA) x * y\n+ ", CharStyle::default());
+        assert_eq!(t.typed_list_at(9), Some((6, arabic)));
+        assert_eq!(t.typed_list_at(19), Some((16, letters)));
+        assert_eq!(t.typed_list_at(27), Some((25, dot)));
+        // Not at the paragraph's start, not right after the space, or past the end.
+        for at in [0, 5, 8, 10, 15, 23, 25, 26, 99] {
+            assert_eq!(t.typed_list_at(at), None, "{at}");
+        }
+        let mut styles = t.paragraph_styles();
+        styles[1].list = Some(ParaList::bulleted(Bullet::Square));
+        t.set_paragraph_styles(styles);
+        assert_eq!(t.typed_list_at(9), None, "a list paragraph stays as it is");
+        assert_eq!(t.typed_list_at(19), Some((16, letters)));
     }
 
     #[test]

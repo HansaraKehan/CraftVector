@@ -7,8 +7,9 @@
 //! 45° steps round its anchor); drag a segment → reshape the curve, a selected blend's spine's too,
 //! straight or curved (#1111; Shift: its handles at right angles to the line between its anchors,
 //! at one length). Shift held at the press on an anchor moves it instead, handles and all (Shift
-//! still held: at 45° steps from where it was). Blend spine points and handles follow the same
-//! conversions (#2544).
+//! still held: at 45° steps from where it was). Space held during a convert- or handle-drag moves
+//! the anchor, handles and all, as while drawing with the Pen. Blend spine points and handles
+//! follow the same conversions (#2544).
 //! Scissors: click a path to split it there.
 
 use serde_json::json;
@@ -83,6 +84,15 @@ enum State {
     },
 }
 
+/// Gesture to resume after Space is released mid-drag (#3694).
+#[derive(Clone, Copy, Debug)]
+enum SpaceResume {
+    Convert { id: NodeId, si: usize, ai: usize },
+    Handle { id: NodeId, si: usize, ai: usize, out: bool },
+    SpineConvert { id: NodeId, ai: usize },
+    SpineHandle { id: NodeId, ai: usize, out: bool },
+}
+
 pub struct AnchorTool {
     id: &'static str,
     state: State,
@@ -91,6 +101,8 @@ pub struct AnchorTool {
     snap: HandleSnap,
     /// Move offset while Shift-dragging an anchor or spine point (pointer, delta).
     measure: Option<(Point, f64, f64)>,
+    /// While Space is held during a convert/handle drag, the shape gesture to return to.
+    space_resume: Option<SpaceResume>,
 }
 
 impl AnchorTool {
@@ -101,7 +113,11 @@ impl AnchorTool {
             "scissors" => "scissors",
             _ => "addAnchor",
         };
-        Self { id, state: State::Idle, guides: vec![], snap: HandleSnap::default(), measure: None }
+        Self { id, state: State::Idle, guides: vec![], snap: HandleSnap::default(), measure: None, space_resume: None }
+    }
+
+    fn anchor_pos(cx: &ToolContext, id: NodeId, si: usize, ai: usize) -> Option<Point> {
+        cx.doc.node(id).and_then(|n| n.path_data()).and_then(|pd| pd.subpaths.get(si)?.anchors.get(ai).map(|a| a.p))
     }
 
     /// Nearest point of this eligible spine, in document coordinates.
@@ -216,6 +232,49 @@ impl AnchorTool {
         }
     }
 
+    fn space_move_from(cx: &ToolContext, st: State, p: Point, began: bool) -> (State, Option<SpaceResume>) {
+        match st {
+            State::Convert { id, si, ai, .. } => match Self::anchor_pos(cx, id, si, ai) {
+                Some(from) => (State::Move { id, si, ai, from, start: p, began }, Some(SpaceResume::Convert { id, si, ai })),
+                None => (st, None),
+            },
+            State::Handle { id, si, ai, out, .. } => match Self::anchor_pos(cx, id, si, ai) {
+                Some(from) => (State::Move { id, si, ai, from, start: p, began }, Some(SpaceResume::Handle { id, si, ai, out })),
+                None => (st, None),
+            },
+            State::SpineConvert { id, ai, .. } => {
+                match crate::direct::spines(cx)
+                    .into_iter()
+                    .find(|(blend, _)| *blend == id)
+                    .and_then(|(_, path)| path.subpaths.first()?.anchors.get(ai).map(|a| a.p))
+                {
+                    Some(from) => (State::SpineMove { id, ai, from, start: p, began }, Some(SpaceResume::SpineConvert { id, ai })),
+                    None => (st, None),
+                }
+            }
+            State::SpineHandle { id, ai, out, .. } => {
+                match crate::direct::spines(cx)
+                    .into_iter()
+                    .find(|(blend, _)| *blend == id)
+                    .and_then(|(_, path)| path.subpaths.first()?.anchors.get(ai).map(|a| a.p))
+                {
+                    Some(from) => (State::SpineMove { id, ai, from, start: p, began }, Some(SpaceResume::SpineHandle { id, ai, out })),
+                    None => (st, None),
+                }
+            }
+            other => (other, None),
+        }
+    }
+
+    fn resume_shape(p: Point, resume: SpaceResume, began: bool) -> State {
+        match resume {
+            SpaceResume::Convert { id, si, ai } => State::Convert { id, si, ai, start: p, began },
+            SpaceResume::Handle { id, si, ai, out } => State::Handle { id, si, ai, out, start: p, began },
+            SpaceResume::SpineConvert { id, ai } => State::SpineConvert { id, ai, start: p, began },
+            SpaceResume::SpineHandle { id, ai, out } => State::SpineHandle { id, ai, out, start: p, began },
+        }
+    }
+
     /// How far a Shift-dragged anchor has gone: Shift still held keeps it at 45° steps.
     fn move_delta(cx: &ToolContext, start: Point, p: Point, shift: bool) -> vectorcraft_geom::Vec2 {
         if shift { constrain_angle_from(p - start, 45.0, cx.constrain_angle) } else { p - start }
@@ -266,6 +325,7 @@ impl Tool for AnchorTool {
                 }
             }
             ("anchorPoint", PointerKind::Down) => {
+                self.space_resume = None;
                 self.state = Self::press_target(cx, p);
                 if ev.mods.shift {
                     self.state = Self::moving(cx, self.state);
@@ -309,6 +369,27 @@ impl Tool for AnchorTool {
                     {
                         *began = true;
                     }
+                }
+                if ev.mods.space {
+                    if self.space_resume.is_none()
+                        && matches!(self.state, State::Convert { .. } | State::Handle { .. } | State::SpineConvert { .. } | State::SpineHandle { .. })
+                    {
+                        let was_began = match self.state {
+                            State::Convert { began, .. }
+                            | State::Handle { began, .. }
+                            | State::SpineConvert { began, .. }
+                            | State::SpineHandle { began, .. } => began,
+                            _ => false,
+                        };
+                        let (st, resume) = Self::space_move_from(cx, self.state, p, was_began);
+                        if let Some(r) = resume {
+                            self.state = st;
+                            self.space_resume = Some(r);
+                        }
+                    }
+                } else if let Some(resume) = self.space_resume.take() {
+                    let was_began = matches!(self.state, State::Move { began: true, .. } | State::SpineMove { began: true, .. });
+                    self.state = Self::resume_shape(p, resume, was_began);
                 }
                 let preview = match self.state {
                     State::Idle => return out,
@@ -376,6 +457,7 @@ impl Tool for AnchorTool {
             ("anchorPoint", PointerKind::Up) => {
                 self.guides.clear();
                 self.measure = None;
+                self.space_resume = None;
                 let st = std::mem::replace(&mut self.state, State::Idle);
                 match st {
                     State::Convert { began: true, .. }
@@ -982,6 +1064,33 @@ mod tests {
         // A Shift-click that doesn't move does nothing (no conversion to a corner).
         t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 200.0, 300.0).with_mods(shift));
         assert!(t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 200.0, 300.0).with_mods(shift)).is_empty());
+    }
+
+    /// #3694: Space held mid-drag on a convert moves the anchor, handles and all.
+    #[test]
+    fn anchor_point_space_mid_drag_moves_the_anchor() {
+        let (mut d, _) = doc_with_rect();
+        let l = d.layers[0].id;
+        let id = d.alloc_id();
+        let sp = vectorcraft_geom::SubPath::polyline(&[Point::new(100.0, 300.0), Point::new(200.0, 300.0), Point::new(300.0, 300.0)], false);
+        d.insert(Some(l), 1, vectorcraft_doc::Node::path(id, vectorcraft_geom::PathData::single(sp), vectorcraft_doc::Appearance::default_art()))
+            .unwrap();
+        let s = Selection::default();
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let space = Mods { space: true, ..Mods::default() };
+        let moved = |x: f64, y: f64| Action::Preview("path.moveAnchor".into(), json!({"id": id.0, "subpath": 0, "anchor": 1, "x": x, "y": y}));
+        let mut t = AnchorTool::new("anchorPoint");
+        t.pointer(&cx, &PointerEvent::new(PointerKind::Down, 200.0, 300.0));
+        let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 230.0, 340.0));
+        assert!(matches!(&a[..], [Action::Begin(_), Action::Preview(c, _)] if c == "path.convertAnchor"), "{a:?}");
+        let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 240.0, 350.0).with_mods(space));
+        assert_eq!(a, vec![moved(200.0, 300.0)]);
+        let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 250.0, 360.0).with_mods(space));
+        assert_eq!(a, vec![moved(210.0, 310.0)]);
+        let a = t.pointer(&cx, &PointerEvent::new(PointerKind::Drag, 260.0, 370.0));
+        assert!(matches!(&a[..], [Action::Preview(c, _)] if c == "path.convertAnchor"), "{a:?}");
+        assert_eq!(t.pointer(&cx, &PointerEvent::new(PointerKind::Up, 260.0, 370.0)), vec![Action::Commit]);
     }
 
     #[test]

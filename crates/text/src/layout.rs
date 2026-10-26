@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape, Vec2};
+use kurbo::{Affine, BezPath, ParamCurve, PathEl, Point, Rect, Shape, Vec2};
 use unicode_bidi::{BidiInfo, Level};
 use vectorcraft_doc::text::Kashida;
 use vectorcraft_doc::{
@@ -11,6 +11,7 @@ use vectorcraft_doc::{
 };
 use vectorcraft_geom::{ArcPath, PathData};
 
+use crate::GlyphBend;
 use crate::composer::{Breakpoint, Params, compose};
 use crate::fontdb::FontDb;
 use crate::hyphen::hyphen_points_with;
@@ -253,6 +254,7 @@ impl Ctx<'_> {
             scale: 1.0,
             image,
             colour,
+            bend: None,
         });
     }
 
@@ -1728,6 +1730,7 @@ mod wrapping_tests {
                 vpal: None,
                 level: unicode_bidi::Level::ltr(),
                 no_break: false,
+                cursive: false,
             })
             .collect()
     }
@@ -2541,6 +2544,107 @@ fn path_steps(ap: &ArcPath, glyphs: &[SGlyph], from: f64, spacing: f64) -> Vec<f
         .collect()
 }
 
+/// How closely a bent glyph's curves follow the path (text space units).
+const BEND_TOLERANCE: f64 = 0.01;
+/// The most pieces one segment of a glyph's outline is cut into to bend it.
+const BEND_PIECES: usize = 32;
+/// The most elements a bent glyph outline may have; beyond that the glyph stays straight.
+const BEND_MAX_ELEMENTS: usize = 8192;
+
+/// `outline` (text space, placed straight by `pre`, which takes the glyph's pen space there) bent
+/// along `ap` as `bend` says ([`GlyphBend`]); `None` where the path doesn't turn under the glyph
+/// (it stays as it is, exactly), or the bent outline would be too large or not finite.
+fn bend_outline(outline: &BezPath, pre: Affine, ap: &ArcPath, bend: &GlyphBend) -> Option<BezPath> {
+    let GlyphBend { s, step, advance, rise } = *bend;
+    if outline.elements().is_empty() || !(advance > 1e-9 && step.is_finite() && step > 0.0 && s.is_finite() && rise.is_finite()) {
+        return None;
+    }
+    // How far the path turns under the glyph; none: it lies straight already.
+    let ((_, a), (_, b)) = (ap.at(s), ap.at(s + step));
+    let turn = a.cross(b).atan2(a.dot(b)).abs();
+    if !(turn.is_finite() && turn > 1e-9) {
+        return None;
+    }
+    let det = pre.determinant();
+    if !(det.is_finite() && det.abs() > 1e-12) {
+        return None;
+    }
+    let to_pen = pre.inverse();
+    let k = step / advance;
+    let map = |q: Point| {
+        let (p, d) = ap.at(s + q.x * k);
+        p + Vec2::new(-d.y, d.x) * (q.y + rise)
+    };
+    // Pieces short enough that mapping a piece's control points stays within the tolerance: the
+    // error of a piece of length L under curvature c, at height y, is about L² c (1 + |y| c) / 8.
+    let curvature = turn / step;
+    let pen = to_pen * outline.clone();
+    let height = pen.bounding_box().y0.abs().max(pen.bounding_box().y1.abs()) + rise.abs();
+    let piece = ((8.0 * BEND_TOLERANCE) / (curvature * (1.0 + height * curvature))).sqrt();
+    let pieces = |a: Point, b: Point| -> usize {
+        let n = ((b - a).hypot() / piece).ceil();
+        if n.is_finite() { (n as usize).clamp(1, BEND_PIECES) } else { BEND_PIECES }
+    };
+    let mut out = BezPath::new();
+    let (mut start, mut cur) = (Point::ZERO, Point::ZERO);
+    let line = |out: &mut BezPath, from: Point, to: Point| {
+        let n = pieces(from, to);
+        for i in 1..=n {
+            out.line_to(map(from.lerp(to, i as f64 / n as f64)));
+        }
+    };
+    for el in pen.elements() {
+        match *el {
+            PathEl::MoveTo(p) => {
+                out.move_to(map(p));
+                (start, cur) = (p, p);
+            }
+            PathEl::LineTo(p) => {
+                line(&mut out, cur, p);
+                cur = p;
+            }
+            PathEl::QuadTo(p1, p2) => {
+                let c = kurbo::QuadBez::new(cur, p1, p2).raise();
+                let n = pieces(cur, p1).max(pieces(p1, p2));
+                for i in 0..n {
+                    let q = c.subsegment(i as f64 / n as f64..(i + 1) as f64 / n as f64);
+                    out.curve_to(map(q.p1), map(q.p2), map(q.p3));
+                }
+                cur = p2;
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                let c = kurbo::CubicBez::new(cur, p1, p2, p3);
+                let n = pieces(cur, p1).max(pieces(p1, p2)).max(pieces(p2, p3));
+                for i in 0..n {
+                    let q = c.subsegment(i as f64 / n as f64..(i + 1) as f64 / n as f64);
+                    out.curve_to(map(q.p1), map(q.p2), map(q.p3));
+                }
+                cur = p3;
+            }
+            PathEl::ClosePath => {
+                if (cur - start).hypot() > 1e-12 {
+                    line(&mut out, cur, start);
+                }
+                out.close_path();
+                cur = start;
+            }
+        }
+        if out.elements().len() > BEND_MAX_ELEMENTS {
+            return None;
+        }
+    }
+    let finite = |p: Point| p.x.is_finite() && p.y.is_finite();
+    out.elements()
+        .iter()
+        .all(|el| match *el {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => finite(p),
+            PathEl::QuadTo(a, b) => finite(a) && finite(b),
+            PathEl::CurveTo(a, b, c) => finite(a) && finite(b) && finite(c),
+            PathEl::ClosePath => true,
+        })
+        .then_some(out)
+}
+
 /// Lay type on a path out along `path` (text space), between its brackets.
 fn on_path(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, path: &PathData) {
     cx.out.on_path = true;
@@ -2786,6 +2890,19 @@ fn on_path(cx: &mut Ctx<'_>, paras: &[Range<usize>], t: &TextObject, path: &Path
             }
         }
         cx.emit(g, pre, origin, angle, g.adv, 0);
+        // A glyph of a script whose letters join is bent along a curved path (Rainbow), so its
+        // joining strokes meet its neighbours' instead of standing off the curve.
+        if t.path_effect == PathEffect::Rainbow && g.cursive && !cx.vertical && g.inline.is_none() {
+            let bend = GlyphBend { s, step, advance: g.adv, rise };
+            if let Some(last) = cx.out.glyphs.last_mut()
+                && last.image.is_none()
+                && last.colour.is_none()
+                && let Some(bent) = bend_outline(&last.outline, pre, &ap, &bend)
+            {
+                last.outline = bent;
+                last.bend = Some(bend);
+            }
+        }
         x += step;
     }
     let (ps, _) = ap.at(s0);
@@ -3212,5 +3329,6 @@ fn ruby_glyph(g: &PositionedGlyph, m: Affine, run: usize, byte: usize, line: usi
         // Ruby draws outlines only.
         image: None,
         colour: None,
+        bend: None,
     }
 }

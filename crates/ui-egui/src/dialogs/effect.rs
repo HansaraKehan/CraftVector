@@ -22,6 +22,8 @@ pub(super) const SPEC: DialogSpec = DialogSpec {
     body,
     confirm,
     preview: true,
+    // Load Texture… adds the texture it reads.
+    passes: |d, field| field == vectorcraft_effects::pixel::TEXTURE_IMAGE && matches!(d.str("__effect").as_str(), GLASS | TEXTURIZER),
     ..DialogSpec::FORM
 };
 
@@ -611,7 +613,7 @@ fn curve_graph(ui: &mut egui::Ui, d: &mut Dialog) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(SIZE, SIZE), egui::Sense::click_and_drag());
     let screen = |(x, y): (f32, f32)| egui::pos2(rect.left() + x * SIZE, rect.bottom() - y * SIZE);
     let unit = |p: egui::Pos2| (((p.x - rect.left()) / SIZE).clamp(0.0, 1.0), ((rect.bottom() - p.y) / SIZE).clamp(0.0, 1.0));
-    let held = ui.id().with("curve-point");
+    let held = ui.scope_id().with("curve-point");
     let mut grabbed: Option<usize> = ui.data(|m| m.get_temp(held)).flatten();
     let mut changed = false;
     if let Some(p) = resp.interact_pointer_pos()

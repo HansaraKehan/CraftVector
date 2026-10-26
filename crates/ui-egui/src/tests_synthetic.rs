@@ -25,7 +25,7 @@ pub(crate) fn run_synthetic(app: &mut VectorcraftApp, ctx: &egui::Context, draw:
     loop {
         let last = app.synthetic.is_empty();
         let mut raw = egui::RawInput::default();
-        app.raw_input_hook(&mut raw);
+        app.raw_input_hook(ctx, &mut raw);
         let mut out = ctx.run_ui(raw, |ui| {
             held.push(ui.input(|i| i.modifiers));
             draw(app, ui);

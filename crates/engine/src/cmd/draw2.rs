@@ -12,6 +12,7 @@ use vectorcraft_geom::hit::fill_contains;
 use vectorcraft_geom::{Anchor, AnchorKind, BezPath, FillRule, PathData, Point, Rect, SubPath, Vec2};
 use vectorcraft_pathops as po;
 use vectorcraft_pathops::{BoolOp, Cap, Join, SimplifyOptions};
+use vectorcraft_tools::draw2::{eraser_area, eraser_tip};
 
 use super::create::{add_look, insert_look};
 use super::newart::NewArt;
@@ -26,7 +27,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Pencil",
             [],
             None,
-            "{points: [[x,y]…] or [[x,y,pressure]…] (pen pressure 0..1: the stroke keeps it, for Calligraphic brushes with Pressure variation; a point without one presses fully), fidelity?: pt (1.5), closed?, style?: \"pencil\"|\"brush\", fill?: bool, keepSelected?: bool (true: the drawn or continued path is selected; false: it is not, and the rest of the selection stays), extend?: {id, end: \"start\"|\"end\"}, redraw?: {id, within?: pt (12)}} fit a freehand stroke → {id}. extend continues the path from that end; redraw (Edit Selected Paths) replaces the section of the path between where the stroke starts and ends, each within `within` of one subpath (the shorter way round a closed one), and draws a new path when the stroke doesn't end on it",
+            "{points: [[x,y]…] or [[x,y,pressure]…] (pen pressure 0..1: the stroke keeps it, for Calligraphic brushes with Pressure variation; a point without one presses fully), fidelity?: pt (1.5), fit?: bool (true; false: the points are joined by straight segments, as the Pencil previews a stroke with Live curve fitting off), closed?, style?: \"pencil\"|\"brush\", fill?: bool, keepSelected?: bool (true: the drawn or continued path is selected; false: it is not, and the rest of the selection stays), extend?: {id, end: \"start\"|\"end\"}, connect?: {id, end: \"start\"|\"end\"}, redraw?: {id, within?: pt (12)}} fit a freehand stroke → {id}. extend continues the path from that end; with connect, the stroke ends on that end of another path's last open subpath and joins it on, in one path with the extended path's appearance (the other path is removed when nothing of it is left); redraw (Edit Selected Paths) replaces the section of the path between where the stroke starts and ends, each within `within` of one subpath (the shorter way round a closed one), and draws a new path when the stroke doesn't end on it",
             has_doc,
             freehand
         ),
@@ -107,7 +108,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Eraser",
             [],
             None,
-            "{points: [[x,y]…], size?: pt (10)} erase a round-brush stroke from paths (selected, or all) → {ids}",
+            "{points: [[x,y]…], size?: pt (10), angle?: ° (0), roundness?: % (100, kept within 1–100)} erase the stroke of an elliptical tip from paths (selected, or all) → {ids}. The tip is `size` across its long axis, which runs at `angle` counter-clockwise from horizontal; its short axis is `roundness` percent of the long one",
             has_doc,
             erase_region
         ),
@@ -410,18 +411,26 @@ pub(super) fn components(pd: &PathData) -> Vec<PathData> {
     groups.into_iter().map(PathData::new).collect()
 }
 
-/// The pieces of `sp` where `remove(point)` is false. `None` when nothing is removed.
-fn cut_subpath(sp: &SubPath, remove: &dyn Fn(Point) -> bool) -> Option<Vec<SubPath>> {
+/// The pieces of `sp` where `remove(point)` is false. `None` when nothing is removed. Each segment
+/// is sampled at least every `step` pt (and at least 24 times), so a removed stretch at least
+/// `step` long is found.
+fn cut_subpath(sp: &SubPath, step: f64, remove: &dyn Fn(Point) -> bool) -> Option<Vec<SubPath>> {
     let nseg = sp.segment_count();
     if nseg == 0 {
         return sp.anchors.first().filter(|a| remove(a.p)).map(|_| vec![]);
     }
     const K: usize = 24;
+    const MAX_SAMPLES: usize = 4096;
     let mut runs: Vec<Vec<(usize, f64, f64)>> = vec![];
     let mut cur: Vec<(usize, f64, f64)> = vec![];
     let mut any = false;
     for i in 0..nseg {
         let c = sp.segment(i);
+        // The curve moves at most 3 times its longest control-polygon edge per unit of t, so with
+        // n samples, neighboring samples are at most 3 · edge / n apart.
+        let edge = (c.p1 - c.p0).hypot().max((c.p2 - c.p1).hypot()).max((c.p3 - c.p2).hypot());
+        let wanted = (3.0 * edge / step).ceil();
+        let samples = if wanted.is_finite() && wanted > K as f64 { (wanted as usize).min(MAX_SAMPLES) } else { K };
         let mut prev_t = 0.0;
         let mut prev_rm = remove(c.eval(0.0));
         let mut start = if prev_rm { None } else { Some(0.0) };
@@ -431,8 +440,8 @@ fn cut_subpath(sp: &SubPath, remove: &dyn Fn(Point) -> bool) -> Option<Vec<SubPa
                 runs.push(std::mem::take(&mut cur));
             }
         }
-        for k in 1..=K {
-            let t = k as f64 / K as f64;
+        for k in 1..=samples {
+            let t = k as f64 / samples as f64;
             let rm = remove(c.eval(t));
             if rm != prev_rm {
                 let (mut lo, mut hi) = (prev_t, t);
@@ -500,13 +509,14 @@ fn cut_subpath(sp: &SubPath, remove: &dyn Fn(Point) -> bool) -> Option<Vec<SubPa
     Some(out)
 }
 
-/// Erase from an outline path (open or closed) where `remove` holds. Returns the new geometry per
-/// output object (one object per piece when the path had a single subpath), or None if unchanged.
-pub(super) fn erase_outline(pd: &PathData, remove: &dyn Fn(Point) -> bool) -> Option<Vec<PathData>> {
+/// Erase from an outline path (open or closed) where `remove` holds, sampling each segment at least
+/// every `step` pt (`f64::INFINITY` for the fixed sampling). Returns the new geometry per output
+/// object (one object per piece when the path had a single subpath), or None if unchanged.
+pub(super) fn erase_outline(pd: &PathData, step: f64, remove: &dyn Fn(Point) -> bool) -> Option<Vec<PathData>> {
     let mut changed = false;
     let mut subs = vec![];
     for sp in &pd.subpaths {
-        match cut_subpath(sp, remove) {
+        match cut_subpath(sp, step, remove) {
             Some(pieces) => {
                 changed = true;
                 subs.extend(pieces);
@@ -539,7 +549,7 @@ fn path_kind(path: PathData) -> NodeKind {
 /// Fit a freehand polyline: drop jitter, build a spline through the samples (sharp turns stay
 /// corners) and simplify it to `tol`.
 fn fit_freehand(pts: &[Point], tol: f64, closed: bool) -> SubPath {
-    let min = (tol * 0.3).max(0.05);
+    let min = (tol * 0.3).max(vectorcraft_tools::draw2::MIN_FIDELITY * 0.3);
     let (Some(&p0), Some(&pn)) = (pts.first(), pts.last()) else { return SubPath::new(vec![], closed) };
     let mut kept: Vec<Point> = vec![p0];
     for &p in pts.iter().skip(1) {
@@ -575,11 +585,21 @@ fn fit_freehand(pts: &[Point], tol: f64, closed: bool) -> SubPath {
     fitted.subpaths.into_iter().next().filter(|s| s.anchors.len() >= 2).unwrap_or(sp)
 }
 
+/// The path of a freehand stroke: fitted at `tol` ([`fit_freehand`]), or with no `tol` the points
+/// joined by straight segments (`path.freehand` with `fit: false`).
+fn stroke_subpath(pts: &[Point], tol: Option<f64>, closed: bool) -> SubPath {
+    match tol {
+        Some(tol) => fit_freehand(pts, tol, closed),
+        None => SubPath::new(pts.iter().map(|&p| Anchor::corner(p)).collect(), closed),
+    }
+}
+
 /// Pencil's Edit Selected Paths in the middle of a path: a stroke from one point of a subpath of
 /// `pd` to another, each within `within` of it, replaces the section between them (the shorter
-/// way round a closed subpath) with the stroke fitted at `tol`. The subpath's index and its new
-/// shape; None when the stroke doesn't start and end on the same subpath, or meets it once.
-fn redraw_section(pd: &PathData, pts: &[Point], tol: f64, within: f64) -> Option<(usize, SubPath)> {
+/// way round a closed subpath) with the stroke fitted at `tol` (with no `tol`, unfitted). The
+/// subpath's index and its new shape; None when the stroke doesn't start and end on the same
+/// subpath, or meets it once.
+fn redraw_section(pd: &PathData, pts: &[Point], tol: Option<f64>, within: f64) -> Option<(usize, SubPath)> {
     use kurbo::ParamCurveArclen;
     let (first, last) = (*pts.first()?, *pts.last()?);
     let (si, _, _, _, d_a) = pd.nearest(first)?;
@@ -633,7 +653,7 @@ fn redraw_section(pd: &PathData, pts: &[Point], tol: f64, within: f64) -> Option
     *s0 = s1.p;
     let (Some(e0), Some(e1)) = (stroke.last_mut(), sp.anchors.get(end)) else { return None };
     *e0 = e1.p;
-    let fit = fit_freehand(&stroke, tol, false).anchors;
+    let fit = stroke_subpath(&stroke, tol, false).anchors;
     let (Some(f0), Some(f1)) = (fit.first().copied(), fit.last().copied()) else { return None };
     let inner = fit.get(1..fit.len().saturating_sub(1)).unwrap_or_default();
     let (before, after): (Vec<Anchor>, Vec<Anchor>) = if sp.closed {
@@ -664,7 +684,9 @@ fn freehand(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let pressure = stroke_pressure(&samples);
     let mut pts: Vec<Point> = samples.into_iter().map(|(pt, _)| pt).collect();
-    let tol = number_or(p, "fidelity", 1.5, C)?.clamp(0.05, 100.0);
+    let tol = number_or(p, "fidelity", 1.5, C)?.clamp(vectorcraft_tools::draw2::MIN_FIDELITY, 100.0);
+    // The tolerance the stroke is fitted at; with `fit: false` it is not fitted.
+    let fit_tol = switch_or(p, "fit", true, C)?.then_some(tol);
     let closed = switch_or(p, "closed", false, C)?;
     let brush = str_param(p, "style") == Some("brush");
     let keep_selected = switch_or(p, "keepSelected", true, C)?;
@@ -687,12 +709,41 @@ fn freehand(s: &mut Session, p: &Value) -> Result<Value> {
         if pts.len() < 2 {
             return Ok(json!({ "id": id.0 }));
         }
+        // A stroke that ends on an open end of another path connects the two: (that path, its last
+        // open subpath, that subpath starting at the end the stroke ends on, it ends at its end).
+        let connect = match p.get("connect").filter(|v| !v.is_null()) {
+            Some(cn) => {
+                let other = id_param(cn, "id").ok_or_else(|| bad(C, "connect needs id"))?;
+                if other == id {
+                    return Err(bad(C, "connect needs a path other than the one extended"));
+                }
+                let (opd, _) = path_of(&s.doc()?.doc, other)?;
+                let osi =
+                    opd.subpaths.iter().rposition(|s| !s.closed && !s.anchors.is_empty()).ok_or_else(|| bad(C, "connect path has no open end"))?;
+                let mut y = opd.subpaths[osi].clone();
+                let at_end = match str_param(cn, "end") {
+                    Some("start") => false,
+                    Some("end") => true,
+                    _ => return Err(bad(C, "connect end must be \"start\" or \"end\"")),
+                };
+                if at_end {
+                    y.reverse();
+                }
+                Some((other, osi, y, at_end))
+            }
+            None => None,
+        };
         let close_tol = (tol * 4.0).max(6.0);
-        let closing = sp.anchors.len() >= 2 && pts.last().is_some_and(|p| p.distance(first) <= close_tol);
+        let closing = connect.is_none() && sp.anchors.len() >= 2 && pts.last().is_some_and(|p| p.distance(first) <= close_tol);
         if closing && let Some(l) = pts.last_mut() {
             *l = first;
         }
-        let fit = fit_freehand(&pts, tol, false);
+        if let Some((_, _, y, _)) = &connect
+            && let (Some(l), Some(y0)) = (pts.last_mut(), y.anchors.first())
+        {
+            *l = y0.p;
+        }
+        let fit = stroke_subpath(&pts, fit_tol, false);
         let mut add = fit.anchors;
         if let (Some(last), Some(a0)) = (sp.anchors.last_mut(), add.first()) {
             last.h_out = a0.h_out;
@@ -712,12 +763,28 @@ fn freehand(s: &mut Session, p: &Value) -> Result<Value> {
         for a in &mut sp.anchors {
             *a = Anchor::with_handles(a.p, a.h_in, a.h_out);
         }
-        // The path's pressure (in the direction it is continued in) followed by the stroke's.
-        let old_pressure = s.doc()?.doc.node(id).and_then(|n| n.appearance.stroke()).and_then(|st| st.pressure.clone());
-        let joined = (old_pressure.is_some() || pressure.is_some()).then(|| {
+        let drawn_len = subpath_len(&sp);
+        // The other path's anchors follow on from the one the stroke ends on, which takes its
+        // outgoing handle.
+        let mut other_len = 0.0;
+        if let Some((_, _, y, _)) = &connect
+            && let Some((y0, rest)) = y.anchors.split_first()
+        {
+            if let Some(last) = sp.anchors.last_mut() {
+                *last = Anchor::with_handles(y0.p, last.h_in + (y0.p - last.p), y0.h_out);
+            }
+            sp.anchors.extend_from_slice(rest);
+            other_len = subpath_len(y);
+        }
+        // The path's pressure (in the direction it is continued in) followed by the stroke's, and
+        // by the pressure of the path it connects to.
+        let pressure_of = |n: NodeId| s.doc().ok()?.doc.node(n).and_then(|n| n.appearance.stroke()).and_then(|st| st.pressure.clone());
+        let old_pressure = pressure_of(id);
+        let other_pressure = connect.as_ref().and_then(|(o, _, _, at_end)| pressure_of(*o).map(|p| if *at_end { p.reversed() } else { p }));
+        let joined = (old_pressure.is_some() || pressure.is_some() || other_pressure.is_some()).then(|| {
             let old = old_pressure.map(|p| if at_start { p.reversed() } else { p });
-            let total = subpath_len(&sp);
-            PressureProfile::extended(old.as_ref(), old_len, pressure.as_ref(), total - old_len)
+            let drawn = PressureProfile::extended(old.as_ref(), old_len, pressure.as_ref(), drawn_len - old_len);
+            if connect.is_some() { PressureProfile::extended(drawn.as_ref(), drawn_len, other_pressure.as_ref(), other_len) } else { drawn }
         });
         s.edit(if brush { "Paintbrush" } else { "Pencil" }, |d, sel| {
             let reverse = at_start && !sp.closed;
@@ -725,6 +792,31 @@ fn freehand(s: &mut Session, p: &Value) -> Result<Value> {
                 sp.reverse();
             }
             path_mut(d, id)?.subpaths[si] = sp;
+            if let Some((other, osi, ..)) = &connect {
+                let o = path_mut(d, *other)?;
+                if *osi < o.subpaths.len() {
+                    o.subpaths.remove(*osi);
+                }
+                if o.is_empty() {
+                    d.remove(*other)?;
+                    sel.remove(*other);
+                }
+                // Direct-selected anchors and segments of the subpaths after the one removed move
+                // down one; those of the one removed go, and a path left with no selected anchors
+                // is no longer selected.
+                let shift = |refs: &mut BTreeSet<(usize, usize)>| {
+                    *refs = refs.iter().filter(|r| r.0 != *osi).map(|&(sub, i)| if sub > *osi { (sub - 1, i) } else { (sub, i) }).collect();
+                };
+                if let Some(refs) = sel.anchors.get_mut(other) {
+                    shift(refs);
+                }
+                if let Some(refs) = sel.segments.get_mut(other) {
+                    shift(refs);
+                }
+                if sel.anchors.get(other).is_some_and(BTreeSet::is_empty) {
+                    sel.remove(*other);
+                }
+            }
             if let Some(joined) = joined
                 && let Some(st) = d.node_mut(id).and_then(|n| n.appearance.stroke_mut())
             {
@@ -748,13 +840,16 @@ fn freehand(s: &mut Session, p: &Value) -> Result<Value> {
         let (pd, _) = path_of(&s.doc()?.doc, id)?;
         // shortcut: a stroke pressure profile is left as it was, measured along the old path; fit
         // it to the new length if Calligraphic pressure strokes get redrawn.
-        if let Some((si, sp)) = redraw_section(&pd, &pts, tol, within) {
+        if let Some((si, sp)) = redraw_section(&pd, &pts, fit_tol, within) {
             s.edit(if brush { "Paintbrush" } else { "Pencil" }, |d, sel| {
                 *path_mut(d, id)?.subpaths.get_mut(si).ok_or_else(|| bad(C, "no such subpath"))? = sp;
+                // A member path of a compound path is redrawn in it: the compound path is what is
+                // selected.
+                let whole = d.parent_of(id).filter(|p| d.node(*p).is_some_and(|n| matches!(n.kind, NodeKind::Compound { .. }))).unwrap_or(id);
                 if keep_selected {
-                    sel.set([id]);
+                    sel.set([whole]);
                 } else {
-                    sel.remove(id);
+                    sel.remove(whole);
                 }
                 Ok(())
             })?;
@@ -764,7 +859,7 @@ fn freehand(s: &mut Session, p: &Value) -> Result<Value> {
     if pts.len() < 2 {
         return Err(bad(C, "need at least two points"));
     }
-    let sp = fit_freehand(&pts, tol, closed);
+    let sp = stroke_subpath(&pts, fit_tol, closed);
     let fill = if filled { s.paint.fill.clone() } else { Paint::None };
     // A pencil path with a fill keeps a stroke of None (#1679); only one that would show nothing
     // gets black. A brush is its stroke.
@@ -1147,9 +1242,17 @@ fn erase_region(s: &mut Session, p: &Value) -> Result<Value> {
     if !(size.is_finite() && size > 0.0) {
         return Err(bad(C, "size must be positive"));
     }
+    let angle = number_or(p, "angle", 0.0, C)?;
+    let roundness = number_or(p, "roundness", 100.0, C)?;
     let r = size / 2.0;
+    // The tip's short axis: an open path is sampled at least every half of it.
+    let short = size * roundness.clamp(1.0, 100.0) / 100.0;
     let st = s.doc()?;
-    let region = brush_region(&pts, size);
+    let region = eraser_area(&pts, size, angle, roundness);
+    // A point is under the tip when, with the tip squashed back into a circle, it is within the
+    // circle's radius of the squashed drag.
+    let squash = eraser_tip(angle, roundness).inverse();
+    let round: Vec<Point> = pts.iter().map(|q| squash * *q).collect();
     let mut plan: Vec<(NodeId, Vec<PathData>)> = vec![];
     for id in target_paths(&st.doc, &st.selection, poly_bounds(&pts, r)) {
         let (pd, rule) = path_of(&st.doc, id)?;
@@ -1158,7 +1261,7 @@ fn erase_region(s: &mut Session, p: &Value) -> Result<Value> {
                 continue;
             }
             plan.push((id, components(&po::boolean(&pd, rule, &region, FillRule::NonZero, BoolOp::Difference))));
-        } else if let Some(pieces) = erase_outline(&pd, &|q| dist_to_polyline(&pts, q) <= r) {
+        } else if let Some(pieces) = erase_outline(&pd, short / 2.0, &|q| dist_to_polyline(&round, squash * q) <= r) {
             plan.push((id, pieces));
         }
     }
@@ -1193,7 +1296,7 @@ fn erase_segments(s: &mut Session, p: &Value) -> Result<Value> {
     let mut plan = vec![];
     for id in target_paths(&st.doc, &st.selection, poly_bounds(&pts, w)) {
         let (pd, _) = path_of(&st.doc, id)?;
-        if let Some(pieces) = erase_outline(&pd, &|q| dist_to_polyline(&pts, q) <= w / 2.0) {
+        if let Some(pieces) = erase_outline(&pd, w / 2.0, &|q| dist_to_polyline(&pts, q) <= w / 2.0) {
             plan.push((id, pieces));
         }
     }
@@ -1329,7 +1432,7 @@ fn smooth_region(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "path.smoothRegion";
     let pts = points_param(p, "points", C)?;
     let radius = number_or(p, "radius", 12.0, C)?.max(0.0);
-    let tol = number_or(p, "fidelity", 2.5, C)?.clamp(0.05, 100.0);
+    let tol = number_or(p, "fidelity", 2.5, C)?.clamp(vectorcraft_tools::draw2::SMOOTH_MIN_FIDELITY, 100.0);
     let st = s.doc()?;
     let near = |q: Point| dist_to_polyline(&pts, q) <= radius;
     let mut plan = vec![];
@@ -1394,6 +1497,7 @@ fn join_scrub(s: &mut Session, p: &Value) -> Result<Value> {
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(0.0, |x| x.0)
     };
+    let (first_pt, last_pt) = (pts.first().copied(), pts.last().copied());
     let mut ends: Vec<(f64, NodeId, usize, bool, Point)> = vec![];
     for id in target_paths(&st.doc, &st.selection, poly_bounds(&pts, tol)) {
         let (pd, _) = path_of(&st.doc, id)?;
@@ -1402,9 +1506,20 @@ fn join_scrub(s: &mut Session, p: &Value) -> Result<Value> {
                 continue;
             }
             for (start, a) in [(true, sp.anchors[0].p), (false, sp.anchors[sp.anchors.len() - 1].p)] {
-                if dist_to_polyline(&pts, a) <= tol {
-                    ends.push((order(a), id, si, start, a));
+                let on_scrub = dist_to_polyline(&pts, a) <= tol;
+                let near_start = first_pt.is_some_and(|p| a.distance(p) <= tol);
+                let near_end = last_pt.is_some_and(|p| a.distance(p) <= tol);
+                if !on_scrub && !near_start && !near_end {
+                    continue;
                 }
+                let ord = if on_scrub {
+                    order(a)
+                } else if near_start && (!near_end || first_pt.is_some_and(|p| a.distance(p) <= a.distance(last_pt.unwrap_or(p)))) {
+                    -1.0
+                } else {
+                    1e30
+                };
+                ends.push((ord, id, si, start, a));
             }
         }
     }
@@ -1515,7 +1630,7 @@ fn blob(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut inputs: Vec<(&PathData, FillRule)> = vec![(&region, FillRule::NonZero)];
     inputs.extend(merge_ids.iter().map(|(_, pd, r)| (pd, *r)));
-    let merged = po::unite_all(&inputs);
+    let merged = po::try_unite_all(&inputs).map_err(|e| EngineError::Other(e.to_string()))?;
     let Some(((keep, _, _), rest)) = merge_ids.split_last() else {
         return insert_look(s, "Blob Brush", path_kind(region), ap, None, keep_selected);
     };

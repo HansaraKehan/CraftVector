@@ -355,8 +355,16 @@ fn text_copy(app: &mut VectorcraftApp) -> bool {
 
 fn text_key(app: &mut VectorcraftApp, k: ToolKey, m: Mods) {
     let v = app.view_info();
-    if let Err(e) = app.session.tool_key(k, m, v) {
-        app.status(e.to_string());
+    let target_before = crate::ime::target(&mut app.session, v);
+    let before = crate::ime::stamp(&mut app.session, v);
+    let r = app.session.tool_key(k, m, v);
+    match &r {
+        Err(e) => app.status(e.to_string()),
+        Ok(_) => {
+            if let Some(ctx) = app.ui_ctx.clone().or_else(|| CTX.get().cloned()) {
+                crate::ime::note_application_edit(app, &ctx, v, target_before, before);
+            }
+        }
     }
 }
 
@@ -364,8 +372,16 @@ fn text_paste(app: &mut VectorcraftApp, s: Option<String>) {
     let s = s.unwrap_or_else(|| CLIP.lock().unwrap_or_else(|e| e.into_inner()).clone());
     if !s.is_empty() {
         let v = app.view_info();
-        if let Err(e) = app.session.tool_text(&s, v) {
-            app.status(e.to_string());
+        let target_before = crate::ime::target(&mut app.session, v);
+        let before = crate::ime::stamp(&mut app.session, v);
+        let r = app.session.tool_text(&s, v);
+        match &r {
+            Err(e) => app.status(e.to_string()),
+            Ok(_) => {
+                if let Some(ctx) = app.ui_ctx.clone().or_else(|| CTX.get().cloned()) {
+                    crate::ime::note_application_edit(app, &ctx, v, target_before, before);
+                }
+            }
         }
     }
 }
@@ -490,7 +506,9 @@ fn cell(ui: &mut Ui, label: &str, tip: &str, add: impl FnOnce(&mut Ui)) {
         let l =
             ui.add_sized(vec2(22.0, 24.0), egui::Label::new(egui::RichText::new(label).size(11.5).strong().color(t.text))).on_hover_text(tl!(tip));
         crate::scrub::note_label(ui, l.rect);
-        add(ui);
+        // The visible label names the value field beside it, also in a grid cell that draws more
+        // than one widget (egui 0.37's strict accessibility check).
+        ui.label_inputs_by(l.id, add);
     });
 }
 
@@ -677,8 +695,8 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let small = s.small_caps.is_some();
-        let position = s.position.id();
+        let small = shared(app, |s| s.small_caps.is_some()) == Some(true);
+        let position = shared(app, |s| s.position).map(|p| p.id()).unwrap_or("");
         for (kind, tip, on, change) in [
             (Glyph::AllCaps, tl!("All Caps"), s.all_caps, json!({"allCaps": !s.all_caps})),
             (Glyph::SmallCaps, tl!("Small Caps"), small, json!({"smallCaps": !small})),
@@ -757,16 +775,18 @@ fn style_toggle(ui: &mut Ui, g: Glyph, tip: &str, on: bool) -> bool {
 /// The Character Direction submenu: Default, Left to Right and Right to Left set the characters the
 /// panel acts on ([`char_cmd`]) as the bidi algorithm sets them, or left to right or right to left
 /// inside their paragraph. The direction those characters share is checked, and none is checked
-/// when they differ.
+/// when they differ. At a caret in text the Type tool edits, with no characters selected, the items
+/// are disabled.
 fn char_direction_items(app: &mut VectorcraftApp, ui: &mut Ui) {
     use vectorcraft_doc::ParaDirection;
     let direction = shared(app, |s| s.char_direction);
+    let enabled = text_editing(app).is_none_or(|(_, a, b)| b > a);
     for (label, d, key) in [
         (tl!("Default"), None, "default"),
         (tl!("Left to Right"), Some(ParaDirection::LeftToRight), "leftToRight"),
         (tl!("Right to Left"), Some(ParaDirection::RightToLeft), "rightToLeft"),
     ] {
-        if menu_item(ui, label, true, direction == Some(d)) {
+        if menu_item(ui, label, enabled, direction == Some(d)) {
             format(app, json!({"charDirection": key}));
         }
     }
@@ -790,8 +810,8 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
             format(app, json!({key: !on}));
         }
     }
-    let small = s.as_ref().is_some_and(|s| s.small_caps.is_some());
-    let position = s.as_ref().map_or("normal", |s| s.position.id());
+    let small = shared(app, |s| s.small_caps.is_some()) == Some(true);
+    let position = shared(app, |s| s.position).map(|p| p.id()).unwrap_or("");
     for (label, on, change) in [
         (tl!("Small Caps"), small, json!({"smallCaps": !small})),
         (tl!("Superscript"), position == "superscript", position_toggle(position, "superscript")),
@@ -1104,7 +1124,7 @@ mod tests {
             let input = egui::RawInput { events, ..Default::default() };
             ctx.run_ui(input, |ui| {
                 axis_sliders(app, ui, &face);
-                slider = ctx.read_response(ui.id().with(("ch-axis", *b"wght"))).map(|r| r.rect);
+                slider = ctx.read_response(ui.scope_id().with(("ch-axis", *b"wght"))).map(|r| r.rect);
             })
             .textures_delta
             .clear();
@@ -1417,6 +1437,57 @@ mod tests {
         assert_eq!(checked(&mut app), ["Left to Right"]);
         app.session.set_tool_option("select", &json!({"start": 0, "end": 8}));
         assert_eq!(checked(&mut app), ["Default"]);
+    }
+
+    /// Small Caps, Superscript and Subscript buttons and menu items stay off when the selection mixes them.
+    #[test]
+    fn character_mixed_small_caps_and_position_show_off() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let a = app.run("text.create", json!({"x": 20, "y": 50, "text": "A"})).unwrap()["id"].clone();
+        let b = app.run("text.create", json!({"x": 20, "y": 90, "text": "B"})).unwrap()["id"].clone();
+        app.run("text.setRangeStyle", json!({"id": a, "start": 0, "end": 1, "smallCaps": true, "position": "superscript"})).unwrap();
+        app.run("text.setRangeStyle", json!({"id": b, "start": 0, "end": 1, "smallCaps": false, "position": "subscript"})).unwrap();
+        app.run("select.set", json!({"ids": [a, b]})).unwrap();
+        assert_eq!(shared(&app, |s| s.small_caps.is_some()), None);
+        assert_eq!(shared(&app, |s| s.position), None);
+        let ctx = egui::Context::default();
+        assert_eq!(script_buttons(&ctx, &mut app).1, [false, false, false]);
+        let checked = |app: &mut VectorcraftApp| {
+            let texts = super::super::tests_appearance::frame_events(&ctx, app, vec![], menu);
+            ["Small Caps", "Superscript", "Subscript"].map(|l| texts.iter().any(|(t, _)| *t == format!("✓ {l}")))
+        };
+        assert_eq!(checked(&mut app), [false, false, false]);
+    }
+
+    /// At a caret in text the Type tool edits, with no characters selected, the Character
+    /// Direction items are disabled: a click on one leaves the direction of every character as it was.
+    #[test]
+    fn character_direction_does_nothing_at_an_empty_caret() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "שלום 21 10 2026"})).unwrap()["id"].as_u64().unwrap();
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        app.select_tool("type");
+        app.session.apply_actions(vec![vectorcraft_tools::Action::Notify("text.editNew".into())]).unwrap();
+        app.session.set_tool_option("select", &json!({"start": 3, "end": 3}));
+        let directions = |app: &VectorcraftApp| match &app.session.active().unwrap().doc.node(NodeId(id)).unwrap().kind {
+            NodeKind::Text(t) => t.runs.iter().map(|r| (r.text.clone(), r.style.char_direction)).collect::<Vec<_>>(),
+            _ => panic!("text"),
+        };
+        let before = directions(&app);
+        let ctx = egui::Context::default();
+        let click_rtl = |app: &mut VectorcraftApp| {
+            let texts = super::super::tests_appearance::frame_events(&ctx, app, vec![], char_direction_items);
+            let at = texts.iter().find(|(t, _)| t.trim_start_matches(['✓', ' ']) == "Right to Left").unwrap_or_else(|| panic!("{texts:?}")).1;
+            super::super::tests_appearance::click(&ctx, app, at.center(), char_direction_items);
+        };
+        click_rtl(&mut app);
+        assert_eq!(directions(&app), before);
+        // With characters selected, the same click sets their direction.
+        app.session.set_tool_option("select", &json!({"start": 0, "end": 4}));
+        click_rtl(&mut app);
+        assert_ne!(directions(&app), before);
     }
 
     /// No Break is in the panel menu, and choosing it marks the selected characters.

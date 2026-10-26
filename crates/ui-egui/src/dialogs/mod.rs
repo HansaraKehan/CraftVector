@@ -24,6 +24,7 @@ mod document_setup;
 pub mod dxf_import;
 pub mod dxf_options;
 pub mod edit_selection;
+pub mod edit_views;
 mod effect;
 pub mod effect_gallery;
 pub mod envelope;
@@ -64,6 +65,7 @@ pub mod new_swatch;
 pub mod office_export;
 pub mod package;
 pub(crate) mod path_ops;
+pub mod pathfinder_options;
 pub mod pdf_presets;
 pub mod perspective_grid;
 pub mod perspective_options;
@@ -83,6 +85,7 @@ mod recovery;
 mod revolve;
 pub(crate) mod revolve_gizmo;
 pub mod saturate;
+pub mod save_brush_library;
 mod save_changes;
 pub mod save_for_web;
 pub(crate) mod save_options;
@@ -170,10 +173,19 @@ pub(crate) struct DialogSpec {
     pub ok: Option<&'static str>,
     /// An extra button left of Cancel that sets `discard: true` and confirms ("Don't Save").
     pub discard: Option<&'static str>,
+    /// A button left of Cancel, as (label, field), that sets `field: true` and confirms, as OK
+    /// does otherwise (Transform Each's Copy).
+    pub alternate: Option<(&'static str, &'static str)>,
     pub min_width: f32,
     pub max_width: Option<f32>,
     /// The body runs a live preview interaction that Cancel rolls back.
     pub preview: bool,
+    /// The fields that a dialog of a kind reads but may not hold yet, which `ui.dialog.set` also
+    /// takes (see [`accepts_field`]).
+    pub inputs: fn(&str) -> &'static [&'static str],
+    /// Whether the dialog passes a field it neither holds nor lists in `inputs` on to what it
+    /// runs (a parameter of the generic dialog's command), so `ui.dialog.set` takes it too.
+    pub passes: fn(&Dialog, &str) -> bool,
     /// The OK button's label when it depends on the app (Export for Screens' "Download" on the
     /// web); `ok` when none. Only with an `ok`.
     pub ok_label: Option<fn(&VectorcraftApp) -> &'static str>,
@@ -198,9 +210,12 @@ impl DialogSpec {
         },
         ok: Some("OK"),
         discard: None,
+        alternate: None,
         min_width: 320.0,
         max_width: None,
         preview: false,
+        inputs: |_| &[],
+        passes: |_, _| false,
         ok_label: None,
         ok_enabled: None,
     };
@@ -287,6 +302,7 @@ registry! {
     FlattenerPresets: [flattener_presets::KIND] => flattener_presets::SPEC,
     SaveStyleLibrary: [save_style_library::KIND] => save_style_library::SPEC,
     SaveSymbolLibrary: [save_symbol_library::KIND] => save_symbol_library::SPEC,
+    SaveBrushLibrary: [save_brush_library::KIND] => save_brush_library::SPEC,
     Expand: [expand::KIND] => expand::SPEC,
     SpotColors: [spot_colors::KIND] => spot_colors::SPEC,
     TransformEach: [transform_each::KIND] => transform_each::SPEC,
@@ -352,9 +368,11 @@ registry! {
     BrushOptions: [brush_options::KIND] => brush_options::SPEC,
     NewBrush: [new_brush::KIND] => new_brush::SPEC,
     EditSelection: [edit_selection::KIND] => edit_selection::SPEC,
+    EditViews: [edit_views::KIND] => edit_views::SPEC,
     PerspectivePlane: [perspective_plane::KIND] => perspective_plane::SPEC,
     LayerOptions: [layer_options::KIND] => layer_options::SPEC,
     LayersPanelOptions: [layers_panel_options::KIND] => layers_panel_options::SPEC,
+    PathfinderOptions: [pathfinder_options::KIND] => pathfinder_options::SPEC,
     RearrangeArtboards: [rearrange_artboards::KIND] => rearrange_artboards::SPEC,
     ShortcutImport: [shortcut_import::KIND] => DialogSpec::window(shortcut_import::show, shortcut_import::confirm),
 }
@@ -366,6 +384,7 @@ pub fn button_labels() -> Vec<&'static str> {
     for spec in std::iter::once(&DialogSpec::FORM).chain(DialogKind::ALL.iter().map(|k| k.spec())) {
         v.extend(spec.ok);
         v.extend(spec.discard);
+        v.extend(spec.alternate.map(|(label, _)| label));
     }
     v.sort_unstable();
     v.dedup();
@@ -376,6 +395,32 @@ pub fn button_labels() -> Vec<&'static str> {
 fn spec(kind: &str) -> &'static DialogSpec {
     static FALLBACK: DialogSpec = DialogSpec::FORM;
     DialogKind::of(kind).map_or(&FALLBACK, DialogKind::spec)
+}
+
+/// Whether `ui.dialog.set` can set `field` on `d`: a field it holds, a `__` field (the dialog's
+/// own state), `discard` on a dialog with a discard button, `preview` on one with a live preview,
+/// one of its spec's `inputs` for its kind, or one it `passes` on.
+pub fn accepts_field(d: &Dialog, field: &str) -> bool {
+    let spec = spec(&d.kind);
+    d.fields.contains_key(field)
+        || field.starts_with("__")
+        || (field == "discard" && spec.discard.is_some())
+        || (field == "preview" && spec.preview)
+        || (spec.inputs)(&d.kind).contains(&field)
+        || (spec.passes)(d, field)
+}
+
+/// The fields `ui.dialog.set` can set on `d`, sorted, without the `__` ones: those it holds,
+/// `discard`, `preview` and the spec's `inputs` for its kind.
+pub fn field_names(d: &Dialog) -> Vec<String> {
+    let spec = spec(&d.kind);
+    let mut names: Vec<String> = d.fields.keys().filter(|k| !k.starts_with("__")).cloned().collect();
+    names.extend(spec.discard.map(|_| "discard".to_string()));
+    names.extend(spec.preview.then(|| "preview".to_string()));
+    names.extend((spec.inputs)(&d.kind).iter().map(|i| i.to_string()));
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Run a command and close the dialog (whether or not the command succeeded).
@@ -448,7 +493,7 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
     confirm::show_waiting(app);
     // The kind of dialog shown last frame: a different one (or none) means this one just opened, and
     // its first field is to take the keyboard focus (`focus_id`, until a field takes it).
-    let (shown_id, focus_id) = (egui::Id::new("dialog-shown"), egui::Id::new("dialog-focus-pending"));
+    let (shown_id, focus_id) = (egui::Id::unique("dialog-shown"), egui::Id::unique("dialog-focus-pending"));
     let Some(mut d) = app.ui.dialog.clone() else {
         revolve_gizmo::clear(ctx);
         app.ui.dialog_file = None;
@@ -483,6 +528,7 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
     let mut ok_enabled = true;
     let mut cancel = false;
     let mut discard = false;
+    let mut alternate = false;
     // Opened as a save panel closed: the Enter that closed it isn't this dialog's, until it is let go.
     let after_panel = d.bool(AFTER_PANEL);
     if after_panel && !ctx.input(|i| i.key_down(egui::Key::Enter) || i.key_pressed(egui::Key::Enter)) {
@@ -494,7 +540,7 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
         revolve_gizmo::show(app, ctx, &mut d);
     }
     let initial = if revolves { egui::vec2((ctx.content_rect().width() / 2.0 - 226.0).max(0.0), -40.0) } else { egui::vec2(0.0, -40.0) };
-    let id = egui::Id::new(("dialog", d.kind.as_str()));
+    let id = egui::Id::unique(("dialog", d.kind.as_str()));
     let id = if revolves { id.with("revolve") } else { id };
     modal::show_at(ctx, &heading, id, initial, MARGIN, |ui| {
         // Never wider than the window (a large UI scale in a small window): the text wraps.
@@ -544,6 +590,10 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
             if widgets::secondary_button(ui, if spec.ok.is_some() { "Cancel" } else { "Close" }).clicked() {
                 cancel = true;
             }
+            if let Some((label, _)) = spec.alternate {
+                ui.add_space(8.0);
+                alternate = widgets::secondary_button(ui, label).clicked() && ok_enabled;
+            }
             if let Some(label) = spec.discard {
                 ui.add_space(28.0);
                 discard = widgets::secondary_button(ui, label).clicked();
@@ -555,6 +605,10 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
     }
     if discard {
         d.fields.insert("discard".into(), json!(true));
+        ok = true;
+    }
+    if alternate && let Some((_, field)) = spec.alternate {
+        d.fields.insert(field.into(), json!(true));
         ok = true;
     }
     app.ui.dialog = Some(d);
@@ -589,6 +643,8 @@ pub(crate) fn mixed_dropdown(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_accessibility;
 #[cfg(test)]
 mod tests_export;
 #[cfg(test)]

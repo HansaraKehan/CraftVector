@@ -15,13 +15,14 @@
 //! Styling a selected range goes through `text.setRangeStyle` (the Character panel reads the
 //! selection from [`Tool::options`]); Alt+arrows step it by the Preferences › Type increments
 //! (`type.step`). New type starts with placeholder text, selected, when Fill New Type Objects With
-//! Placeholder Text is on.
+//! Placeholder Text is on. A space typed on its own after "1.", "1)", "A.", "A)", "*", "#", ">" or
+//! "+" at the start of a paragraph in no list makes that paragraph a list (`text.startList`).
 //!
 //! IME: the marked text of a composition is part of the typing session (so it lays out in place),
 //! underlined, until the IME commits it (it then goes through [`Tool::text_input`]) or clears it.
 
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use vectorcraft_doc::hit::hit_test;
@@ -30,7 +31,7 @@ use vectorcraft_geom::{BezPath, Point, Rect, Shape};
 use vectorcraft_text::{FontDb, TextLayout, edit};
 
 use crate::guides::DrawSnap;
-use crate::{Action, Cursor, Mods, Overlay, PointerEvent, PointerKind, Tool, ToolContext, ToolKey};
+use crate::{Action, Cursor, ImeSurrounding, Mods, Overlay, PointerEvent, PointerKind, SurroundingUnit, Tool, ToolContext, ToolKey};
 
 /// Which of the Type tools this is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,8 +61,39 @@ struct Preedit {
     active: Option<Range<usize>>,
 }
 
+/// A list that typed characters started ([`TypeTool::start_typed_list`]).
+struct TypedList {
+    /// The type object.
+    id: NodeId,
+    /// The bytes of the typed characters and the space: from the paragraph's start to the caret.
+    start: usize,
+    end: usize,
+    /// The plain text with the typed characters, before the list started.
+    text: String,
+    list: vectorcraft_doc::text::ParaList,
+}
+
 /// The edited text's layout, keyed by the font database's generation and the text.
 type CachedLayout = ((u64, TextObject), Arc<TextLayout>);
+
+/// Process-global Type-tool edit-session counter: the IME target's replacement epoch.
+///
+/// A per-tool counter restarts at zero when the tool is recreated (a document switch, File ›
+/// Revert), while the document keeps its uid and node ids. The same `(document, node)` would then
+/// receive an epoch a still-cached native IME context already used, violating the replacement
+/// contract that an old context can never edit the new owner. Sessions are therefore numbered for
+/// the process lifetime; the counter only stops changing after 2^64 sessions (unreachable).
+/// A mutex (not an `AtomicU64`) keeps this available on wasm targets without 64-bit atomics.
+static NEXT_EDIT_SESSION: Mutex<u64> = Mutex::new(0);
+
+/// Return the next process-wide edit-session id. It saturates at `u64::MAX` instead of wrapping to
+/// zero; the final id can repeat only after 2^64 sessions.
+fn next_edit_session() -> u64 {
+    let mut next = NEXT_EDIT_SESSION.lock().unwrap_or_else(PoisonError::into_inner);
+    let session = next.checked_add(1).unwrap_or(u64::MAX);
+    *next = session;
+    session
+}
 
 #[derive(Default)]
 pub struct TypeTool {
@@ -71,6 +103,11 @@ pub struct TypeTool {
     prev_tool: Option<String>,
     /// Text object being edited.
     editing: Option<NodeId>,
+    /// Monotonic identity of this edit session (the IME target's replacement epoch): it changes
+    /// whenever editing starts afresh, including on the same text object, and never on ordinary
+    /// edits or caret moves. Numbered process-wide ([`NEXT_EDIT_SESSION`]), so recreating the tool
+    /// (File › Revert, a document switch) cannot reuse an epoch of the same document and node.
+    edit_session: u64,
     /// The point type a click just placed (edited now): discarded if empty when editing ends.
     fresh: Option<NodeId>,
     /// Caret and selection anchor (byte offsets into the plain text).
@@ -80,6 +117,10 @@ pub struct TypeTool {
     goal_x: Option<f64>,
     typing: Option<Typing>,
     preedit: Option<Preedit>,
+    /// A command from outside the tool (`settle_interaction`, an external edit while typing) ended
+    /// the typing session, while the text stays open for editing. A commit over that edit is
+    /// application-origin unless an IME deletion has already begun a fresh typing session.
+    typing_ended: bool,
     /// Where the button went down, and where new type goes from there (snapped to Smart Guides).
     press: Option<(Point, Point)>,
     /// The other corner of an area dragged out (snapped).
@@ -92,6 +133,9 @@ pub struct TypeTool {
     clicks: (Option<Point>, u8),
     /// Styled copy of the last copied range (pasting the same plain text keeps its styles).
     clipboard: Vec<TextRun>,
+    /// The list typed characters last started (`text.startList`), so that after Undo puts them back
+    /// the caret goes on after them, and after Redo it goes back.
+    listed: Option<TypedList>,
     cache: Mutex<Option<CachedLayout>>,
 }
 
@@ -128,17 +172,77 @@ impl TypeTool {
         l
     }
 
+    /// The edited text used to find word and paragraph boundaries for selection: the typing session's
+    /// runs, or the document's current text when there is no live session or it has gone stale.
     fn plain(&self, cx: &ToolContext) -> String {
+        let document = self.editing.and_then(|id| Self::text(cx, id));
         match &self.typing {
+            // A session the document changed under is not the edited text any more: use the
+            // document's own runs (word/paragraph selection must not index stale text).
+            Some(ty) if document.is_some_and(|t| ty.cur != t.runs) => document.map(|t| t.plain_text()).unwrap_or_default(),
             Some(ty) => ty.cur.iter().map(|r| r.text.as_str()).collect(),
-            None => self.editing.and_then(|id| Self::text(cx, id)).map(|t| t.plain_text()).unwrap_or_default(),
+            None => document.map(|t| t.plain_text()).unwrap_or_default(),
         }
     }
 
-    /// The edited object as it currently is (with the typing session's runs).
+    /// The edited plain text as borrowed run slices: the IME query copies only the bounded window
+    /// it needs, never the whole document text. A typing session whose runs no longer match the
+    /// document (an external edit) is not used; the document's runs are.
+    fn plain_segments<'a>(&'a self, cx: &'a ToolContext) -> Option<Vec<&'a str>> {
+        let id = self.editing?;
+        let t = Self::text(cx, id)?;
+        match &self.typing {
+            Some(ty) if ty.cur == t.runs => Some(ty.cur.iter().map(|r| r.text.as_str()).collect()),
+            _ => Some(t.runs.iter().map(|r| r.text.as_str()).collect()),
+        }
+    }
+
+    /// The exact text [`Tool::text_input`] would insert for `s`: control characters removed, `\r`
+    /// normalized to `\n`, and Typographer's Quotes applied to a straight quote. `None` when
+    /// nothing would be inserted. Shared with [`Tool::text_input_is_verbatim`] so the IME receipt
+    /// and the insertion cannot disagree about what was transformed.
+    fn input_text(&self, cx: &ToolContext, s: &str) -> Option<String> {
+        let s: String = s.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).map(|c| if c == '\r' { '\n' } else { c }).collect();
+        if s.is_empty() {
+            return None;
+        }
+        // Use Typographer's Quotes (Document Setup): a typed straight quote becomes the document's
+        // opening or closing quote, by the character before it.
+        let setup = &cx.doc.setup;
+        if setup.typographers_quotes && matches!(s.as_str(), "\"" | "'") {
+            let mut prev = self.char_before(cx, self.caret.min(self.anchor));
+            return Some(setup.quotes.apply(&s, &mut prev));
+        }
+        Some(s)
+    }
+
+    /// The character just before byte `at` in the edited plain text, walked run by run (the quote
+    /// direction needs one character, not a copy of the whole text).
+    fn char_before(&self, cx: &ToolContext, at: usize) -> Option<char> {
+        let segments = self.plain_segments(cx)?;
+        let mut acc = 0usize;
+        let mut prev = None;
+        for segment in &segments {
+            let end = acc + segment.len();
+            if at <= acc {
+                break;
+            }
+            let local = at.min(end).saturating_sub(acc);
+            if let Some((_, c)) = segment.char_indices().take_while(|(i, _)| *i < local).last() {
+                prev = Some(c);
+            }
+            acc = end;
+        }
+        prev
+    }
+
+    /// The edited object as it currently is (with the typing session's runs). A session the
+    /// document changed under is dropped: the document's own runs win.
     fn current(&self, cx: &ToolContext) -> Option<TextObject> {
         let mut t = Self::text(cx, self.editing?)?.clone();
-        if let Some(ty) = &self.typing {
+        if let Some(ty) = &self.typing
+            && ty.cur == t.runs
+        {
             t.runs = ty.cur.clone();
         }
         Some(t)
@@ -183,9 +287,11 @@ impl TypeTool {
         if self.typing.as_ref().is_some_and(|ty| ty.cur != t.runs) {
             out.push(Action::Commit);
             self.typing = None;
+            self.preedit = None;
         }
         if self.typing.is_none() {
             out.push(Action::Begin("Typing".into()));
+            self.typing_ended = false;
         }
         let ty = self.typing.get_or_insert_with(|| Typing { base: t.runs.clone(), cur: t.runs.clone(), lo: usize::MAX });
         let len = edit::runs_len(&ty.cur);
@@ -215,17 +321,61 @@ impl TypeTool {
         if !extend {
             self.anchor = byte;
         }
+        self.listed = None;
         out
     }
 
+    /// Begin a new edit session for `id` at `caret`, assigning a fresh session id and clearing typing,
+    /// pre-edit and goal state.
     fn start_editing(&mut self, id: NodeId, caret: usize) {
+        self.edit_session = next_edit_session();
         self.editing = Some(id);
         self.fresh = None;
+        self.listed = None;
         self.caret = caret;
         self.anchor = caret;
         self.goal_x = None;
         self.typing = None;
         self.preedit = None;
+        self.typing_ended = false;
+    }
+
+    /// Typed list detection, after a space typed on its own at the caret: when the characters
+    /// from the start of the caret's paragraph up to it start a list ([`TextObject::typed_list_at`]),
+    /// the typing session ends as one undo step with those characters, and `text.startList`
+    /// removes them and makes the paragraph a list as the next one, so one Undo puts them back.
+    fn start_typed_list(&mut self, cx: &ToolContext) -> Vec<Action> {
+        let (Some(id), Some(ty)) = (self.editing, &self.typing) else { return vec![] };
+        let Some(mut t) = Self::text(cx, id).cloned() else { return vec![] };
+        // The document does not have the space yet (its preview is applied after this input).
+        t.runs = ty.cur.clone();
+        let at = self.caret;
+        let Some((start, list)) = t.typed_list_at(at) else { return vec![] };
+        let mut out = self.commit();
+        out.push(Action::Exec("text.startList".into(), json!({"id": id.0, "at": at})));
+        self.caret = start;
+        self.anchor = start;
+        self.listed = Some(TypedList { id, start, end: at, text: t.plain_text(), list });
+        out
+    }
+
+    /// After Undo of a list that typed characters started (and of what was typed after it), the
+    /// text is as it was typed: the caret goes on after the characters. After Redo the text is as
+    /// the list left it: the caret goes back to the paragraph's start.
+    fn after_typed_list(&mut self, cx: &ToolContext) {
+        let Some(l) = &self.listed else { return };
+        if self.editing != Some(l.id) || self.typing.is_some() || self.caret != self.anchor {
+            return;
+        }
+        let Some(t) = Self::text(cx, l.id) else { return };
+        let (text, list) = (t.plain_text(), t.para_at(t.paragraphs_in(l.start, l.start).start).list);
+        let listed_text = l.text.get(..l.start).zip(l.text.get(l.end..)).map(|(a, b)| format!("{a}{b}"));
+        if text == l.text && list.is_none() {
+            self.caret = l.end;
+        } else if self.caret == l.end && Some(&text) == listed_text.as_ref() && list == Some(l.list) {
+            self.caret = l.start;
+        }
+        self.anchor = self.caret;
     }
 
     /// Byte under `p` in the edited text if `p` is inside it (frame, path band or layout bounds).
@@ -324,6 +474,68 @@ impl TypeTool {
         params["placeholder"] = json!(cx.placeholder_text);
         out.push(Action::Exec("text.create".into(), params));
         out.push(Action::Notify("text.editNew".into()));
+        out
+    }
+
+    /// Delete plain-text byte ranges in one typing session, shifting the caret, anchor and any
+    /// pre-edit range so the selection's direction and the marked text are preserved.
+    fn delete_ranges(&mut self, cx: &ToolContext, ranges: &[(usize, usize)]) -> Vec<Action> {
+        let Some(id) = self.editing else { return vec![] };
+        let Some(t) = Self::text(cx, id) else {
+            self.editing = None;
+            return vec![];
+        };
+        let mut out = vec![];
+        // The document changed under us (undo, a panel edit): start a new session.
+        if self.typing.as_ref().is_some_and(|ty| ty.cur != t.runs) {
+            out.push(Action::Commit);
+            self.typing = None;
+            // The marked text belonged to the replaced session; it must not be sliced out of the
+            // new document text by a stale range.
+            self.preedit = None;
+        }
+        if self.typing.is_none() {
+            out.push(Action::Begin("Typing".into()));
+            self.typing_ended = false;
+        }
+        let len = match &self.typing {
+            Some(ty) => edit::runs_len(&ty.cur),
+            None => edit::runs_len(&t.runs),
+        };
+        let mut sorted: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (a.min(b).min(len), a.max(b).min(len))).filter(|(a, b)| a < b).collect();
+        sorted.sort_unstable();
+        if sorted.is_empty() {
+            return out;
+        }
+        // Shift the selection ends and the pre-edit by the bytes removed before them. The ranges
+        // lie outside the selection/pre-edit, so both ends move by the same preceding amount and
+        // a reversed selection stays reversed.
+        let shift = |at: usize| -> usize {
+            let removed: usize = sorted.iter().map(|&(a, b)| if at >= b { b - a } else { at.saturating_sub(a) }).sum();
+            at.saturating_sub(removed)
+        };
+        let (caret, anchor) = (self.caret.min(len), self.anchor.min(len));
+        self.caret = shift(caret);
+        self.anchor = shift(anchor);
+        if let Some(p) = &mut self.preedit {
+            p.range.start = shift(p.range.start.min(len));
+            p.range.end = shift(p.range.end.min(len));
+        }
+        self.goal_x = None;
+        let ty = self.typing.get_or_insert_with(|| Typing { base: t.runs.clone(), cur: t.runs.clone(), lo: usize::MAX });
+        // Delete from the end so earlier offsets stay valid; each call floors to a char boundary
+        // and the one Preview below still makes the whole session one undo step.
+        for &(a, b) in sorted.iter().rev() {
+            ty.lo = ty.lo.min(a);
+            edit::replace_range(&mut ty.cur, a, b, "");
+        }
+        // One preview for the whole session, exactly as `replace` does.
+        let base: String = ty.base.iter().map(|r| r.text.as_str()).collect();
+        let cur: String = ty.cur.iter().map(|r| r.text.as_str()).collect();
+        let (p, s) = common_affixes(&base, &cur, ty.lo);
+        let runs = edit::slice_runs(&ty.cur, p, cur.len() - s);
+        let runs = if runs.is_empty() { json!([]) } else { serde_json::to_value(&runs).unwrap_or(json!([])) };
+        out.push(Action::Preview("text.editRange".into(), json!({"id": id.0, "start": p, "end": base.len() - s, "runs": runs})));
         out
     }
 }
@@ -555,6 +767,115 @@ fn common_affixes(a: &str, b: &str, max_prefix: usize) -> (usize, usize) {
     (p, s)
 }
 
+/// Byte length of the borrowed plain-text segments.
+fn plain_len(segments: &[&str]) -> usize {
+    segments.iter().map(|s| s.len()).sum()
+}
+
+/// Is `byte` a UTF-8 boundary in the concatenation of `segments`? Run edges are boundaries.
+fn plain_is_boundary(segments: &[&str], byte: usize) -> bool {
+    let mut at = 0usize;
+    for segment in segments {
+        if byte == at {
+            return true;
+        }
+        if byte < at + segment.len() {
+            return segment.is_char_boundary(byte - at);
+        }
+        at += segment.len();
+    }
+    byte == at
+}
+
+/// Append the bytes `start..end` of the concatenation of `segments` to `out`.
+fn copy_plain_range(segments: &[&str], start: usize, end: usize, out: &mut String) {
+    let mut at = 0usize;
+    for segment in segments {
+        let segment_end = at + segment.len();
+        let from = start.max(at);
+        let to = end.min(segment_end);
+        if from < to {
+            let (a, b) = (from - at, to - at);
+            if segment.is_char_boundary(a) && segment.is_char_boundary(b) {
+                out.push_str(&segment[a..b]);
+            }
+        }
+        if segment_end >= end {
+            break;
+        }
+        at = segment_end;
+    }
+}
+
+/// Move `i` back to a character boundary in the concatenation of `segments` (deleting fewer
+/// bytes rather than splitting UTF-8).
+fn plain_floor_boundary(segments: &[&str], mut i: usize) -> usize {
+    i = i.min(plain_len(segments));
+    while i > 0 && !plain_is_boundary(segments, i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Move `i` forward to a character boundary in the concatenation of `segments`.
+fn plain_ceil_boundary(segments: &[&str], mut i: usize) -> usize {
+    let len = plain_len(segments);
+    i = i.min(len);
+    while i < len && !plain_is_boundary(segments, i) {
+        i += 1;
+    }
+    i
+}
+
+/// The byte offset `n` characters before `at` (a boundary) in `segments`, stopping at the start of
+/// the text. Walks the runs, so a large IME deletion count never copies the whole text.
+fn plain_chars_before(segments: &[&str], at: usize, n: usize) -> usize {
+    if n == 0 {
+        return at;
+    }
+    let mut remaining = n;
+    let mut end = plain_len(segments);
+    for segment in segments.iter().rev() {
+        let start = end - segment.len();
+        let local_end = at.min(end).saturating_sub(start);
+        if local_end > 0 && segment.is_char_boundary(local_end) {
+            let before = &segment[..local_end];
+            let count = before.chars().count();
+            if count >= remaining {
+                return start + before.char_indices().rev().nth(remaining.saturating_sub(1)).map_or(0, |(i, _)| i);
+            }
+            remaining -= count;
+        }
+        end = start;
+    }
+    0
+}
+
+/// The byte offset `n` characters after `at` (a boundary) in `segments`, stopping at the end of
+/// the text.
+fn plain_chars_after(segments: &[&str], at: usize, n: usize) -> usize {
+    if n == 0 {
+        return at;
+    }
+    let len = plain_len(segments);
+    let mut remaining = n;
+    let mut acc = 0usize;
+    for segment in segments {
+        let end = acc + segment.len();
+        let local_start = at.saturating_sub(acc);
+        if end > at && segment.is_char_boundary(local_start) {
+            let after = &segment[local_start..];
+            let count = after.chars().count();
+            if count >= remaining {
+                return acc + local_start + after.char_indices().nth(remaining).map_or(after.len(), |(i, _)| i);
+            }
+            remaining -= count;
+        }
+        acc = end;
+    }
+    len
+}
+
 impl Tool for TypeTool {
     fn id(&self) -> &'static str {
         match (self.mode, self.vertical) {
@@ -643,9 +964,10 @@ impl Tool for TypeTool {
         if self.editing.is_none() {
             return vec![];
         }
-        let s: String = s.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')).map(|c| if c == '\r' { '\n' } else { c }).collect();
         // An IME commit replaces its marked text (an empty commit just removes it).
         let committing = self.preedit.is_some();
+        // A space typed on its own at a caret may start a list.
+        let list_space = !committing && s == " " && self.caret == self.anchor;
         if committing && s.is_empty() {
             return self.ime_preedit(cx, "", None);
         }
@@ -653,19 +975,7 @@ impl Tool for TypeTool {
             self.anchor = p.range.start;
             self.caret = p.range.end;
         }
-        if s.is_empty() {
-            return vec![];
-        }
-        // Use Typographer's Quotes (Document Setup): a typed straight quote becomes the document's
-        // opening or closing quote, by the character before it.
-        let setup = &cx.doc.setup;
-        let s = if setup.typographers_quotes && matches!(s.as_str(), "\"" | "'") {
-            let text = self.plain(cx);
-            let mut prev = text.get(..self.caret.min(self.anchor)).and_then(|b| b.chars().next_back());
-            setup.quotes.apply(&s, &mut prev)
-        } else {
-            s
-        };
+        let Some(s) = self.input_text(cx, s) else { return vec![] };
         self.clicks = (None, 0);
         // Pasting what we copied keeps its formatting (unless pasted text is kept plain).
         let clip: String = self.clipboard.iter().map(|r| r.text.as_str()).collect();
@@ -673,8 +983,50 @@ impl Tool for TypeTool {
             let runs = self.clipboard.clone();
             return self.replace(cx, "", Some(runs));
         }
-        self.replace(cx, &s, None)
+        let mut out = self.replace(cx, &s, None);
+        if list_space {
+            out.extend(self.start_typed_list(cx));
+        }
+        out
     }
+    /// Would [`Tool::text_input`] change `s` before inserting it? Control characters are dropped,
+    /// `\r` becomes `\n`, Typographer's Quotes rewrites a straight quote, and copied text keeps
+    /// its run styles. An IME commit the application rewrites is an application edit, not an
+    /// accepted IME insertion (its receipt must stay `Other`).
+    fn text_input_is_verbatim(&self, cx: &ToolContext, s: &str) -> bool {
+        if self.editing.is_none() {
+            return true;
+        }
+        if s.is_empty() {
+            return true;
+        }
+        // A straight quote's direction depends on the character before the insertion. During a
+        // commit this check still sees the pre-edit at the caret, while `text_input` replaces it
+        // from its start; with a custom pair whose opening quote is straight, that can look
+        // verbatim here and then be rewritten. Never claim verbatim for one.
+        if cx.doc.setup.typographers_quotes && matches!(s, "\"" | "'") {
+            return false;
+        }
+        let Some(normalized) = self.input_text(cx, s) else { return false };
+        if normalized != s {
+            return false;
+        }
+        let clip: String = self.clipboard.iter().map(|r| r.text.as_str()).collect();
+        !(self.preedit.is_none() && normalized.len() > 1 && normalized == clip && !cx.paste_plain_text)
+    }
+    /// Whether the typing session still describes the edited document; a session ended by an outside
+    /// command reports false until a replacement commit starts a new one.
+    fn ime_session_matches_document(&self, cx: &ToolContext) -> bool {
+        match (self.editing, &self.typing) {
+            (Some(id), Some(ty)) => Self::text(cx, id).is_none_or(|t| ty.cur == t.runs),
+            // An outside command settled the session: the document may have changed under it, and
+            // the commit that starts a new session cannot claim the IME made that change.
+            (Some(_), None) => !self.typing_ended,
+            _ => true,
+        }
+    }
+    /// Handle an editing key: ignore keys while an IME composes, remap arrows in vertical text, step
+    /// type attributes with Alt, and otherwise edit, navigate or end the session.
     fn key(&mut self, cx: &ToolContext, key: ToolKey, mods: Mods) -> Vec<Action> {
         // The IME owns the keys while it composes (the UI doesn't send them; this is a guard).
         if self.preedit.is_some() {
@@ -841,6 +1193,111 @@ impl Tool for TypeTool {
         self.preedit = Some(Preedit { range: start..end, active: active_chars.and_then(|r| char_range_to_bytes(&text, r)) });
         out
     }
+    /// Delete the requested bytes or characters before and after the selection or marked text,
+    /// preserving the selection direction and composition and refusing a stale session; byte counts
+    /// round inward to UTF-8 boundaries.
+    fn ime_delete_surrounding(&mut self, cx: &ToolContext, before: usize, after: usize, unit: SurroundingUnit) -> Vec<Action> {
+        let Some(id) = self.editing else { return vec![] };
+        // The document changed under the session (undo, a panel edit): the ranges below would index
+        // text that is no longer there. The commit that follows resets the session; do not delete
+        // from the wrong text in the meantime.
+        if let Some(t) = Self::text(cx, id)
+            && self.typing.as_ref().is_some_and(|ty| ty.cur != t.runs)
+        {
+            return vec![];
+        }
+        // Walk the runs in place: joining the whole edited text here would copy a large document
+        // for every IME deletion event, though only the characters next to the selection matter.
+        let Some(segments) = self.plain_segments(cx) else { return vec![] };
+        let len = plain_len(&segments);
+        // The text the IME's following commit replaces (the selection, or the marked text while
+        // composing). The surrounding deletion never removes it: it deletes only the bytes/characters
+        // before and after it, preserving the selection direction and the composition.
+        let (raw_start, raw_end) = match &self.preedit {
+            Some(p) => (p.range.start.min(len), p.range.end.min(len)),
+            None => (self.caret.min(self.anchor).min(len), self.caret.max(self.anchor).min(len)),
+        };
+        let (before_start, start, end, after_end) = match unit {
+            SurroundingUnit::Bytes => {
+                // Inward rounding: a count ending inside a scalar leaves that scalar whole. The
+                // preceding side moves its start forward (ceil), the following side moves its end
+                // backward (floor). Do not reverse these: that would delete part of a character.
+                let start = plain_floor_boundary(&segments, raw_start);
+                let end = plain_ceil_boundary(&segments, raw_end);
+                let before_start = plain_ceil_boundary(&segments, start.saturating_sub(before));
+                let after_end = plain_floor_boundary(&segments, end.saturating_add(after));
+                (before_start, start, end, after_end)
+            }
+            SurroundingUnit::Chars => {
+                let start = plain_floor_boundary(&segments, raw_start);
+                let end = plain_ceil_boundary(&segments, raw_end);
+                let before_start = plain_chars_before(&segments, start, before);
+                let after_end = plain_chars_after(&segments, end, after);
+                (before_start, start, end, after_end)
+            }
+        };
+        let mut ranges = Vec::with_capacity(2);
+        if before_start < start {
+            ranges.push((before_start, start));
+        }
+        if end < after_end {
+            ranges.push((end, after_end));
+        }
+        if ranges.is_empty() {
+            return vec![];
+        }
+        self.delete_ranges(cx, &ranges)
+    }
+    /// Return the active Type tool's stable IME owner (document uid, target id, replacement epoch),
+    /// or `None` when nothing is being edited.
+    fn ime_target(&self, cx: &ToolContext) -> Option<(u64, u64, u64)> {
+        let id = self.editing?;
+        Self::text(cx, id)?;
+        Some((cx.revision.0, id.0, self.edit_session))
+    }
+    /// Return a bounded logical text window around the caret, anchor and optional pre-edit; a stale
+    /// typing session publishes the document's current text, and unusable or non-boundary offsets
+    /// return `Unavailable` rather than stale data.
+    fn ime_surrounding(&self, cx: &ToolContext, max_bytes: usize) -> ImeSurrounding {
+        let Some(id) = self.editing else {
+            return ImeSurrounding::Unavailable("no text object is being edited");
+        };
+        let Some(current) = Self::text(cx, id) else {
+            return ImeSurrounding::Unavailable("the edited text object is gone");
+        };
+        // The document changed under the typing session (undo, a panel or control edit): the
+        // session's runs, marked-text range and caret offsets no longer describe the document.
+        // Publish the document's own text (never the stale session's, which the IME cannot see);
+        // the marked text has no range in it, so it is excluded from the logical view. The
+        // commit-time check (`ime_session_matches_document`) reports the reset as application
+        // origin instead of letting a receipt describe the wrong text.
+        let stale = self.typing.as_ref().is_some_and(|ty| ty.cur != current.runs);
+        if self.preedit.is_some() && self.typing.is_none() {
+            return ImeSurrounding::Unavailable("the IME pre-edit has no typing session");
+        }
+        let Some(segments) = self.plain_segments(cx) else {
+            return ImeSurrounding::Unavailable("the edited text object is gone");
+        };
+        let len = plain_len(&segments);
+        let caret = self.caret.min(len);
+        let anchor = self.anchor.min(len);
+        if !plain_is_boundary(&segments, caret) || !plain_is_boundary(&segments, anchor) {
+            return ImeSurrounding::Unavailable("the caret or selection anchor is not a UTF-8 boundary");
+        }
+        let preedit = match self.preedit.as_ref().filter(|_| !stale) {
+            Some(p) => {
+                let start = p.range.start.min(len);
+                let end = p.range.end.min(len);
+                if start > end || !plain_is_boundary(&segments, start) || !plain_is_boundary(&segments, end) {
+                    return ImeSurrounding::Unavailable("the IME pre-edit is not on UTF-8 boundaries");
+                }
+                Some(start..end)
+            }
+            None => None,
+        };
+        ime_surrounding_window(&segments, preedit, len, caret, anchor, max_bytes)
+    }
+    /// Whether an IME pre-edit is currently shown for this Type-tool session.
     fn composing(&self) -> bool {
         self.preedit.is_some()
     }
@@ -861,8 +1318,11 @@ impl Tool for TypeTool {
         self.finish(cx)
     }
     /// Editing ends when a command takes the text out of the selection (Deselect, another object
-    /// picked in the Layers panel) or removes it.
+    /// picked in the Layers panel) or removes it. After an Undo that takes back a list typed
+    /// characters started, the caret goes on after the characters, and after its Redo the caret
+    /// goes before the paragraph's text.
     fn after_command(&mut self, cx: &ToolContext) -> Vec<Action> {
+        self.after_typed_list(cx);
         let Some(id) = self.editing else { return vec![] };
         let mut cur = Some(id).filter(|i| cx.doc.node(*i).is_some());
         while let Some(c) = cur {
@@ -928,6 +1388,7 @@ impl Tool for TypeTool {
             "commitTyping" | "endTyping" => {
                 self.typing = None;
                 self.preedit = None;
+                self.typing_ended = true;
             }
             "selectAll" if self.editing.is_some() => {
                 self.anchor = 0;
@@ -1039,6 +1500,90 @@ impl Tool for TypeTool {
         }
         if self.vertical { Cursor::TypeVertical } else { Cursor::Text }
     }
+}
+
+/// The logical IME surrounding window: the pre-edit is removed and the caret/anchor offsets
+/// are remapped around it. `preedit` has already been validated against `segments`.
+fn ime_surrounding_window(
+    segments: &[&str],
+    preedit: Option<Range<usize>>,
+    len: usize,
+    caret: usize,
+    anchor: usize,
+    max_bytes: usize,
+) -> ImeSurrounding {
+    let removed = preedit.as_ref().map_or(0, |r| r.end - r.start);
+    let logical_len = len - removed;
+    let to_logical = |byte: usize| -> usize {
+        match &preedit {
+            Some(r) if byte > r.start && byte < r.end => r.start,
+            Some(r) if byte >= r.end => byte - removed,
+            _ => byte,
+        }
+    };
+    let cursor = to_logical(caret);
+    let anchor = to_logical(anchor);
+    let selection_start = cursor.min(anchor);
+    let selection_end = cursor.max(anchor);
+    let selection_len = selection_end - selection_start;
+    if selection_len > max_bytes {
+        return ImeSurrounding::Unavailable("the selection is wider than the IME surrounding-text limit");
+    }
+    let budget = max_bytes - selection_len;
+    let before_available = selection_start;
+    let after_available = logical_len - selection_end;
+    let mut before = (budget / 2).min(before_available);
+    let mut after = (budget - before).min(after_available);
+    before = (budget - after).min(before_available);
+    after = (budget - before).min(after_available);
+    let mut window_start = selection_start - before;
+    let mut window_end = selection_end + after;
+    let logical_boundary = |byte: usize| -> bool {
+        match &preedit {
+            Some(r) if byte == r.start => true,
+            Some(r) if byte < r.start => plain_is_boundary(segments, byte),
+            Some(_) => plain_is_boundary(segments, byte + removed),
+            None => plain_is_boundary(segments, byte),
+        }
+    };
+    while window_start < selection_start && !logical_boundary(window_start) {
+        window_start += 1;
+    }
+    while selection_end < window_end && !logical_boundary(window_end) {
+        window_end -= 1;
+    }
+    let to_original = |byte: usize| -> usize {
+        match &preedit {
+            Some(r) if byte > r.start => byte + removed,
+            _ => byte,
+        }
+    };
+    let original_start = to_original(window_start);
+    let original_end = to_original(window_end);
+    let mut text = String::with_capacity(window_end - window_start);
+    match &preedit {
+        Some(r) => {
+            if window_start < r.start {
+                let first_end = original_end.min(r.start);
+                if original_start < first_end {
+                    copy_plain_range(segments, original_start, first_end, &mut text);
+                }
+            }
+            if r.start < window_end {
+                let second_start = r.end.max(original_start);
+                if second_start < original_end {
+                    copy_plain_range(segments, second_start, original_end, &mut text);
+                }
+            }
+        }
+        None => {
+            if original_start < original_end {
+                copy_plain_range(segments, original_start, original_end, &mut text);
+            }
+        }
+    }
+    debug_assert_eq!(text.len(), window_end - window_start, "removing the pre-edit must preserve the logical window length");
+    ImeSurrounding::Available { text, cursor: cursor - window_start, anchor: anchor - window_start }
 }
 
 #[cfg(test)]

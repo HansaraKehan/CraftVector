@@ -132,6 +132,25 @@ pub struct PositionedGlyph {
     /// A colour glyph's art (COLR layers, an SVG document's art), drawn through `xf` instead of an
     /// outline: a group in font units (y down). Its `outline` is empty.
     pub colour: Option<Arc<vectorcraft_doc::Node>>,
+    /// Type on a curved path in a script whose letters join: the glyph's `outline` is bent along
+    /// the path ([`GlyphBend`]) so it meets its neighbours, and `xf` is only the straight glyph
+    /// nearest it (for the caret, hit testing and tools). `None`: the glyph is drawn through `xf`.
+    pub bend: Option<GlyphBend>,
+}
+
+/// How a glyph on a path is bent along it: a point of its pen space (x along its advance from its
+/// left end, y down from the baseline) goes to `P(s + x · step / advance) + (y + rise) · N` there,
+/// `P` the path's point at a distance along it and `N` its normal on the glyph's lower side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphBend {
+    /// Where the glyph's left end is along the path.
+    pub s: f64,
+    /// How far along the path the glyph runs.
+    pub step: f64,
+    /// The glyph's advance.
+    pub advance: f64,
+    /// How far down the type moves off the path (Align to Path).
+    pub rise: f64,
 }
 
 impl PositionedGlyph {
@@ -703,6 +722,8 @@ mod tests_inline;
 mod tests_joiners;
 #[cfg(test)]
 mod tests_justify;
+#[cfg(test)]
+mod tests_path_joins;
 #[cfg(test)]
 mod tests_ruby;
 #[cfg(test)]

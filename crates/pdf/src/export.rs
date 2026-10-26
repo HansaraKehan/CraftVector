@@ -21,8 +21,8 @@ use vectorcraft_color::{BlendMode, Color, GradientKind, Paint};
 use vectorcraft_doc::{AppearanceItem, Document, LineCap, LineJoin, Node, NodeKind, StrokeAlign, StrokeLayer, SymbolBoxes, TextObject};
 use vectorcraft_effects::stroke::{self, WrittenShape};
 use vectorcraft_geom::{Affine, BezPath, FillRule, Rect};
-use vectorcraft_text::TextLayout;
 use vectorcraft_text::embed::Embedding;
+use vectorcraft_text::{ListMarker, TextLayout};
 
 use crate::forms::Mark;
 use crate::lab_spot::{find, rfind};
@@ -320,6 +320,7 @@ impl Writer {
             description: given(&info.description),
             keywords: info.keywords.clone(),
             created: created.map(date_time),
+            modified: None,
         };
         let pdf = write::Writer::new(settings, metadata);
         Ok(Self {
@@ -693,8 +694,11 @@ struct GlyphLine {
     /// The glyph space (krilla's, y down, at `size`) → text space, at the line's start.
     frame: Affine,
     /// Glyph id, pen position and advance along the line (in glyph space), and the characters it
-    /// stands for (bytes of the plain text).
+    /// stands for (bytes of the plain text, or of the list marker's text).
     glyphs: Vec<(u32, f64, f64, std::ops::Range<usize>)>,
+    /// The list marker the glyphs belong to, by its first glyph's index in the layout
+    /// ([`TextLayout::marker_of`]); `None` for glyphs of the plain text.
+    marker: Option<usize>,
 }
 
 /// Most pixels along a side of a freeform gradient's image (its colour field is smooth).
@@ -1660,7 +1664,7 @@ impl Exporter<'_> {
                 // The outlines left to fill as paths: all of them, or those real text leaves.
                 let outlines = match plain.as_deref().filter(|_| !fill.is_none() && !ex.area_paint(fill, true)) {
                     Some(text) => {
-                        let (mut left, unwritten) = ex.glyph_text(s, &layout, i, text, fill, true);
+                        let (mut left, unwritten) = ex.glyph_text(s, &layout, i, text, fill, true, Some(false));
                         images = Some(unwritten);
                         left.extend(run_bars.iter());
                         Cow::Owned(left)
@@ -1700,7 +1704,17 @@ impl Exporter<'_> {
                     s.push_transform(&text_space);
                     // The paint only lets the writer write the text; the glyphs it can't write
                     // as text draw nothing, and colour bitmap glyphs are drawn already.
-                    self.glyph_text(s, &layout, i, text, &Paint::solid(Color::gray(0.0)), false);
+                    self.glyph_text(s, &layout, i, text, &Paint::solid(Color::gray(0.0)), false, None);
+                    s.pop();
+                });
+            } else if let Some(text) = plain.as_deref().filter(|_| layout.glyphs.iter().any(|g| g.run == i && g.bend.is_some())) {
+                // Glyphs bent along a path were drawn as their outlines (text is set straight):
+                // they are written again as invisible text, straight where they stand, so they can
+                // still be selected, searched and copied.
+                self.invisible = true;
+                crate::forms::form(s, Mark::Invisible, |s| {
+                    s.push_transform(&text_space);
+                    self.glyph_text(s, &layout, i, text, &Paint::solid(Color::gray(0.0)), false, Some(true));
                     s.pop();
                 });
             }
@@ -1769,24 +1783,69 @@ impl Exporter<'_> {
     /// COLR, SVG), with `images`, are written as text too, which draws their images or layers; the
     /// indices of those it can't write or draw (SVG glyphs) are returned with the outlines. The
     /// hyphen the layout adds where it breaks a line inside a word ([`break_hyphen`]) is written
-    /// as the character its glyph stands for, on its own after the glyphs before it.
-    fn glyph_text(&mut self, s: &mut Surface, layout: &TextLayout, run: usize, text: &str, fill: &Paint, images: bool) -> (BezPath, Vec<usize>) {
+    /// as the character its glyph stands for, on its own after the glyphs before it. The glyphs of
+    /// a list marker are written as the marker's characters ([`marker_chars`]), apart from the
+    /// plain text's glyphs; a marker glyph that stands for none of them is drawn as a path.
+    ///
+    /// `bent`: `Some(false)` writes the glyphs bent along a path ([`vectorcraft_text::GlyphBend`])
+    /// as outlines, not text (text is set straight); `Some(true)` writes only those, as text where
+    /// they stand straight; `None` writes all of them as text.
+    #[allow(clippy::too_many_arguments)]
+    fn glyph_text(
+        &mut self,
+        s: &mut Surface,
+        layout: &TextLayout,
+        run: usize,
+        text: &str,
+        fill: &Paint,
+        images: bool,
+        bent: Option<bool>,
+    ) -> (BezPath, Vec<usize>) {
         let (mut rest, mut unwritten) = (BezPath::new(), vec![]);
         let mut line: Option<GlyphLine> = None;
         // The characters the glyphs stand for: the plain text, then, when the run has glyphs that
         // stand for no character of it, the characters a line-break hyphen can stand for.
         let written: Cow<str> =
             if layout.glyphs.iter().any(|g| g.run == run && g.len == 0) { Cow::Owned(format!("{text}{BREAK_HYPHENS}")) } else { Cow::Borrowed(text) };
+        let written_text: &str = &written;
+        // The text a line's glyphs stand for: `written`, or its list marker's characters.
+        let text_of = |l: &GlyphLine| l.marker.and_then(|m| layout.marker_of(m)).map_or(written_text, |m| m.text.as_str());
+        // The characters of the list marker being written that each of its glyphs stands for.
+        let mut marker: Option<(usize, Vec<Option<std::ops::Range<usize>>>)> = None;
         for (gi, g) in layout.glyphs.iter().enumerate().filter(|(_, g)| g.run == run) {
             let coloured = g.image.is_some() || g.colour.is_some();
             if coloured && !images {
                 continue;
             }
-            // A list marker's glyphs stand for no character of the text either; they are not
-            // line-break hyphens, whatever the marker.
-            let hyphen = if layout.marker_of(gi).is_some() { None } else { break_hyphen(g) };
-            let range = hyphen.clone().map_or(g.byte..g.byte + g.len, |h| text.len() + h.start..text.len() + h.end);
-            let ch = written.get(range.clone()).and_then(|t| t.chars().next());
+            match (bent, g.bend.is_some()) {
+                (Some(false), true) => {
+                    rest.extend(g.outline.iter());
+                    continue;
+                }
+                (Some(true), false) => continue,
+                _ => {}
+            }
+            // Of the glyphs with no length, only a list marker's and line-break hyphens are written
+            // as text; the others, such as kashidas, are drawn as paths. A list marker's glyphs are
+            // not line-break hyphens, whatever the marker.
+            let in_marker = (g.len == 0).then(|| layout.marker_of(gi)).flatten();
+            let hyphen = if in_marker.is_some() { None } else { break_hyphen(g) };
+            let (range, ch) = match in_marker {
+                Some(m) => {
+                    if marker.as_ref().is_none_or(|(start, _)| *start != m.glyphs.start) {
+                        marker = Some((m.glyphs.start, marker_chars(layout, m)));
+                    }
+                    let range = marker.as_ref().and_then(|(start, chars)| chars.get(gi.checked_sub(*start)?).cloned().flatten());
+                    let ch = range.clone().and_then(|r| m.text.get(r)).and_then(|t| t.chars().next());
+                    (range.unwrap_or(0..0), ch)
+                }
+                None => {
+                    let range = hyphen.clone().map_or(g.byte..g.byte + g.len, |h| text.len() + h.start..text.len() + h.end);
+                    let ch = written.get(range.clone()).and_then(|t| t.chars().next());
+                    (range, ch)
+                }
+            };
+            let marker_at = in_marker.map(|m| m.glyphs.start);
             // Spaces are written too (text extraction needs them); control characters and soft
             // hyphens draw nothing.
             let blank = g.outline.elements().is_empty() && !coloured;
@@ -1819,18 +1878,22 @@ impl Exporter<'_> {
             let frame = g.xf * Affine::scale(1.0 / sy);
             // Its pen position along the frame's baseline, when it continues the line (a
             // line-break hyphen never does).
-            let x = line.as_ref().filter(|l| hyphen.is_none() && l.face == g.font_id && (l.size - size).abs() < 1e-6).and_then(|l| {
-                let [a, b, c, d, e, f] = (l.frame.inverse() * frame).as_coeffs();
-                let same = (a - 1.0).abs() < 1e-6 && b.abs() < 1e-6 && c.abs() < 1e-6 && (d - 1.0).abs() < 1e-6 && f.abs() < 1e-4;
-                same.then_some(e)
-            });
+            let x = line
+                .as_ref()
+                .filter(|l| hyphen.is_none() && l.face == g.font_id && (l.size - size).abs() < 1e-6 && l.marker == marker_at)
+                .and_then(|l| {
+                    let [a, b, c, d, e, f] = (l.frame.inverse() * frame).as_coeffs();
+                    let same = (a - 1.0).abs() < 1e-6 && b.abs() < 1e-6 && c.abs() < 1e-6 && (d - 1.0).abs() < 1e-6 && f.abs() < 1e-4;
+                    same.then_some(e)
+                });
             let x = match x {
                 Some(x) => x,
                 None => {
                     if let Some(l) = line.take() {
-                        self.draw_glyph_line(s, l, &written, fill, layout.bounds);
+                        let text = text_of(&l);
+                        self.draw_glyph_line(s, l, text, fill, layout.bounds);
                     }
-                    line = Some(GlyphLine { face: g.font_id, font, size, frame, glyphs: vec![] });
+                    line = Some(GlyphLine { face: g.font_id, font, size, frame, glyphs: vec![], marker: marker_at });
                     0.0
                 }
             };
@@ -1847,7 +1910,8 @@ impl Exporter<'_> {
             }
         }
         if let Some(l) = line {
-            self.draw_glyph_line(s, l, &written, fill, layout.bounds);
+            let text = text_of(&l);
+            self.draw_glyph_line(s, l, text, fill, layout.bounds);
         }
         (rest, unwritten)
     }
@@ -2094,6 +2158,35 @@ fn break_hyphen(g: &vectorcraft_text::PositionedGlyph) -> Option<std::ops::Range
     }
     let face = vectorcraft_text::FontDb::global().face_by_id(g.font_id)?;
     BREAK_HYPHENS.char_indices().find(|&(_, c)| face.glyph_for(c) == g.gid).map(|(i, c)| i..i + c.len_utf8())
+}
+
+/// The characters of list marker `m` of `layout` that each of its glyphs stands for, as bytes of
+/// the marker's text, in the order of [`ListMarker::glyphs`]: `None` for its tab and for a glyph
+/// that stands for none of them. A glyph stands for the first character left that the glyph's
+/// font maps to that glyph in its character map. When the glyphs that no character maps to (an
+/// OpenType feature such as oldstyle figures replaced them) are as many as the characters left,
+/// they stand for those characters, in order.
+fn marker_chars(layout: &TextLayout, m: &ListMarker) -> Vec<Option<std::ops::Range<usize>>> {
+    let db = vectorcraft_text::FontDb::global();
+    let mut left: Vec<(std::ops::Range<usize>, char)> = m.text.char_indices().map(|(i, c)| (i..i + c.len_utf8(), c)).collect();
+    let mut chars = vec![None; m.glyphs.len()];
+    let mut unmapped = vec![];
+    for (k, gi) in m.glyphs.clone().enumerate() {
+        let Some(g) = layout.glyphs.get(gi).filter(|g| gi != m.tab && g.gid != 0) else { continue };
+        let face = db.face_by_id(g.font_id);
+        match (left.iter().position(|(_, c)| face.as_ref().is_some_and(|f| f.glyph_for(*c) == g.gid)), chars.get_mut(k)) {
+            (Some(at), Some(slot)) => *slot = Some(left.remove(at).0),
+            _ => unmapped.push(k),
+        }
+    }
+    if unmapped.len() == left.len() {
+        for (k, (range, _)) in unmapped.into_iter().zip(left) {
+            if let Some(slot) = chars.get_mut(k) {
+                *slot = Some(range);
+            }
+        }
+    }
+    chars
 }
 
 #[cfg(test)]

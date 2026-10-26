@@ -229,7 +229,7 @@ mod tests {
                 let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
                 ctx.run_ui(input, |ui| super::super::show(&mut app, ui.ctx())).textures_delta.clear();
             }
-            ctx.memory(|m| m.area_rect(egui::Id::new(("dialog", KIND)))).unwrap().height()
+            ctx.memory(|m| m.area_rect(egui::Id::unique(("dialog", KIND)))).unwrap().height()
         };
         let (short, tall) = (height(1000.0), height(2000.0));
         assert!((short - tall).abs() < 1.0 && short < 400.0, "{short} vs {tall}");

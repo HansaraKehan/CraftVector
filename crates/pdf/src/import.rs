@@ -2040,6 +2040,10 @@ impl<'a> Device<'a> for Builder<'_> {
         paint: &craft_pdf::interpret::Paint<'a>,
         draw_mode: &GlyphDrawMode,
     ) {
+        // Clipping text paints nothing; its outlines arrive separately as a clip path.
+        if matches!(draw_mode, GlyphDrawMode::Clip) {
+            return;
+        }
         self.pending = false;
         let stroke = match draw_mode {
             // Invisible text (a scanned page's recognized text, over the scan) draws nothing but
@@ -2054,7 +2058,7 @@ impl<'a> Device<'a> for Builder<'_> {
                 }
                 return;
             }
-            GlyphDrawMode::Fill => None,
+            GlyphDrawMode::Fill | GlyphDrawMode::Clip => None,
             GlyphDrawMode::Stroke(p) => Some(p.clone()),
         };
         match glyph {

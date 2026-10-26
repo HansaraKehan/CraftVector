@@ -296,6 +296,14 @@ mod tests {
         ConnectionTimeouts { idle: Duration::from_millis(150), line: Duration::from_millis(120), write: Duration::from_millis(150) }
     }
 
+    /// The short line deadline, with idle and reply budgets longer than the tests' 3 s waits. On a
+    /// busy machine either thread can pause for more than 150 ms between connecting and sending, or
+    /// between starting a reply and writing it, and a short budget then closes the connection with no
+    /// reply.
+    fn line_timeouts() -> ConnectionTimeouts {
+        ConnectionTimeouts { idle: Duration::from_secs(10), write: Duration::from_secs(10), ..short_timeouts() }
+    }
+
     fn socket_fixture(
         timeouts: ConnectionTimeouts,
         handle: impl FnMut(String, Value) -> Option<Value> + Send + 'static,
@@ -344,7 +352,7 @@ mod tests {
     /// A line that stalls is refused in words a client's author can act on, not the system's.
     #[test]
     fn stalled_control_line_is_refused_with_the_reason() {
-        let (mut client, done, worker) = socket_fixture(short_timeouts(), |_, _| panic!("incomplete requests must not execute"));
+        let (mut client, done, worker) = socket_fixture(line_timeouts(), |_, _| panic!("incomplete requests must not execute"));
         client.write_all(b"{\"method\":").unwrap();
         let mut line = String::new();
         BufReader::new(client.try_clone().unwrap()).read_line(&mut line).unwrap();
@@ -419,7 +427,7 @@ mod tests {
 
     #[test]
     fn buffered_partial_control_line_also_expires() {
-        let (mut client, done, worker) = socket_fixture(short_timeouts(), |_, _| Some(json!({"ok": true})));
+        let (mut client, done, worker) = socket_fixture(line_timeouts(), |_, _| Some(json!({"ok": true})));
         client.write_all(b"{\"id\":1,\"method\":\"inspect\"}\n{").unwrap();
         let mut line = String::new();
         BufReader::new(client.try_clone().unwrap()).read_line(&mut line).unwrap();

@@ -330,16 +330,17 @@ pub(crate) fn toolbar_drop(app: &mut VectorcraftApp, ui: &Ui, slots: &[(usize, R
 
 /// Where the toolbar leaves its ••• button's rect and its own for the drawer, each frame.
 pub(crate) fn button_id() -> egui::Id {
-    egui::Id::new("edit-toolbar-button")
+    egui::Id::unique("edit-toolbar-button")
 }
 
+/// Stable id of the floating edit toolbar.
 pub(crate) fn toolbar_id() -> egui::Id {
-    egui::Id::new("edit-toolbar-toolbar")
+    egui::Id::unique("edit-toolbar-toolbar")
 }
 
 /// The drawer's area.
 pub(crate) fn drawer_id() -> egui::Id {
-    egui::Id::new("tools-drawer")
+    egui::Id::unique("tools-drawer")
 }
 
 /// The heading a tool is listed under: its Basic toolbar group, else one for the tools only the
@@ -436,7 +437,7 @@ pub(crate) fn drawer(app: &mut VectorcraftApp, ctx: &egui::Context) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (r, menu) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     icons::paint(ui, "menu", r.shrink(1.0), if menu.hovered() { t.text_strong } else { t.text_dim });
-                    menu.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!("Drawer menu")));
+                    menu.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("Drawer menu")));
                     let menu = menu.on_hover_text(tl!("Drawer menu"));
                     egui::Popup::menu(&menu).id(menu_id()).show(|ui| {
                         ui.set_min_width(160.0);
@@ -530,7 +531,7 @@ pub(crate) fn drawer(app: &mut VectorcraftApp, ctx: &egui::Context) {
 /// and Coloring are drawn as small copies of those controls, the modes with their buttons' icons.
 fn show_button(ui: &mut Ui, t: &Tokens, name: &str, label: &str, icon: &str, on: bool) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, tl!(label)));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, on, tl!(label)));
     let p = ui.painter();
     if on {
         p.rect_filled(r, 3.0, t.tool_active);
@@ -571,7 +572,7 @@ fn show_button(ui: &mut Ui, t: &Tokens, name: &str, label: &str, icon: &str, on:
 
 /// The drawer's flyout menu.
 fn menu_id() -> egui::Id {
-    egui::Id::new("tools-drawer-menu")
+    egui::Id::unique("tools-drawer-menu")
 }
 
 /// A tool's row in the drawer: icon, name and shortcut, dimmed when the tool is in the toolbar
@@ -628,7 +629,7 @@ fn ghost(ctx: &egui::Context, t: &Tokens) {
     let Some(d) = DragAndDrop::payload::<ToolDrag>(ctx) else { return };
     let (Some(at), Some(tool)) = (ctx.pointer_interact_pos(), tool_info(d.tool)) else { return };
     let r = Rect::from_min_size(at + vec2(8.0, 8.0), vec2(GHOST, GHOST));
-    egui::Area::new(egui::Id::new("tool-drag-ghost")).order(egui::Order::Tooltip).fixed_pos(r.min).interactable(false).show(ctx, |ui| {
+    egui::Area::new(egui::Id::unique("tool-drag-ghost")).order(egui::Order::Tooltip).fixed_pos(r.min).interactable(false).show(ctx, |ui| {
         let (r, _) = ui.allocate_exact_size(r.size(), Sense::hover());
         ui.painter().rect(r, 3.0, t.panel, Stroke::new(1.0, t.accent), StrokeKind::Inside);
         icons::paint(ui, icons::tool_icon(tool.icon), Rect::from_center_size(r.center(), vec2(18.0, 18.0)), t.text_strong);

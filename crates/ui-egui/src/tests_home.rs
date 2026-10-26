@@ -282,6 +282,7 @@ fn home_scrolls_in_a_short_window() {
         delta: egui::vec2(0.0, -5000.0),
         phase: egui::TouchPhase::Move,
         modifiers: Default::default(),
+        source: egui::MouseWheelSource::Unknown,
     };
     visible_home_texts(&mut app, &ctx, size, 0.1, vec![egui::Event::PointerMoved(at), wheel]);
     let mut texts = vec![];

@@ -94,6 +94,54 @@ fn count(app: &VectorcraftApp) -> usize {
     app.session.active().unwrap().doc.layers[0].children().unwrap().len()
 }
 
+/// An egui `PasteImage` from the host is the signal to read the rich system clipboard: it must
+/// paste the bitmap even when no paste chord or text event came with it.
+#[test]
+fn an_image_only_paste_event_imports_the_system_image_once() {
+    let (mut app, board) = app();
+    copy_elsewhere(&board, vec![(PNG, blue_png())]);
+    frame(&mut app, vec![egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([4, 2], egui::Color32::BLUE)))]);
+    frame(&mut app, vec![]);
+    assert_eq!(count(&app), 1, "one image object, not zero or two");
+    assert!(matches!(pasted(&app)[0].kind, NodeKind::Image { .. }));
+}
+
+/// The image-only paste schedules the tick that reads the rich clipboard and remembers the chord
+/// held when the image arrived, not the next pass's (possibly stale) modifiers.
+#[test]
+fn an_image_only_paste_requests_its_tick_and_keeps_the_paste_time_chord() {
+    let (mut app, board) = app();
+    copy_elsewhere(&board, vec![(PNG, blue_png())]);
+    let held = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+    let out = frame(
+        &mut app,
+        vec![egui::Event::ModifiersChanged(held), egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([4, 2], egui::Color32::BLUE)))],
+    );
+    assert_eq!(app.clipboard_image_request, Some(held), "the paste-time chord is kept");
+    let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay);
+    assert_eq!(delay, std::time::Duration::ZERO, "the request asks for the tick that will consume it");
+    // The next pass carries the keyboard's modifiers back as None; the stored chord still picks
+    // Paste in Place rather than Paste.
+    frame(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
+    assert_eq!(app.clipboard_image_request, None, "the one-shot request is consumed");
+    assert_eq!(count(&app), 1, "the image pasted once");
+}
+
+/// A text paste alongside `PasteImage` takes the text path only: the image signal must not read
+/// and paste the clipboard a second time.
+#[test]
+fn text_and_image_paste_events_paste_once_as_text() {
+    let (mut app, board) = app();
+    copy_elsewhere(&board, vec![(TEXT, b"Words".to_vec()), (PNG, blue_png())]);
+    frame(
+        &mut app,
+        vec![egui::Event::Paste("Words".into()), egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([4, 2], egui::Color32::BLUE)))],
+    );
+    frame(&mut app, vec![]);
+    assert_eq!(count(&app), 1, "one paste, not text and picture");
+    assert!(matches!(pasted(&app)[0].kind, NodeKind::Text(_)), "{:?}", pasted(&app)[0].kind);
+}
+
 /// A 4 × 2 px blue PNG.
 pub(super) fn blue_png() -> Vec<u8> {
     let img = image::RgbaImage::from_pixel(4, 2, image::Rgba([0, 0, 255, 255]));
@@ -104,12 +152,14 @@ pub(super) fn blue_png() -> Vec<u8> {
 
 /// One headless frame of app logic (shortcuts too, from the second frame on) delivering `events`,
 /// in the test's one context (in a new one the app starts its fonts over).
-fn frame(app: &mut VectorcraftApp, events: Vec<egui::Event>) {
+fn frame(app: &mut VectorcraftApp, events: Vec<egui::Event>) -> egui::FullOutput {
     thread_local! {
         static CTX: egui::Context = egui::Context::default();
     }
     let ctx = CTX.with(Clone::clone);
-    ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.logic(ui.ctx())).textures_delta.clear();
+    let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| app.logic(ui.ctx()));
+    out.textures_delta.clear();
+    out
 }
 
 fn key(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
@@ -301,7 +351,7 @@ fn the_menus_paste_into_a_field_waits_for_the_formats() {
     run(&mut app, "edit.copy", json!({}));
     let hold = hold_worker(&mut app, "Saving a.vectorcraft");
     // A text field with the keyboard; in the second frame Paste is chosen from the menu.
-    let (ctx, id, mut field) = (egui::Context::default(), egui::Id::new("field"), String::new());
+    let (ctx, id, mut field) = (egui::Context::default(), egui::Id::unique("field"), String::new());
     for paste in [false, true] {
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             if paste {

@@ -360,10 +360,12 @@ fn parse_measure(s: &str, default: Unit) -> Option<f64> {
             };
         }
     }
+    // Plain decimals only, as in `number_unit` (`str::parse` would accept `1e5`, `inf`, `nan`).
+    let plain = |t: &str| t.trim().chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-') && t.trim().parse::<f64>().is_ok();
     if let Some((p, pt)) = s.split_once('p')
         && !p.is_empty()
-        && p.trim().parse::<f64>().is_ok()
-        && (pt.is_empty() || pt.trim().parse::<f64>().is_ok())
+        && plain(p)
+        && (pt.is_empty() || plain(pt))
         && !s.ends_with("pt")
         && !s.ends_with("px")
     {
@@ -619,6 +621,29 @@ pub struct SavedView {
     pub rotation: f64,
 }
 
+impl SavedView {
+    /// Most views a document keeps (the View menu lists every one).
+    pub const MAX: usize = 25;
+    /// Longest name, in characters.
+    pub const MAX_NAME: usize = 255;
+
+    /// `name` trimmed and cut to [`Self::MAX_NAME`] characters (`None` when blank).
+    pub fn clean_name(name: &str) -> Option<String> {
+        let name: String = name.trim().chars().take(Self::MAX_NAME).collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The first "View N" none of `saved` is named.
+    pub fn default_name(saved: &[SavedView]) -> String {
+        (1..=saved.len() + 1).map(|i| format!("View {i}")).find(|n| !saved.iter().any(|x| &x.name == n)).unwrap_or_default()
+    }
+
+    /// Can the canvas show this view: a finite centre and a finite, positive zoom.
+    pub fn is_usable(&self) -> bool {
+        self.center.x.is_finite() && self.center.y.is_finite() && self.zoom.is_finite() && self.zoom > 0.0
+    }
+}
+
 /// A saved selection (Select → Save Selection…): the objects that were selected, listed by name at
 /// the bottom of the Select menu.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -849,7 +874,7 @@ pub struct Document {
     pub graph_designs: Vec<GraphDesign>,
     #[serde(default)]
     pub guides: Vec<Guide>,
-    /// View → New View… (up to 25, like Illustrator).
+    /// View → New View… (at most [`SavedView::MAX`]); saved with the document.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<SavedView>,
     /// Select → Save Selection… (at most [`SavedSelection::MAX`]); saved with the document.
@@ -1841,6 +1866,40 @@ impl Document {
         }
         art
     }
+    /// Does any artwork lie on `rect` (an artboard)? Artwork is any object under the layers,
+    /// hidden and locked ones and those on template layers included, whose visual bounds (symbol
+    /// instances measured by their art) meet `rect`; touching its edge counts. A group (not a clip
+    /// group) counts by its members, so one whose members sit on two other artboards leaves the one
+    /// between them empty. A clip group or clipping layer counts by its members inside its clip (and
+    /// by its clipping path where that paints). Guides (paths made into guides too) aren't artwork
+    /// (Delete Empty Artboards).
+    pub fn artboard_has_art(&self, rect: Rect) -> bool {
+        // As in `art_on_artboard`: a millionth of a point covers rounding at the edges.
+        let rect = rect.inflate(1e-6, 1e-6);
+        fn meets(b: Option<Rect>, r: Rect) -> bool {
+            b.is_some_and(|b| b.x0 <= r.x1 && r.x0 <= b.x1 && b.y0 <= r.y1 && r.y0 <= b.y1)
+        }
+        fn has(c: &Node, s: &SymbolBoxes, rect: Rect) -> bool {
+            match &c.kind {
+                NodeKind::Group { children, clip: true } | NodeKind::Layer { children, clip: true, .. } => {
+                    let Some((clip, rest)) = children.split_first() else { return false };
+                    let paint = clip.clip_paint();
+                    if (paint.fill.is_some() || paint.stroke.is_some()) && meets(clip.visual_bounds_with(s), rect) {
+                        return true;
+                    }
+                    // The members show only inside the clip's box.
+                    let Some(b) = c.visual_bounds_with(s).filter(|b| meets(Some(*b), rect)) else { return false };
+                    let inside = Rect::new(b.x0.max(rect.x0), b.y0.max(rect.y0), b.x1.min(rect.x1), b.y1.min(rect.y1));
+                    rest.iter().any(|m| has(m, s, inside))
+                }
+                NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } => children.iter().any(|m| has(m, s, rect)),
+                NodeKind::Path { guide: true, .. } => false,
+                _ => meets(c.visual_bounds_with(s), rect),
+            }
+        }
+        let symbols = self.symbol_boxes();
+        self.layers.iter().any(|l| has(l, &symbols, rect))
+    }
     /// The art that moves, scales or is cut with artboard `index`: [`Document::art_on_artboard`]
     /// without the objects on another locked artboard, which stay unless `locked_and_hidden`, as
     /// locked art does.
@@ -2096,6 +2155,28 @@ impl Document {
             kept.push(SavedSelection { name, objects });
         }
         self.saved_selections = kept.into();
+    }
+
+    /// Saved views as a file gives them, made safe to list and go to: at most [`SavedView::MAX`],
+    /// each with a clean, unique name, a finite centre and a finite, positive zoom (a rotation
+    /// that isn't finite becomes 0°).
+    pub fn tidy_views(&mut self) {
+        if self.views.is_empty() {
+            return;
+        }
+        let mut kept: Vec<SavedView> = vec![];
+        for v in std::mem::take(&mut self.views) {
+            if kept.len() >= SavedView::MAX {
+                break;
+            }
+            let Some(name) = SavedView::clean_name(&v.name) else { continue };
+            if !v.is_usable() || kept.iter().any(|k| k.name == name) {
+                continue;
+            }
+            let rotation = if v.rotation.is_finite() { v.rotation } else { 0.0 };
+            kept.push(SavedView { name, rotation, ..v });
+        }
+        self.views = kept;
     }
 
     /// Leave opacity-mask editing: drop the temporary editing layer, a working copy of art the
@@ -2712,6 +2793,13 @@ mod tests {
         assert_eq!(Unit::Points.parse("-0p6"), Some(-6.0));
         assert_eq!(Unit::Points.parse("-2p"), Some(-24.0));
         assert_eq!(Unit::Points.parse("2p6"), Some(30.0));
+    }
+
+    #[test]
+    fn pica_form_rejects_exponent_notation() {
+        for s in ["1e5p", "infp", "nanp", "infp3", "1p1e2"] {
+            assert_eq!(Unit::Points.parse(s), None, "{s}");
+        }
     }
 }
 

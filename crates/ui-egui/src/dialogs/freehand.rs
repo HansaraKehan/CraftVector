@@ -1,11 +1,14 @@
 //! Tool Options of the freehand tools (double-click Pencil, Paintbrush, Smooth, Blob Brush or
 //! Eraser): the options each tool keeps, which last across tool switches and are saved with the
-//! preferences. OK sets them with `tool.setOption {tool, values}`.
+//! preferences. OK sets them with `tool.setOption {tool, values}`. The Pencil also has `liveFit`
+//! (Live curve fitting, on: its preview fits the stroke while it is drawn).
 //!
 //! Fields: `tool`; `fidelity` (points; Pencil, Paintbrush and Smooth), `fill` (Pencil and
 //! Paintbrush), `keepSelected` (Pencil, Paintbrush and Blob Brush), `mergeOnlySelection` (Blob
-//! Brush), `closeWithin` and `editWithin` (screen pixels, 0 turns it off; Pencil and Paintbrush) and
-//! `size` (points; Blob Brush and Eraser).
+//! Brush), `closeWithin` and `editWithin` (screen pixels, 0 turns it off; Pencil and Paintbrush),
+//! `angle` (degrees) and `roundness` (percent; Eraser), `livePreview` (Pencil: the stroke shows
+//! with its fill and stroke while it is drawn, or as a thin line until the release) and `size`
+//! (points; Blob Brush and Eraser).
 
 use serde_json::{Map, Value, json};
 
@@ -18,21 +21,90 @@ use crate::{VectorcraftApp, widgets};
 /// The dialog kind of the freehand tools' Tool Options.
 pub const KIND: &str = "freehandOptions";
 
-pub(super) const SPEC: DialogSpec = DialogSpec { heading, body, confirm, min_width: 420.0, ..DialogSpec::FORM };
+pub(super) const SPEC: DialogSpec = DialogSpec { heading, body, confirm, min_width: CONTENT_W, ..DialogSpec::FORM };
 
 /// The tools the dialog serves.
 pub const TOOLS: [&str; 5] = ["pencil", "paintbrush", "smooth", "blobBrush", "eraser"];
 
 /// The options the dialog edits, in the order it shows them (a tool has those it reports).
-const KEYS: [&str; 8] = ["fidelity", "size", "fill", "altSmooth", "keepSelected", "mergeOnlySelection", "closeWithin", "editWithin"];
+const KEYS: [&str; 12] = [
+    "fidelity",
+    "angle",
+    "roundness",
+    "size",
+    "fill",
+    "altSmooth",
+    "keepSelected",
+    "mergeOnlySelection",
+    "closeWithin",
+    "editWithin",
+    "livePreview",
+    "liveFit",
+];
 
-/// Width of the label column: wide enough for the tolerances' labels when there are any.
-fn label_w(d: &Dialog) -> f32 {
-    if d.fields.contains_key("closeWithin") { 230.0 } else { 90.0 }
+/// Width of the dialog's rows: every number field ends at its right edge.
+const CONTENT_W: f32 = 330.0;
+
+/// Width of the number fields, Fidelity's among them.
+const FIELD_W: f32 = 72.0;
+
+/// Width of the label column of a row with a number field: what the field leaves of the row. The
+/// Fidelity slider takes the same width under its label.
+fn label_w(ui: &egui::Ui) -> f32 {
+    CONTENT_W - FIELD_W - ui.spacing().item_spacing.x
 }
 
-/// The range of the Fidelity slider (points); the field takes what the tool allows.
-const FIDELITY: (f64, f64) = (0.5, 20.0);
+/// The top of the Fidelity slider (points); it starts at the lowest Fidelity the tool takes, and
+/// the field takes up to 100.
+const FIDELITY_MAX: f64 = 20.0;
+
+/// Fidelity `v` stepped `n` steps by the slider's and the field's keys: an arrow steps hundredths up to 0.1 pt,
+/// tenths up to 1 pt and whole points above (a step down from 0.1 or 1 takes the finer step below
+/// it); ten steps at once (Shift with an arrow, Page Up/Down) multiply or divide by ten, so they go
+/// 0.01 → 0.1 → 1 → 10.
+fn fidelity_step(v: f64, n: f64) -> f64 {
+    if n.abs() >= 10.0 {
+        let times = 10f64.powf((n / 10.0).round());
+        return ((v * times) * 100.0).round() / 100.0;
+    }
+    // The step at `v` going up, or going down from it.
+    let unit = |v: f64, up: bool| {
+        let at = |edge: f64| if up { v < edge - 1e-9 } else { v <= edge + 1e-9 };
+        if at(0.1) {
+            0.01
+        } else if at(1.0) {
+            0.1
+        } else {
+            1.0
+        }
+    };
+    let up = n > 0.0;
+    let mut v = v;
+    for _ in 0..(n.abs().min(1000.0) as usize) {
+        let u = unit(v, up);
+        let q = v / u;
+        let k = if up { (q + 1e-6).floor() + 1.0 } else { (q - 1e-6).ceil() - 1.0 };
+        v = ((k * u) * 100.0).round() / 100.0;
+    }
+    v
+}
+
+/// Where Fidelity `v` sits on a slider over `(min, max)`, from 0 to 1. The rail is logarithmic, so
+/// the low values, where the stroke is followed closely, get as much of it as the high ones
+/// (0.01–1 pt takes most of a 0.01–20 rail).
+fn fidelity_at(v: f64, (min, max): (f64, f64)) -> f32 {
+    if !(v.is_finite() && min > 0.0 && max > min) {
+        return 0.0;
+    }
+    ((v.clamp(min, max) / min).ln() / (max / min).ln()) as f32
+}
+
+/// The Fidelity at `x` (0 to 1) on a slider over `(min, max)`: hundredths below 1 pt, tenths above.
+fn fidelity_from(x: f32, (min, max): (f64, f64)) -> f64 {
+    let v = min * (max / min).powf(f64::from(x.clamp(0.0, 1.0)));
+    let step = if v < 1.0 { 100.0 } else { 10.0 };
+    ((v * step).round() / step).clamp(min, max)
+}
 
 fn heading(d: &Dialog) -> String {
     let label = vectorcraft_tools::tool_info(&d.str("tool")).map_or("", |t| t.label);
@@ -53,47 +125,62 @@ pub fn open(app: &mut VectorcraftApp, tool: &str) -> Result<Value, String> {
 
 /// A row with a number field for `d.fields[key]` (`suffix` is its unit), kept within `range`.
 fn number(ui: &mut egui::Ui, d: &mut Dialog, (key, label): (&str, &str), suffix: &str, decimals: usize, range: (f64, f64)) {
-    let label_w = label_w(d);
+    let label_w = label_w(ui);
     let v = d.f64(key, 0.0);
     widgets::label_row(ui, label, label_w, |ui| {
-        if let Some(x) = widgets::range_field(ui, ("freehand-field", key), v, range.0..=range.1, suffix, decimals, 72.0) {
+        if let Some(x) = widgets::range_field(ui, ("freehand-field", key), v, range.0..=range.1, suffix, decimals, FIELD_W) {
             d.fields.insert(key.into(), json!(x));
         }
     });
 }
 
-/// The Fidelity row: a slider over [`FIDELITY`] in tenths, and a field.
+/// The Fidelity rows: the label on a line of its own, then a logarithmic slider from the tool's
+/// lowest Fidelity to [`FIDELITY_MAX`] across the row with the field at its end, both to two
+/// decimals, and Accurate and Smooth under the slider's ends.
 fn fidelity(ui: &mut egui::Ui, d: &mut Dialog) {
-    let label_w = label_w(d);
     let t = Tokens::get(ui.ctx());
     let v = d.f64("fidelity", 1.5);
-    let (min, max) = FIDELITY;
+    let rail = (vectorcraft_tools::draw2::min_fidelity(&d.str("tool")), FIDELITY_MAX);
+    let rail_w = label_w(ui);
     let mut new = None;
-    widgets::label_row(ui, tl!("Fidelity:"), label_w, |ui| {
-        let at = ((v.clamp(min, max) - min) / (max - min)) as f32;
-        let shown = widgets::SliderValue::field(v, min..=max, "pt", 1);
+    ui.label(egui::RichText::new(tl!("Fidelity:")).size(12.5).color(t.text));
+    ui.horizontal(|ui| {
+        let shown = widgets::SliderValue::field(v, rail.0..=rail.1, "pt", 2).with_step(fidelity_step);
         let (x, _, keyed) =
-            widgets::color_slider_stepped(ui, "freehand-fidelity", tl!("Fidelity:"), Some(shown), at, form::SLIDER_WIDTH, &|_| t.input_border);
-        new = x.map(|x| ((min + x as f64 * (max - min)) * 10.0).round() / 10.0).or(keyed);
-        if let Some(x) = widgets::range_field(ui, "freehand-fidelity-field", v, 0.05..=100.0, "pt", 1, 64.0) {
+            widgets::color_slider_stepped(ui, "freehand-fidelity", tl!("Fidelity:"), Some(shown), fidelity_at(v, rail), rail_w, &|_| t.input_border);
+        new = x.map(|x| fidelity_from(x, rail)).or(keyed);
+        if let Some(x) = widgets::range_field_stepped(ui, "freehand-fidelity-field", v, rail.0..=100.0, "pt", 2, FIELD_W, fidelity_step) {
             new = Some(x);
         }
     });
     if let Some(n) = new.filter(|n| *n != v) {
         d.fields.insert("fidelity".into(), json!(n));
     }
-    form::slider_ends(ui, label_w, (tl!("Accurate"), tl!("Smooth")));
-    ui.label(
-        egui::RichText::new(tl!("A lower value follows the stroke closely; a higher one gives fewer points and smoother curves."))
-            .size(11.5)
-            .color(t.text_dim),
-    );
+    form::slider_ends_below(ui, rail_w, (tl!("Accurate"), tl!("Smooth")));
+    ui.add_space(4.0);
+    // Wrapped to the rows' width, so the sentence doesn't widen the dialog.
+    ui.allocate_ui(egui::vec2(CONTENT_W, 0.0), |ui| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(tl!("A lower value follows the stroke closely; a higher one gives fewer points and smoother curves."))
+                    .size(11.5)
+                    .color(t.text_dim),
+            )
+            .wrap(),
+        );
+    });
 }
 
 fn body(_app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
     if d.fields.contains_key("fidelity") {
         fidelity(ui, d);
         ui.add_space(10.0);
+    }
+    if d.fields.contains_key("angle") {
+        number(ui, d, ("angle", tl!("Angle:")), "°", 0, (-180.0, 180.0));
+    }
+    if d.fields.contains_key("roundness") {
+        number(ui, d, ("roundness", tl!("Roundness:")), "%", 0, (1.0, 100.0));
     }
     if d.fields.contains_key("size") {
         number(ui, d, ("size", tl!("Size:")), "pt", 1, (0.1, 1000.0));
@@ -116,6 +203,16 @@ fn body(_app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
     }
     if d.fields.contains_key("editWithin") {
         number(ui, d, ("editWithin", tl!("Edit selected paths within:")), "px", 0, (0.0, 100.0));
+    }
+    if d.fields.contains_key("livePreview") {
+        ui.add_space(6.0);
+        check(ui, d, "livePreview", tl!("Live preview"));
+    }
+    if d.fields.contains_key("liveFit") {
+        if !d.fields.contains_key("livePreview") {
+            ui.add_space(6.0);
+        }
+        check(ui, d, "liveFit", tl!("Live curve fitting"));
     }
     false
 }
@@ -143,6 +240,55 @@ mod tests {
     }
 
     #[test]
+    fn the_fidelity_rail_is_logarithmic_and_round_trips_two_decimals() {
+        let rail = (0.01, FIDELITY_MAX);
+        assert_eq!((fidelity_at(0.01, rail), fidelity_at(20.0, rail)), (0.0, 1.0));
+        assert_eq!((fidelity_from(0.0, rail), fidelity_from(1.0, rail)), (0.01, 20.0));
+        // 0.01–1 pt gets more than half of the rail.
+        assert!(fidelity_at(1.0, rail) > 0.5, "{}", fidelity_at(1.0, rail));
+        // The values a user picks come back as they were, and the rail only ever rises.
+        for v in [0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.5, 6.5, 12.0, 20.0] {
+            assert_eq!(fidelity_from(fidelity_at(v, rail), rail), v, "{v}");
+        }
+        let steps: Vec<f64> = (0..=200).map(|i| fidelity_from(i as f32 / 200.0, rail)).collect();
+        assert!(steps.windows(2).all(|w| w[0] <= w[1]), "{steps:?}");
+        // Past the ends and on bad input it stays on the rail.
+        assert_eq!((fidelity_at(0.0, rail), fidelity_at(50.0, rail), fidelity_at(f64::NAN, rail)), (0.0, 1.0, 0.0));
+        assert_eq!((fidelity_from(-1.0, rail), fidelity_from(2.0, rail)), (0.01, 20.0));
+    }
+
+    #[test]
+    fn the_fidelity_keys_step_finely_at_the_low_end() {
+        let up: Vec<f64> = std::iter::successors(Some(0.01), |&v| Some(fidelity_step(v, 1.0))).take(21).collect();
+        assert_eq!(up, [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 2.0, 3.0]);
+        // Down retraces the same steps.
+        let down: Vec<f64> = std::iter::successors(Some(3.0), |&v| Some(fidelity_step(v, -1.0))).take(21).collect();
+        assert_eq!(down, up.iter().rev().copied().collect::<Vec<_>>());
+        // Ten steps at once (Shift) multiply or divide by ten.
+        assert_eq!((fidelity_step(0.01, 10.0), fidelity_step(0.1, 10.0), fidelity_step(1.0, 10.0)), (0.1, 1.0, 10.0));
+        assert_eq!(
+            (fidelity_step(10.0, -10.0), fidelity_step(1.0, -10.0), fidelity_step(0.1, -10.0), fidelity_step(0.03, 10.0)),
+            (1.0, 0.1, 0.01, 0.3)
+        );
+        // A value between steps goes to the next one in its direction.
+        assert_eq!(
+            (fidelity_step(0.035, 1.0), fidelity_step(0.035, -1.0), fidelity_step(1.5, 1.0), fidelity_step(1.5, -1.0)),
+            (0.04, 0.03, 2.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn the_fidelity_field_takes_a_hundredth_for_the_pencil() {
+        let mut app = app();
+        app.run("tool.options", json!({"tool": "pencil"})).unwrap();
+        app.ui.dialog.as_mut().unwrap().fields.insert("fidelity".into(), json!(0.02));
+        let text = painted(&mut app);
+        assert!(text.contains("0.02"), "{text}");
+        super::super::confirm(&mut app).unwrap();
+        assert_eq!(app.session.tool_options_of("pencil")["fidelity"].as_f64(), Some(0.02));
+    }
+
+    #[test]
     fn each_tool_shows_its_options_and_ok_sets_them() {
         let mut app = app();
         // Pencil: Fidelity, fill, the two tolerances; no Size.
@@ -157,6 +303,7 @@ mod tests {
             "Alt key toggles to Smooth Tool",
             "Close paths when ends are within:",
             "Edit selected paths within:",
+            "Live preview",
         ] {
             assert!(text.contains(label), "{label} in {text}");
         }
@@ -184,7 +331,7 @@ mod tests {
         assert_eq!((d.f64("fidelity", 0.0), d.bool("fill")), (1.5, false));
         let pb_text = painted(&mut app);
         assert!(pb_text.contains("Paintbrush Tool Options"));
-        assert!(!pb_text.contains("Alt key toggles to Smooth Tool"));
+        assert!(!pb_text.contains("Alt key toggles to Smooth Tool") && !pb_text.contains("Live preview"), "{pb_text}");
         // Smooth has Fidelity only, the Eraser Size only, and the Blob Brush Size, Keep selected and Merge only with selection.
         app.run("tool.options", json!({"tool": "smooth"})).unwrap();
         let text = painted(&mut app);
@@ -203,10 +350,61 @@ mod tests {
             // The Blob Brush also has Keep selected and Merge only with selection.
             let blob = tool == "blobBrush";
             assert_eq!((text.contains("Keep selected"), text.contains("Merge only with selection")), (blob, blob), "{tool}: {text}");
+            // The Eraser also has Angle and Roundness.
+            assert_eq!((text.contains("Angle:"), text.contains("Roundness:")), (!blob, !blob), "{tool}: {text}");
             app.ui.dialog.as_mut().unwrap().fields.insert("size".into(), json!(24));
             super::super::confirm(&mut app).unwrap();
             assert_eq!(app.session.tool_options_of(tool)["size"].as_f64(), Some(24.0), "{tool}");
         }
+    }
+
+    /// Live curve fitting (the Pencil's, on by default): on, the path shown while a stroke is
+    /// drawn is fitted; off, it joins the stroke's points with straight segments, and the release
+    /// fits it as with the option on.
+    #[test]
+    fn live_curve_fitting_off_shows_the_points_until_the_release_fits_them() {
+        let mut app = app();
+        // The anchors of the newest path while a wave around height `y0` is drawn and after the
+        // release, with nothing selected (a stroke starting at the end of a selected path would
+        // continue it).
+        let draw = |app: &mut VectorcraftApp, y0: f64| {
+            app.run("select.set", json!({"ids": []})).unwrap();
+            app.select_tool("pencil");
+            let view = app.view_info();
+            let pts: Vec<_> = (0..=40).map(|i| (20.0 + i as f64 * 8.0, y0 + 30.0 * (i as f64 * 0.25).sin())).collect();
+            let pointer = |kind, (x, y)| vectorcraft_tools::PointerEvent::new(kind, x, y);
+            let newest = |app: &VectorcraftApp| {
+                let doc = &app.session.doc().unwrap().doc;
+                doc.layers[0].children().unwrap().last().unwrap().path_data().unwrap().subpaths[0].anchors.clone()
+            };
+            crate::canvas::dispatch(app, &pointer(vectorcraft_tools::PointerKind::Down, pts[0]), view);
+            for p in &pts[1..] {
+                crate::canvas::dispatch(app, &pointer(vectorcraft_tools::PointerKind::Drag, *p), view);
+            }
+            let drawing = newest(app);
+            crate::canvas::dispatch(app, &pointer(vectorcraft_tools::PointerKind::Up, pts[40]), view);
+            (drawing, newest(app))
+        };
+        let corners = |anchors: &[vectorcraft_geom::Anchor]| anchors.iter().all(|a| a.h_in == a.p && a.h_out == a.p);
+        // On by default: the Pencil's dialog shows it and the Paintbrush's does not.
+        app.run("tool.options", json!({"tool": "pencil"})).unwrap();
+        assert!(painted(&mut app).contains("Live curve fitting"));
+        assert!(app.ui.dialog.as_ref().unwrap().bool("liveFit"));
+        super::super::confirm(&mut app).unwrap();
+        let (drawing, on) = draw(&mut app, 100.0);
+        assert!(!corners(&drawing) && drawing.len() < 20, "fitted while drawn: {} anchors", drawing.len());
+        // Off: the points while the stroke is drawn, fitted at the release.
+        app.run("tool.options", json!({"tool": "pencil"})).unwrap();
+        app.ui.dialog.as_mut().unwrap().fields.insert("liveFit".into(), json!(false));
+        super::super::confirm(&mut app).unwrap();
+        app.select_tool("selection");
+        assert_eq!(app.session.tool_options_of("pencil")["liveFit"].as_bool(), Some(false), "it lasts while another tool is chosen");
+        let (drawing, off) = draw(&mut app, 200.0);
+        assert!(corners(&drawing) && drawing.len() > 30, "the points while drawn: {} anchors", drawing.len());
+        assert_eq!(off.len(), on.len(), "the release fits the stroke as with the option on");
+        assert!(off.iter().zip(&on).all(|(a, b)| (a.p.x - b.p.x).abs() < 1e-9 && (a.p.y - b.p.y - 100.0).abs() < 1e-9), "{off:?}");
+        app.run("tool.options", json!({"tool": "paintbrush"})).unwrap();
+        assert!(!painted(&mut app).contains("Live curve fitting"));
     }
 
     #[test]
@@ -310,6 +508,52 @@ mod tests {
         app.run("select.set", json!({"ids": [b.0]})).unwrap();
         assert_eq!(stroke(&mut app), vec![b]);
         assert_eq!(ids(&app), vec![a, b], "merged into b only");
+    }
+
+    /// Eraser Tool Options' Angle and Roundness shape the tip the next Eraser drag erases with,
+    /// and the tool keeps them while another tool is chosen.
+    #[test]
+    fn the_eraser_options_set_the_tips_angle_and_roundness() {
+        let mut app = app();
+        // The width of the gap a vertical Eraser drag cuts through the middle of a 100 pt square.
+        let erase = |app: &mut VectorcraftApp| {
+            app.run("select.set", json!({"ids": []})).unwrap();
+            let r = app.run("shape.rectangle", json!({"x": 100, "y": 100, "width": 100, "height": 100})).unwrap();
+            let id = r["id"].as_u64().unwrap();
+            app.run("select.set", json!({"ids": [id]})).unwrap();
+            app.select_tool("eraser");
+            let view = app.view_info();
+            let pointer = |kind, y| vectorcraft_tools::PointerEvent::new(kind, 150.0, y);
+            crate::canvas::dispatch(app, &pointer(vectorcraft_tools::PointerKind::Down, 50.0), view);
+            for y in [100.0, 150.0, 200.0] {
+                crate::canvas::dispatch(app, &pointer(vectorcraft_tools::PointerKind::Drag, y), view);
+            }
+            crate::canvas::dispatch(app, &pointer(vectorcraft_tools::PointerKind::Up, 250.0), view);
+            let st = app.session.doc().unwrap();
+            let bounds: Vec<_> = st.selection.objects.iter().filter_map(|id| st.doc.node(*id)?.path_data()?.control_bounds()).collect();
+            let [a, b] = bounds[..] else { panic!("two halves: {bounds:?}") };
+            let (l, r) = if a.x0 < b.x0 { (a, b) } else { (b, a) };
+            r.x0 - l.x1
+        };
+        app.run("tool.options", json!({"tool": "eraser"})).unwrap();
+        let d = app.ui.dialog.as_mut().unwrap();
+        // A round tip by default.
+        assert_eq!((d.f64("angle", -1.0), d.f64("roundness", -1.0)), (0.0, 100.0));
+        d.fields.insert("size".into(), json!(20));
+        super::super::confirm(&mut app).unwrap();
+        let round = erase(&mut app);
+        assert!((round - 20.0).abs() < 0.2, "a 20 pt round tip cuts {round} pt");
+        // Upright and a quarter as wide: the band it erases is 5 pt wide.
+        app.run("tool.options", json!({"tool": "eraser"})).unwrap();
+        let d = app.ui.dialog.as_mut().unwrap();
+        d.fields.insert("angle".into(), json!(90));
+        d.fields.insert("roundness".into(), json!(25));
+        super::super::confirm(&mut app).unwrap();
+        app.select_tool("selection");
+        let o = app.session.tool_options_of("eraser");
+        assert_eq!((o["angle"].as_f64(), o["roundness"].as_f64(), o["size"].as_f64()), (Some(90.0), Some(25.0), Some(20.0)));
+        let narrow = erase(&mut app);
+        assert!((narrow - 5.0).abs() < 0.2, "a 20 by 5 pt upright tip cuts {narrow} pt");
     }
 
     #[test]

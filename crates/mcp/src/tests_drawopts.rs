@@ -180,3 +180,37 @@ fn a_bad_paint_draws_nothing() {
         assert_eq!(history.last().unwrap().label, label);
     }
 }
+
+/// The opacity `draw_path` takes in percent reads back in the same scale: `doc_inspect` (and
+/// the `vectorcraft://object/{id}` resource, the same summary) report `opacityPct` beside the
+/// stored 0–1 `opacity`, so an agent that reuses what it read does not turn 55 % into 0.55 %.
+#[test]
+fn inspect_reports_opacity_in_the_percent_scale_the_drawing_tools_take() {
+    let mut h = headless();
+    let (id, reply) = draw(&mut h, "draw_path", json!({"d": "M10 10 L90 90", "opacity": 55}));
+    assert_eq!(reply["opacity"], json!(55));
+    let summary = |h: &mut Headless, id: NodeId| -> Value {
+        let r = call_tool(h, "doc_inspect", &json!({"ids": [id.0]}));
+        assert!(!r.is_error, "{r:?}");
+        let v: Value = serde_json::from_str(r.content[0]["text"].as_str().unwrap()).unwrap();
+        v["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id.0).cloned().expect("the node")
+    };
+    let n = summary(&mut h, id);
+    assert_eq!(n["opacityPct"], json!(55.0), "{n}");
+    assert!((n["opacity"].as_f64().unwrap() - 0.55).abs() < 1e-6, "{n}");
+    // The whole tree and the object resource say the same.
+    let r = call_tool(&mut h, "inspect_document", &json!({}));
+    let tree: Value = serde_json::from_str(r.content[0]["text"].as_str().unwrap()).unwrap();
+    let in_tree = tree["layers"][0]["children"].as_array().unwrap().iter().find(|c| c["id"] == id.0).expect("the path in its layer");
+    assert_eq!(in_tree["opacityPct"], json!(55.0), "{in_tree}");
+    let res = crate::resources::read(&mut h, &format!("vectorcraft://object/{}", id.0)).unwrap();
+    assert_eq!((res["opacityPct"].clone(), res["opacity"].as_f64().map(|o| (o * 100.0).round())), (json!(55.0), Some(55.0)), "{res}");
+    // Writing `opacityPct` back, as the descriptions say, keeps the object as it was.
+    let r = call_tool(&mut h, "run_command", &json!({"command": "object.setProps", "params": {"id": id.0, "opacity": n["opacityPct"]}}));
+    assert!(!r.is_error, "{r:?}");
+    assert!((node(&h, id).opacity - 0.55).abs() < 1e-6);
+    // A fully opaque object reports neither field, so the two never disagree.
+    let (full, _) = draw(&mut h, "draw_path", json!({"d": "M0 0 L5 5"}));
+    let n = summary(&mut h, full);
+    assert!(n.get("opacity").is_none() && n.get("opacityPct").is_none(), "{n}");
+}

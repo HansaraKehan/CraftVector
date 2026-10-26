@@ -4,6 +4,8 @@
 //! - `engine.execute {command, params}` / `ui.menu.invoke {command|id, params}`: run any command
 //! - `engine.commands`: engine + UI commands with enablement
 //! - `document.inspect`: document summary; `ui.inspect`: UI state
+//! - `ui.docking`: the panel layout in use, the open flyout, the focused panel and the docking
+//!   controls' rects
 //! - `ui.menu.list`: flattened menu tree
 //! - `ui.contextMenu.list`: the canvas context menu for the current selection, flattened
 //! - `ui.tool.select {tool}`, `ui.tool.list`
@@ -13,12 +15,15 @@
 //! - `ui.move {x, y}` / `ui.click {x, y, button?, count?, shift?…}` / `ui.drag {x, y, toX, toY, steps?}`:
 //!   real egui pointer input in screen points (reaches every widget: panels, flyouts, dialogs)
 //! - `ui.set {brightness?, panel?, dockTab?, rulers?, outline?, …}`
-//! - `ui.dialog.set {field, value}` / `ui.dialog.confirm` / `ui.dialog.cancel`
+//! - `ui.dialog.set {field, value}` or `{fields: [{field, value}…]}` (all or none; setting a field
+//!   the dialog does not read is an error that lists its fields: [`crate::dialogs::accepts_field`]) /
+//!   `ui.dialog.confirm` / `ui.dialog.cancel`
 //! - `ui.resize {width, height}`, `ui.focus`, `ui.screenshot {path?, data?}` (`data: true`: the PNG
 //!   comes back as `pngBase64` as well)
-//! - `ui.render {path?, scale?, artboard?, data?}`: render an artboard headlessly (`artboard`: its
-//!   0-based index, default the first; PNG with the pixels of a PNG export on white; without a
-//!   path, or with `data: true`, as `pngBase64`)
+//! - `ui.render {path?, scale?, artboard?, data?, traceViews?}`: render an artboard headlessly
+//!   (`artboard`: its 0-based index, default the first; PNG with the pixels of a PNG export on
+//!   white; `traceViews: true` draws Image Trace objects in their View, as the canvas does; without
+//!   a path, or with `data: true`, as `pngBase64`)
 //! - `app.open {path}` (any readable format) / `app.save {path?, svg?: {…SVG options}}` / `app.quit`
 //!   (`file.close`, `file.closeAll` and `app.quit` first open a `saveChanges` dialog for each
 //!   modified document: `ui.dialog.confirm` saves, set `discard: true` then confirm to discard)
@@ -43,6 +48,8 @@ pub(crate) const MAX_DRAG_STEPS: u64 = 256;
 pub(crate) const MAX_CLICK_COUNT: u64 = 16;
 pub(crate) const MAX_SYNTHETIC_EVENTS: usize = 1024;
 pub(crate) const MAX_CONTROL_REQUESTS_PER_FRAME: usize = 64;
+/// Most items one `ui.dialog.set {fields}` may store, as MCP `answer_dialog` allows.
+pub(crate) const MAX_DIALOG_FIELDS: usize = 256;
 
 fn input_count(p: &Value, key: &str, default: u64, max: u64) -> Result<usize, String> {
     let n = match p.get(key) {
@@ -54,6 +61,29 @@ fn input_count(p: &Value, key: &str, default: u64, max: u64) -> Result<usize, St
     }
     // Preserve legacy zero behaviour: both a zero count and zero steps still perform once.
     usize::try_from(n.max(1)).map_err(|_| format!("`{key}` is out of range"))
+}
+
+/// The fields one `ui.dialog.set` stores, in order: `{field, value?}`, or `{fields: [{field, value?}…]}`.
+/// Every item is checked before any is stored, so a refused item leaves the dialog as it was.
+fn dialog_fields(p: &Value) -> Result<Vec<(String, Value)>, String> {
+    let Some(list) = p.get("fields") else {
+        let f = p.get("field").and_then(Value::as_str).ok_or("missing `field`")?;
+        return Ok(vec![(f.to_string(), p.get("value").cloned().unwrap_or(Value::Null))]);
+    };
+    if p.get("field").is_some() {
+        return Err("give `field` or `fields`, not both".into());
+    }
+    let list = list.as_array().ok_or("`fields` must be a list of {field, value?}")?;
+    if list.len() > MAX_DIALOG_FIELDS {
+        return Err(format!("`fields` holds {} items; at most {MAX_DIALOG_FIELDS}", list.len()));
+    }
+    list.iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let f = item.get("field").and_then(Value::as_str).ok_or_else(|| format!("fields {i}: missing string `field`"))?;
+            Ok((f.to_string(), item.get("value").cloned().unwrap_or(Value::Null)))
+        })
+        .collect()
 }
 
 fn reserve_synthetic(app: &mut VectorcraftApp, additional: usize) -> Result<(), String> {
@@ -140,10 +170,16 @@ pub fn all_commands(app: &VectorcraftApp) -> Value {
 
 pub fn inspect(app: &VectorcraftApp, ctx: &egui::Context) -> Value {
     let r = ctx.content_rect();
+    let mut ui = serde_json::to_value(&app.ui).unwrap_or_default();
+    // The old floating panels' record, kept only to read older preferences: `ui.docking` has
+    // the layout.
+    if let Some(fields) = ui.as_object_mut() {
+        fields.remove("floating_panels");
+    }
     json!({
         "tool": app.session.tool_id(),
         "toolOptions": app.session.tool_options(),
-        "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
+        "ui": ui,
         // Not saved with the UI state, so not in `ui`: 0 normal … 3 Presentation Mode.
         "screenMode": app.ui.screen_mode,
         // The Contextual Task Bar: pinned (not saved either) and where it shows.
@@ -218,6 +254,7 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
         "engine.commands" => ok(all_commands(app)),
         "document.inspect" => wrap(app.run("document.inspect", p.clone())),
         "ui.inspect" => ok(inspect(app, ctx)),
+        "ui.docking" => ok(crate::panel_docking::inspect(app, ctx)),
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_entries(app)).unwrap_or_default()),
         "ui.contextMenu.list" => ok(serde_json::to_value(crate::menus::context_entries(app)).unwrap_or_default()),
         "ui.tool.select" => wrap(app.run("tool.select", json!({"tool": s("tool").unwrap_or("")}))),
@@ -337,7 +374,13 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             // Notches, not a flood: a turn stays within what a real wheel sends.
             let delta = egui::vec2(f("dx"), f("dy")).clamp(egui::Vec2::splat(-100.0), egui::Vec2::splat(100.0));
             app.synthetic.push(egui::Event::PointerMoved(egui::pos2(f("x"), f("y"))));
-            app.synthetic.push(egui::Event::MouseWheel { unit, delta, phase: egui::TouchPhase::Move, modifiers: modifiers(p) });
+            app.synthetic.push(egui::Event::MouseWheel {
+                unit,
+                delta,
+                phase: egui::TouchPhase::Move,
+                modifiers: modifiers(p),
+                source: egui::MouseWheelSource::Unknown,
+            });
             ctx.request_repaint();
             ok(Value::Null)
         }
@@ -384,7 +427,7 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                 app.ui.control_bar = v;
             }
             if let Some(v) = p.get("imageTracePreview").and_then(Value::as_bool) {
-                app.ui.image_trace_preview = v;
+                r = app.run("imageTrace.preview", json!({"on": v}));
             }
             if p.get("closePanel").is_some() {
                 app.ui.open_panel = None;
@@ -393,8 +436,18 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
         }
         "ui.dialog.set" => match app.ui.dialog.as_mut() {
             Some(d) => {
-                let Some(f) = s("field") else { return err("missing `field`") };
-                d.fields.insert(f.to_string(), p.get("value").cloned().unwrap_or(Value::Null));
+                let fields = match dialog_fields(p) {
+                    Ok(fields) => fields,
+                    Err(e) => return err(e),
+                };
+                // Every field is checked before any is set, so a request sets all of them or none.
+                if let Some((f, _)) = fields.iter().find(|(f, _)| !crate::dialogs::accepts_field(d, f)) {
+                    let names = crate::dialogs::field_names(d).join(", ");
+                    return err(format!("the `{}` dialog has no field `{f}`; its fields: {names}", d.kind));
+                }
+                for (f, value) in fields {
+                    d.fields.insert(f, value);
+                }
                 ok(serde_json::to_value(&*d).unwrap_or_default())
             }
             None => err("no dialog open"),
@@ -436,7 +489,9 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                 return err(e);
             }
             // Rendered with the options of a PNG export on white, so its pixels are the exported file's.
-            let opts = RasterExportOptions { background: Some([255; 3]), ..Default::default() }.render_options(RasterFormat::Png);
+            // `traceViews: true` draws Image Trace objects as their View shows them, as the canvas does.
+            let mut opts = RasterExportOptions { background: Some([255; 3]), ..Default::default() }.render_options(RasterFormat::Png);
+            opts.trace_views = p.get("traceViews").and_then(Value::as_bool) == Some(true);
             let img = app.canvas.renderer.render_region_with(&doc, r, scale, &opts);
             let png = match img.to_png() {
                 Ok(png) => png,
@@ -497,12 +552,44 @@ fn with_data(mut result: Value, png: Option<&[u8]>) -> Value {
     result
 }
 
+/// The largest image whose PNG goes back in a `ui.screenshot` reply (`data: true`): the reply
+/// makes a straight-alpha copy, the encoded PNG and, for `data`, a base64 string (~1.33× the
+/// PNG), so this bounds that working set before any of it is allocated. A path-only capture keeps
+/// the shared 128 MiB image budget.
+pub(crate) const MAX_SCREENSHOT_PNG_REPLY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The checked RGBA size of `w × h`, when it fits.
+fn screenshot_rgba_bytes(w: usize, h: usize) -> Option<usize> {
+    w.checked_mul(h).and_then(|n| n.checked_mul(4))
+}
+
 /// The reply to `ui.screenshot`: the window capture `image` written to `path`, and sent back as
 /// `pngBase64` with `data`.
 pub fn save_screenshot(app: &mut VectorcraftApp, image: &egui::ColorImage, path: Option<&str>, data: bool) -> Value {
+    save_screenshot_with_limit(app, image, path, data, MAX_SCREENSHOT_PNG_REPLY_BYTES)
+}
+
+/// [`save_screenshot`] with the inline-PNG encoding limit supplied, so a small image can exercise
+/// the over-limit path without allocating a multi-megapixel frame. The public function always uses
+/// [`MAX_SCREENSHOT_PNG_REPLY_BYTES`].
+pub(crate) fn save_screenshot_with_limit(
+    app: &mut VectorcraftApp,
+    image: &egui::ColorImage,
+    path: Option<&str>,
+    data: bool,
+    max_reply_bytes: usize,
+) -> Value {
     let [w, h] = image.size;
     if path.is_none() && !data {
         return json!({"ok": true, "result": {"width": w, "height": h}});
+    }
+    // A data-only reply has no second way to deliver the image, so refuse an oversized one before
+    // allocating its working set. A request that named a path still writes that file: only the
+    // inline copy is downgraded.
+    if data && path.is_none() && screenshot_rgba_bytes(w, h).is_none_or(|bytes| bytes > max_reply_bytes) {
+        return json!({"ok": false, "error": format!(
+            "a PNG reply of this {w}×{h} screenshot would exceed the {max_reply_bytes}-byte reply-encoding limit; write it to a path instead"
+        )});
     }
     let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
     let img = vectorcraft_render::Rendered { width: w as u32, height: h as u32, pixels: rgba };
@@ -510,7 +597,14 @@ pub fn save_screenshot(app: &mut VectorcraftApp, image: &egui::ColorImage, path:
         Ok(png) => png,
         Err(e) => return json!({"ok": false, "error": e}),
     };
-    let data = data.then_some(png.as_slice());
+    let reply_png = data && png.len() <= max_reply_bytes;
+    if data && !reply_png && path.is_none() {
+        return json!({"ok": false, "error": format!(
+            "this screenshot's PNG is {} bytes, over the {max_reply_bytes}-byte reply-encoding limit; write it to a path instead",
+            png.len()
+        )});
+    }
+    let data = reply_png.then_some(png.as_slice());
     let Some(path) = path else {
         return json!({"ok": true, "result": with_data(json!({"width": w, "height": h}), data)});
     };
@@ -528,7 +622,8 @@ mod tests {
     use serde_json::{Value, json};
     use vectorcraft_engine::Session;
 
-    use super::{ControlRequest, Outcome, handle};
+    use super::{ControlRequest, MAX_DIALOG_FIELDS, Outcome, handle};
+    use crate::state::Dialog;
     use crate::{Services, VectorcraftApp};
 
     fn input_request(app: &mut VectorcraftApp, method: &str, params: Value) -> Value {
@@ -546,6 +641,22 @@ mod tests {
             assert_eq!(r["ok"], true, "{r}");
             assert_eq!(app.ui.image_trace_preview, on);
         }
+    }
+
+    #[test]
+    fn the_image_trace_preview_is_a_command() {
+        let mut app = VectorcraftApp::new(Session::new(), Services::default());
+        assert!(crate::menus::UI_COMMANDS.iter().any(|c| c.0 == "imageTrace.preview"));
+        assert_eq!(app.run("imageTrace.preview", json!({})), Ok(json!(false)), "toggles");
+        assert!(!app.ui.image_trace_preview);
+        assert_eq!(app.run("imageTrace.preview", json!({"on": false})), Ok(json!(false)), "stays off");
+        assert_eq!(app.run("imageTrace.preview", json!({"on": true})), Ok(json!(true)));
+        assert!(app.ui.image_trace_preview);
+        assert!(app.run("imageTrace.preview", json!({"on": "yes"})).is_err());
+        assert!(app.ui.image_trace_preview, "a bad value leaves it");
+        let r = input_request(&mut app, "engine.execute", json!({"command": "imageTrace.preview", "params": {"on": false}}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(!app.ui.image_trace_preview, "the control channel reaches it");
     }
 
     #[test]
@@ -662,6 +773,53 @@ mod tests {
         }
     }
 
+    /// `ui.dialog.set {fields}` stores the whole list in order, or nothing when an item is refused.
+    #[test]
+    fn dialog_set_stores_a_field_list_whole_or_not_at_all() {
+        let mut app = VectorcraftApp::new(Session::new(), Services::default());
+        app.ui.dialog = Some(crate::state::Dialog::new("move", json!({"dx": "0 pt", "dy": "0 pt"})));
+        let fields = |app: &VectorcraftApp| app.ui.dialog.as_ref().map(|d| serde_json::to_value(&d.fields).unwrap());
+        let before = fields(&app);
+        for params in [
+            json!({"fields": [{"field": "copy", "value": true}, {"value": 1}]}),
+            json!({"fields": [{"field": "copy", "value": true}, 7]}),
+            json!({"fields": {"field": "copy"}}),
+            json!({"field": "dx", "fields": [{"field": "copy", "value": true}]}),
+            json!({"fields": [{"field": "copy", "value": true}, {"field": "note"}]}),
+        ] {
+            let r = input_request(&mut app, "ui.dialog.set", params.clone());
+            assert_eq!(r["ok"], false, "{params}: {r}");
+            assert_eq!(fields(&app), before, "{params}: a refused list stores no field");
+        }
+        let list = json!([{"field": "copy", "value": true}, {"field": "dx", "value": "3 pt"}, {"field": "dx", "value": "5 pt"}, {"field": "dy"}]);
+        let r = input_request(&mut app, "ui.dialog.set", json!({"fields": list}));
+        assert_eq!(r["ok"], true, "{r}");
+        let after = fields(&app).unwrap();
+        assert_eq!(after, json!({"copy": true, "dx": "5 pt", "dy": null}));
+        assert_eq!(r["result"]["fields"], after);
+        let r = input_request(&mut app, "ui.dialog.set", json!({"field": "dy", "value": "2 pt"}));
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(fields(&app).unwrap()["dy"], "2 pt");
+        app.ui.dialog = None;
+        assert_eq!(input_request(&mut app, "ui.dialog.set", json!({"fields": []}))["error"], "no dialog open");
+    }
+
+    /// `ui.dialog.set {fields}` stores at most `MAX_DIALOG_FIELDS` items; a longer list stores none.
+    #[test]
+    fn dialog_set_refuses_a_field_list_over_the_limit() {
+        let mut app = VectorcraftApp::new(Session::new(), Services::default());
+        app.ui.dialog = Some(crate::state::Dialog::new("move", json!({"dx": "0 pt"})));
+        let list = |n: usize| Value::Array((0..n).map(|i| json!({"field": "dx", "value": format!("{i} pt")})).collect());
+        let r = input_request(&mut app, "ui.dialog.set", json!({"fields": list(MAX_DIALOG_FIELDS + 1)}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(r["error"], format!("`fields` holds {} items; at most {MAX_DIALOG_FIELDS}", MAX_DIALOG_FIELDS + 1));
+        assert_eq!(app.ui.dialog.as_ref().map(|d| d.fields["dx"].clone()), Some(json!("0 pt")), "a refused list stores no field");
+        let r = input_request(&mut app, "ui.dialog.set", json!({"fields": list(MAX_DIALOG_FIELDS)}));
+        assert_eq!(r["ok"], true, "{r}");
+        let last = format!("{} pt", MAX_DIALOG_FIELDS - 1);
+        assert_eq!(app.ui.dialog.as_ref().map(|d| d.fields["dx"].clone()), Some(json!(last)), "the whole list is stored, in order");
+    }
+
     /// #1004: `ui.render` (the MCP `screenshot` of a connected app) renders the artboard asked
     /// for, at the scale asked for; the first without one.
     #[test]
@@ -712,5 +870,90 @@ mod tests {
         };
         assert_eq!(click(&mut app), Some(b), "a click on a selected object makes it the key");
         assert_eq!(click(&mut app), Some(Value::Null), "a click on the key again lets it go");
+    }
+
+    /// `ui.dialog.set` of a field the open dialog does not have is an error that lists its fields,
+    /// and the dialog stays as it was. Fields a dialog may not hold yet are still set: `discard`
+    /// with a discard button, `preview` with a live preview, `__` fields and the spec's `inputs`.
+    #[test]
+    fn dialog_set_refuses_a_field_the_dialog_does_not_have() {
+        let mut app = VectorcraftApp::new(Session::new(), Services::default());
+        let fields = json!({"index": 0, "uid": 1, "name": "Untitled-1", "then": "close"});
+        app.ui.dialog = Some(Dialog::new(crate::unsaved::KIND, fields.clone()));
+        let r = input_request(&mut app, "ui.dialog.set", json!({"field": "discrad", "value": true}));
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(r["error"], "the `saveChanges` dialog has no field `discrad`; its fields: discard, index, name, then, uid");
+        assert_eq!(app.ui.dialog.as_ref().map(|d| Value::Object(d.fields.clone())), Some(fields));
+        for field in ["name", "discard", "__note"] {
+            let r = input_request(&mut app, "ui.dialog.set", json!({"field": field, "value": true}));
+            assert_eq!(r["ok"], true, "{field}: {r}");
+        }
+        // Move opens without Copy, which its checkbox adds once clicked; Scale's options and the
+        // reference point belong to the other transform dialogs.
+        let set = |app: &mut VectorcraftApp, kind: &str, fields: Value, cases: &[(&str, bool)]| {
+            app.ui.dialog = Some(Dialog::new(kind, fields));
+            for (field, ok) in cases {
+                let r = input_request(app, "ui.dialog.set", json!({"field": field, "value": true}));
+                assert_eq!(r["ok"], *ok, "{kind} {field}: {r}");
+            }
+        };
+        let moved =
+            [("copy", true), ("preview", true), ("distance", true), ("discard", false), ("copies", false), ("corners", false), ("origin", false)];
+        set(&mut app, "move", json!({"dx": "0 pt", "dy": "0 pt"}), &moved);
+        set(
+            &mut app,
+            "scale",
+            json!({"sx": 100, "sy": 100, "uniform": true}),
+            &[("corners", true), ("strokes", true), ("origin", true), ("distance", false)],
+        );
+        set(&mut app, "rotate", json!({"angle": 0}), &[("origin", true), ("objects", true), ("corners", false)]);
+        set(&mut app, "rectangle", json!({"x": 0, "y": 0, "width": 10, "height": 10}), &[("radius", true), ("sides", false)]);
+        set(&mut app, "ellipse", json!({"x": 0, "y": 0, "width": 10, "height": 10}), &[("radius", false)]);
+        // Corners that differ in kind and radius open without either.
+        let mixed = json!({"id": 1, "corners": [0, 1, 2, 3], "relativeRadii": false});
+        set(&mut app, vectorcraft_tools::corners::DIALOG, mixed, &[("kind", true), ("radius", true), ("radii", false)]);
+        set(&mut app, "saveForOffice", json!({"ppi": 150, "transparent": false, "artboard": 0}), &[("path", true)]);
+        set(&mut app, "brushOptions", json!({"name": "Dots"}), &[("tips", true), ("tip", false)]);
+        set(&mut app, "justification", json!({"wordDesired": 100}), &[("wordMin", true), ("singleWord", true), ("wordMid", false)]);
+        set(&mut app, "hyphenation", json!({"hyphenate": true}), &[("afterFirst", true), ("hyphenationZone", true), ("afterfirst", false)]);
+        set(&mut app, "effectGallery", json!({"stack": []}), &[("browseEffect", true), ("browseParams", true), ("browse", false)]);
+        // A new artboard's dialog opens without a background color or display marks.
+        let new_board = json!({"new": true, "name": "Artboard 2", "x": 0, "y": 0, "width": 10, "height": 10});
+        let marks = [
+            ("color", true),
+            ("showCenterMark", true),
+            ("showCrossHairs", true),
+            ("showVideoSafeAreas", true),
+            ("videoRulerPixelAspectRatio", true),
+            ("showCenterMarks", false),
+        ];
+        set(&mut app, "artboardOptions", new_board, &marks);
+        // Glass and Texturizer take the texture Load Texture… reads; other effects don't.
+        set(&mut app, "effect", json!({"__effect": "distort.glass"}), &[("textureImage", true)]);
+        set(&mut app, "effect", json!({"__effect": "blur.gaussian"}), &[("textureImage", false)]);
+        // The generic dialog takes every parameter of its command.
+        set(&mut app, "command", json!({"__command": "shape.rectangle", "x": 0, "y": 0}), &[("width", true), ("widht", false)]);
+        // Transparency Flattener Presets holds the selected preset's options before its first frame.
+        crate::dialogs::flattener_presets::open(&mut app, None);
+        let r = input_request(&mut app, "ui.dialog.set", json!({"field": "textToOutlines", "value": true}));
+        assert_eq!(r["ok"], true, "{r}");
+        // Edit Selection takes `deleted<i>` for each of its rows only.
+        app.run("file.new", json!({})).unwrap();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap();
+        for name in ["A", "B"] {
+            app.run("select.save", json!({ "name": name })).unwrap();
+        }
+        crate::dialogs::edit_selection::open(&mut app).unwrap();
+        for (field, ok) in [("deleted1", true), ("deleted", false), ("deletedx", false), ("deleted01", false), ("deleted2", false)] {
+            let r = input_request(&mut app, "ui.dialog.set", json!({"field": field, "value": true}));
+            assert_eq!(r["ok"], ok, "{field}: {r}");
+        }
+        let r = input_request(&mut app, "ui.dialog.set", json!({"field": "name", "value": "A"}));
+        assert_eq!(
+            r["error"],
+            "the `editSelection` dialog has no field `name`; its fields: count, deleted0, deleted1, name0, name1, orig0, orig1, selected"
+        );
+        app.ui.dialog = None;
+        assert_eq!(input_request(&mut app, "ui.dialog.set", json!({"field": "name", "value": "A"}))["error"], "no dialog open");
     }
 }

@@ -3,6 +3,7 @@
 pub(crate) mod appearance;
 mod assets;
 mod attributes;
+pub mod brushlib;
 mod brushsym;
 mod buildcmds;
 pub mod clipboard;
@@ -271,6 +272,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(flatten::specs());
         v.extend(stylelib::specs());
         v.extend(symbollib::specs());
+        v.extend(brushlib::specs());
         v.extend(library::specs());
         v.extend(expand::specs());
         v.extend(attributes::specs());
@@ -563,6 +565,9 @@ pub use opacitymask::TransparencyInfo;
 
 /// Eyedropper Options (`Prefs::eyedropper`).
 pub use xform::{AppearanceAttrs, EyedropperAttrs, EyedropperOptions, FillAttrs, StrokeAttrs};
+
+/// Pathfinder Options (`Prefs::pathfinder`).
+pub use pathops::{PATHFINDER_PRECISION_RANGE, PathfinderOptions};
 
 /// The Attributes panel's state ([`Session::attributes_info`]).
 pub use overprint::AttributesInfo;

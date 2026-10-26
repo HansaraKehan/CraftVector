@@ -162,6 +162,17 @@ fn rect_cut_crops_to_real_geometry() {
 }
 
 #[test]
+fn rect_cut_keeps_a_long_line_through_a_narrow_rectangle() {
+    // A 200 pt line used to be tested every 200 / 24 pt (at 400 and 408.33 near here), so a
+    // rectangle between two of those points kept nothing of it.
+    let mut s = session();
+    let line = path(&mut s, &[(300.0, 150.0), (500.0, 150.0)], false);
+    select(&mut s, &[line]);
+    s.execute("path.rectCut", &json!({"rect": [402, 100, 4, 100]})).unwrap();
+    assert!(near(bounds(&s, line), Rect::new(402.0, 150.0, 406.0, 150.0)));
+}
+
+#[test]
 fn mirror_cut_makes_a_symmetric_shape() {
     let mut s = session();
     // A right triangle: mirrored at x = 50 keeping the left, it becomes a house-like pentagon.

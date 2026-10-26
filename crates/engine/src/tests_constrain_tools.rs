@@ -1,10 +1,11 @@
 //! General › Constrain Angle turns the axes the arrow keys, Shift-constrained drags and the
-//! Rectangle, Rounded Rectangle and Ellipse tools work along (G12, #394, first batch).
+//! Rectangle, Rounded Rectangle and Ellipse tools work along, and General › Corner Radius is the
+//! Rounded Rectangle tool's radius (G12, #394, first batch).
 
 use serde_json::{Value, json};
 use vectorcraft_doc::{LiveShape, NodeKind};
 use vectorcraft_geom::{Point, Vec2};
-use vectorcraft_tools::{Mods, PointerEvent, PointerKind};
+use vectorcraft_tools::{Mods, PointerEvent, PointerKind, ToolKey};
 
 use super::*;
 
@@ -176,4 +177,60 @@ fn constrain_angle_keeps_guides_selected_with_art_on_the_page_axes() {
     // With a copy, the guides' copies keep to the page too.
     s.execute("object.nudge", &json!({"dx": 1, "dy": 0, "copy": true})).unwrap();
     assert_eq!(pos(&s), [60.0, 60.0, 70.0, 60.0]);
+}
+
+/// General › Corner Radius is the Rounded Rectangle tool's radius, a change while the tool is
+/// active reaches it, and the radius ↑ sets while drawing one becomes the preference.
+#[test]
+fn corner_radius_is_the_rounded_rectangle_tools_radius() {
+    use PointerKind::{Down, Drag, Up};
+    let mut s = new_doc();
+    let v = ViewInfo::default();
+    set_pref(&mut s, "cornerRadius", json!(7));
+    s.select_tool("roundedRectangle", v).unwrap();
+    let draw = |s: &mut Session, y: f64, up: bool| {
+        gesture(s, Mods::default(), &[(Down, 100.0, y), (Drag, 150.0, y + 30.0), (Drag, 200.0, y + 60.0)]);
+        if up {
+            s.tool_key(ToolKey::Up, Mods::default(), v).unwrap();
+        }
+        gesture(s, Mods::default(), &[(Up, 200.0, y + 60.0)]);
+        live_box(s, last_id(s)).3
+    };
+    assert!(close(draw(&mut s, 10.0, false), 7.0), "the preference's radius");
+    // Set while the tool is active: the tool takes it.
+    set_pref(&mut s, "cornerRadius", json!(4));
+    assert!(close(draw(&mut s, 100.0, false), 4.0), "the new preference's radius");
+    assert!(close(draw(&mut s, 200.0, true), 5.0), "↑ adds a point");
+    assert_eq!(s.execute("prefs.get", &json!({"key": "cornerRadius"})).unwrap(), json!(5.0), "and it is the preference now");
+    s.select_tool("selection", v).unwrap();
+    s.select_tool("roundedRectangle", v).unwrap();
+    assert_eq!(s.tool_options()["cornerRadius"], json!(5.0), "chosen again, the tool keeps it");
+    // A tool option set from the Tool Options dialog is the preference too, within its range.
+    s.set_tool_option("cornerRadius", &json!(5000));
+    assert_eq!(s.execute("prefs.get", &json!({"key": "cornerRadius"})).unwrap(), json!(1296.0));
+    assert_eq!(s.tool_options()["cornerRadius"], json!(1296.0), "and the tool itself stops at the range");
+    draw(&mut s, 300.0, true);
+    assert_eq!(s.tool_options()["cornerRadius"], json!(1296.0), "↑ at the top stays there");
+}
+
+/// General › Corner Radius set for the Rounded Rectangle tool by name (`tool.setOption {tool}`)
+/// while it has lent a selection tool for a Cmd-drag reaches the tool kept aside: back from the
+/// drag, it draws the radius that is the preference now, not the one from before.
+#[test]
+fn corner_radius_set_by_name_reaches_the_tool_that_lent_a_selection_tool() {
+    use PointerKind::{Down, Drag, Up};
+    let mut s = new_doc();
+    let v = ViewInfo::default();
+    set_pref(&mut s, "cornerRadius", json!(7));
+    s.select_tool("roundedRectangle", v).unwrap();
+    let cmd = Mods { cmd: true, ..Mods::default() };
+    gesture(&mut s, cmd, &[(Down, 300.0, 300.0), (Drag, 320.0, 320.0)]);
+    assert_eq!(s.tool_id(), "selection", "Cmd lends the Selection tool");
+    s.set_tool_option_cmd(&json!({"tool": "roundedRectangle", "key": "cornerRadius", "value": 9})).unwrap();
+    assert_eq!(s.execute("prefs.get", &json!({"key": "cornerRadius"})).unwrap(), json!(9.0), "the preference");
+    gesture(&mut s, cmd, &[(Up, 320.0, 320.0)]);
+    assert_eq!(s.tool_id(), "roundedRectangle", "the drag over, the tool is back");
+    assert_eq!(s.tool_options()["cornerRadius"], json!(9.0), "with the radius set while it was aside");
+    gesture(&mut s, Mods::default(), &[(Down, 100.0, 100.0), (Drag, 150.0, 130.0), (Drag, 200.0, 160.0), (Up, 200.0, 160.0)]);
+    assert!(close(live_box(&s, last_id(&s)).3, 9.0), "and draws it");
 }

@@ -30,7 +30,7 @@ use crate::{VectorcraftApp, widgets};
 /// The dialog kind of Brush Options.
 pub const KIND: &str = "brushOptions";
 
-pub(super) const SPEC: DialogSpec = DialogSpec { heading, body, confirm: ok, min_width: 440.0, ..DialogSpec::FORM };
+pub(super) const SPEC: DialogSpec = DialogSpec { heading, body, confirm: ok, min_width: 440.0, inputs: |_| &["tips"], ..DialogSpec::FORM };
 
 /// The field of a Brush Options dialog that New Brush opened.
 const CREATE: &str = "__create";
@@ -241,18 +241,18 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
     ui.add_space(10.0);
     match d.str("__type").as_str() {
         "bristle" => bristle_body(app, ui, d),
-        "calligraphic" => calligraphic_body(ui, d),
+        "calligraphic" => calligraphic_body(app, ui, d),
         _ => brush_art_options::body(app, ui, d),
     }
     false
 }
 
-fn calligraphic_body(ui: &mut egui::Ui, d: &mut Dialog) {
+fn calligraphic_body(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
     let c = calligraphic(d);
     ui.horizontal(|ui| {
         nib_preview(ui, &c, vec2(NIB_W, 84.0));
         ui.add_space(8.0);
-        stroke_preview(ui, "calligraphic", serde_json::to_value(&c).unwrap_or_default(), vec2(STROKE_W - NIB_W - 8.0, 84.0));
+        stroke_preview(app, ui, "calligraphic", serde_json::to_value(&c).unwrap_or_default(), vec2(STROKE_W - NIB_W - 8.0, 84.0));
     });
     ui.add_space(12.0);
     egui::Grid::new("brush-options-calli").num_columns(5).spacing([8.0, 8.0]).show(ui, |ui| {
@@ -290,11 +290,12 @@ fn bristle_body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
     }
     ui.add_space(8.0);
     let p = params(d);
-    stroke_preview(ui, "bristle", p, vec2(STROKE_W, 64.0));
+    stroke_preview(app, ui, "bristle", p, vec2(STROKE_W, 64.0));
 }
 
-/// A stroke painted with the brush the fields describe (type `ty`, definition fields `def`).
-pub(super) fn stroke_preview(ui: &mut egui::Ui, ty: &str, def: Value, size: egui::Vec2) {
+/// A stroke painted with the brush the fields describe (type `ty`, definition fields `def`), with
+/// the active document's resources (the patterns, symbols… its art uses).
+pub(super) fn stroke_preview(app: &VectorcraftApp, ui: &mut egui::Ui, ty: &str, def: Value, size: egui::Vec2) {
     let mut def = match def {
         Value::Object(o) => o,
         _ => Map::new(),
@@ -302,7 +303,7 @@ pub(super) fn stroke_preview(ui: &mut egui::Ui, ty: &str, def: Value, size: egui
     def.insert("name".into(), json!("preview"));
     def.insert("type".into(), json!(ty));
     let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-    crate::panels::brushes::chip(ui, r, &Value::Object(def));
+    crate::panels::brushes::definition_chip(ui, r, app.session.active(), &Value::Object(def));
     ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, Tokens::get(ui.ctx()).input_border), egui::StrokeKind::Inside);
 }
 
@@ -584,6 +585,34 @@ mod tests {
         set(&mut app, json!({"scaleMode": "stretch"}));
         super::super::confirm(&mut app).unwrap();
         assert_eq!(app.run("brush.get", json!({"name": "Arrow"})).unwrap()["scale"], json!({"mode": "stretch"}));
+    }
+
+    /// Art Brush Options' Width menu: Pressure takes a second width for the heaviest pen pressure,
+    /// and a stroke drawn without pressure is half way between the two; Fixed drops the second width.
+    #[test]
+    fn art_options_width_follows_the_pen_pressure() {
+        let mut app = app();
+        let (id, before) = brushed(&mut app, "Tapered Stroke");
+        app.run("ui.brushOptions", json!({"name": "Tapered Stroke"})).unwrap();
+        let d = app.ui.dialog.as_ref().unwrap();
+        assert_eq!((d.str("widthMode"), d.f64("widthMax", 0.0)), ("fixed".into(), 100.0));
+        assert!(shown(&mut app).contains("Fixed"));
+        set(&mut app, json!({"widthMode": "pressure", "widthMax": 300}));
+        assert!(shown(&mut app).contains("Pressure"));
+        super::super::confirm(&mut app).unwrap();
+        let def = app.run("brush.get", json!({"name": "Tapered Stroke"})).unwrap();
+        assert_eq!((&def["width"], &def["width_mode"], &def["width_max"]), (&json!(100.0), &json!("pressure"), &json!(300.0)));
+        let after = drawn_height(&app, id);
+        assert!((after - 2.0 * before).abs() < 0.01 * before, "200 % half way: {before} then {after}");
+        // Opened again, it shows what was set; Fixed drops the second width.
+        app.run("ui.brushOptions", json!({"name": "Tapered Stroke"})).unwrap();
+        let d = app.ui.dialog.as_ref().unwrap();
+        assert_eq!((d.str("widthMode"), d.f64("widthMax", 0.0)), ("pressure".into(), 300.0));
+        set(&mut app, json!({"widthMode": "fixed"}));
+        super::super::confirm(&mut app).unwrap();
+        let def = app.run("brush.get", json!({"name": "Tapered Stroke"})).unwrap();
+        assert!(def.get("width_mode").is_none() && def.get("width_max").is_none(), "{def}");
+        assert!((drawn_height(&app, id) - before).abs() < 1e-6);
     }
 
     /// A context with the app's fonts and theme, for [`frame`].
