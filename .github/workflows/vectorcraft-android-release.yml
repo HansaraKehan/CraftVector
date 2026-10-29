@@ -2,7 +2,8 @@ name: Build and release VectorCraft Android APK
 
 # Builds the newest upstream VectorCraft (storytold/vectorcraft) with the Android layer
 # applied on top, then publishes the APK as a GitHub Release.
-# It only builds when upstream has something new (or when you run it by hand).
+# It builds when upstream publishes a new version (a v* tag), when the Android layer changes, or
+# when you run it by hand. Upstream commits between versions do not make a release.
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -42,7 +43,10 @@ jobs:
           INPUT_REF: ${{ inputs.ref }}
           VAR_REF: ${{ vars.UPSTREAM_REF }}
         run: |
-          REF="${INPUT_REF:-${VAR_REF:-main}}"
+          # Default: upstream's newest released version (a plain v1.2.3 tag), not its latest commit.
+          LATEST=$(git ls-remote --tags --refs "https://github.com/${UPSTREAM}.git" 'v*' | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          REF="${INPUT_REF:-${VAR_REF:-${LATEST:-main}}}"
+          echo "Building upstream ref: $REF"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
       - name: Check out this repository (the Android layer lives here)
@@ -222,8 +226,44 @@ jobs:
           - Early preview: no system clipboard or printing yet. A hardware keyboard is recommended.
           - Unofficial build, not made or supported by the VectorCraft team. If an update will not install over an older build, uninstall the old one first.
           NOTES
-          if [ -f "$RUNNER_TEMP/layer/whats-new.md" ]; then
-            { echo; echo "## What's new"; echo; cat "$RUNNER_TEMP/layer/whats-new.md"; } >> notes.md
+          # What changed since the previous Android release: upstream's own changes, and the Android
+          # layer's changes only when the layer itself is new.
+          CUR_LAYER="${TAG##*-}"
+          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,publishedAt \
+            --jq '[.[] | select(.tagName | startswith("android-v")) | select(.tagName != $ENV.TAG)] | sort_by(.publishedAt) | reverse | .[0].tagName // ""' || true)
+          PREV_SHA=""
+          PREV_LAYER=""
+          if [ -n "$PREV_TAG" ]; then
+            PREV_LAYER="${PREV_TAG##*-}"
+            REST="${PREV_TAG%-*}"
+            PREV_SHA="${REST##*-}"
+          fi
+          COUNT=0
+          UP=""
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$SHA" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+            COUNT=$(git rev-list --no-merges --count "${PREV_SHA}..HEAD")
+            # No @name (it would notify people) and no #123 (it would link to this repository's issues).
+            UP=$(git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD" | sed -e 's/@/＠/g' -e 's/#\([0-9][0-9]*\)/\\#\1/g')
+          fi
+          WROTE=0
+          if [ "$COUNT" -gt 0 ]; then
+            {
+              echo
+              echo "## Upstream changes"
+              echo
+              echo "${COUNT} changes since the previous Android build ([all of them](https://github.com/${UPSTREAM}/compare/${PREV_SHA}...${SHA})):"
+              echo
+              echo "$UP"
+              if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
+            } >> notes.md
+            WROTE=1
+          fi
+          if [ -f "$RUNNER_TEMP/layer/whats-new.md" ] && [ "$PREV_LAYER" != "$CUR_LAYER" ]; then
+            { echo; echo "## Android changes"; echo; cat "$RUNNER_TEMP/layer/whats-new.md"; } >> notes.md
+            WROTE=1
+          fi
+          if [ "$WROTE" = "0" ]; then
+            { echo; echo "No changes since the previous Android build."; } >> notes.md
           fi
           gh release create "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "VectorCraft ${VERSION} Android (${SHA})" --notes-file notes.md
