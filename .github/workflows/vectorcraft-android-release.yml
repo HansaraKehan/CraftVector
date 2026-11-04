@@ -2,8 +2,11 @@ name: Build and release VectorCraft Android APK
 
 # Builds the newest upstream VectorCraft (storytold/vectorcraft) with the Android layer
 # applied on top, then publishes the APK as a GitHub Release.
-# It builds when upstream publishes a new version (a v* tag), when the Android layer changes, or
-# when you run it by hand. Upstream commits between versions do not make a release.
+# Every night it looks at upstream: only when upstream has published a NEW version (a v1.2.3 tag) does it
+# build and release. Run it by hand for a specific ref, to rebuild with a new layer zip (tick force), or
+# to test a build without publishing (untick publish: the APK is kept as a download for 14 days).
+# The Android layer is the one zip android-layer/vectorcraft-android-layer.tar.gz in this repository;
+# it carries apply_layer.py, make_notes.py and whats-new.md, so this file rarely needs editing.
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -14,12 +17,17 @@ on:
         required: false
         default: ""
       force:
-        description: "Build again even if this upstream version already has a release"
+        description: "Build again even if this upstream version already has a release (new tag with -r<run>)"
         type: boolean
         default: false
+      publish:
+        description: "Publish a release (untick = build only, APK is attached to this run)"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: android-release
@@ -31,6 +39,7 @@ env:
   NDK_VERSION: 28.2.13676358
   BT_VERSION: 35.0.0
   CARGO_TERM_COLOR: always
+  MIN_RUST: "1.95"   # raise when a build says "requires rustc 1.xx"
 
 jobs:
   build:
@@ -67,19 +76,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           FORCE: ${{ inputs.force }}
+          PUBLISH: ${{ inputs.publish }}
         run: |
           VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
           SHA=$(git -C src rev-parse --short=7 HEAD)
-          LAYER=$(sha256sum fork/android-layer/vectorcraft-android-layer.tar.gz | cut -c1-6)
-          TAG="android-v${VER}-${SHA}-${LAYER}"
+          # The tag is also the app's version name: the in-app updater compares it with the newest release tag.
+          TAG="android-v${VER}-${SHA}"
           {
             echo "version=$VER"
             echo "sha=$SHA"
             echo "tag=$TAG"
           } >> "$GITHUB_OUTPUT"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          echo "publish=$([ "$PUBLISH" = "false" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" != "false" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             if [ "$FORCE" = "true" ]; then
-              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              # A newer tag for the same upstream commit (a new layer zip): the updater sees it as new.
+              TAG="${TAG}-r${GITHUB_RUN_NUMBER}"
+              sed -i "s|^tag=.*|tag=$TAG|" "$GITHUB_OUTPUT"
               echo "skip=false" >> "$GITHUB_OUTPUT"
             else
               echo "Release $TAG already exists - nothing to do."
@@ -91,11 +104,12 @@ jobs:
 
       - name: Add the Android layer on top of upstream
         if: steps.ver.outputs.skip != 'true'
+        shell: bash
         working-directory: src
         run: |
           mkdir -p "$RUNNER_TEMP/layer"
           tar xzf ../fork/android-layer/vectorcraft-android-layer.tar.gz -C "$RUNNER_TEMP/layer"
-          python3 "$RUNNER_TEMP/layer/apply_layer.py"
+          python3 "$RUNNER_TEMP/layer/apply_layer.py" 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       - uses: actions/setup-java@v4
         if: steps.ver.outputs.skip != 'true'
@@ -106,9 +120,9 @@ jobs:
       - name: Install the Rust version upstream asks for
         if: steps.ver.outputs.skip != 'true'
         run: |
-          # egui 0.36 needs Rust 1.95 even where the workspace still says 1.90: never go below it.
+          # Never go below MIN_RUST, even where the workspace says less.
           RUSTV=$(grep -m1 '^rust-version' src/Cargo.toml | cut -d'"' -f2)
-          RUSTV=$(printf '%s\n%s\n' "${RUSTV:-1.95}" "1.95" | sort -V | tail -n1)
+          RUSTV=$(printf '%s\n%s\n' "${RUSTV:-$MIN_RUST}" "$MIN_RUST" | sort -V | tail -n1)
           rustup toolchain install "$RUSTV" --profile minimal --target "$TARGET"
           rustup default "$RUSTV"
           rustc --version
@@ -128,6 +142,7 @@ jobs:
 
       - name: Build native library (Rust)
         if: steps.ver.outputs.skip != 'true'
+        shell: bash
         working-directory: src
         run: |
           BIN="$ANDROID_HOME/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -136,7 +151,7 @@ jobs:
           export AR_aarch64_linux_android="$BIN/llvm-ar"
           export CARGO_PROFILE_RELEASE_LTO=false
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-          cargo build -p vectorcraft-android --target "$TARGET" --release -j 3
+          cargo build -p vectorcraft-android --target "$TARGET" --release -j 3 2>&1 | tee -a "$RUNNER_TEMP/build.log"
 
       - name: Restore signing key
         if: steps.ver.outputs.skip != 'true'
@@ -205,8 +220,16 @@ jobs:
           "$BT/apksigner" verify --verbose "$APK"
           echo "APK=$APK" >> "$GITHUB_ENV"
 
+      - name: Keep the APK (build-only run)
+        if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vectorcraft-android-apk
+          path: src/dist/*.apk
+          retention-days: 14
+
       - name: Publish the release
-        if: steps.ver.outputs.skip != 'true'
+        if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'true'
         working-directory: src
         env:
           GH_TOKEN: ${{ github.token }}
@@ -215,55 +238,115 @@ jobs:
           SHA: ${{ steps.ver.outputs.sha }}
           REF: ${{ steps.ref.outputs.ref }}
         run: |
-          cat > notes.md <<NOTES
-          **VectorCraft ${VERSION} for Android** (early preview, ARM64)
-
-          Built automatically from upstream \`${UPSTREAM}\` at \`${REF}\` (commit \`${SHA}\`) with the Android layer applied.
-
-          - Needs an ARM64 phone or tablet running Android 9 or newer with a Vulkan GPU.
-          - Download the \`.apk\`, open it, and allow installs from your file manager or browser when Android asks.
-          - No storage permission is needed: Open, Save As and Export use Android's own file picker.
-          - Early preview: no system clipboard or printing yet. A hardware keyboard is recommended.
-          - Unofficial build, not made or supported by the VectorCraft team. If an update will not install over an older build, uninstall the old one first.
-          NOTES
-          # What changed since the previous Android release: upstream's own changes, and the Android
-          # layer's changes only when the layer itself is new.
-          CUR_LAYER="${TAG##*-}"
+          # The previous Android release: its commit (for "what changed upstream") and its notes (so
+          # Android news is not repeated).
           PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,publishedAt \
             --jq '[.[] | select(.tagName | startswith("android-v")) | select(.tagName != $ENV.TAG)] | sort_by(.publishedAt) | reverse | .[0].tagName // ""' || true)
-          PREV_SHA=""
-          PREV_LAYER=""
+          PREV_SHA=""; PREV_VER=""
+          : > "$RUNNER_TEMP/prev.md"
           if [ -n "$PREV_TAG" ]; then
-            PREV_LAYER="${PREV_TAG##*-}"
-            REST="${PREV_TAG%-*}"
-            PREV_SHA="${REST##*-}"
+            # android-v<ver>-<sha7>[-<layer6>][-r<run>]
+            PREV_VER=$(printf '%s' "$PREV_TAG" | sed -E 's/^android-v(.*)-[0-9a-f]{7}(-[0-9a-f]{6})?(-r[0-9]+)?$/\1/')
+            PREV_SHA=$(printf '%s' "$PREV_TAG" | sed -E 's/^android-v.*-([0-9a-f]{7})(-[0-9a-f]{6})?(-r[0-9]+)?$/\1/')
+            gh release view "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/prev.md" || true
           fi
-          COUNT=0
-          UP=""
+
+          # 1. Android news: only when whats-new.md has a section the previous release did not show.
+          python3 "$RUNNER_TEMP/layer/make_notes.py" "$RUNNER_TEMP/layer/whats-new.md" \
+            --prev-body "$RUNNER_TEMP/prev.md" --out "$RUNNER_TEMP/android.md" --readme "$GITHUB_WORKSPACE/fork/README.md"
+
+          # 2. Upstream: its own release notes when the version is new, then its commits since the last build.
+          : > "$RUNNER_TEMP/upstream.md"
+          if [ "$PREV_VER" != "$VERSION" ]; then
+            gh release view "v${VERSION}" --repo "$UPSTREAM" --json body --jq .body 2>/dev/null \
+              | head -n 60 | sed -e 's/@/＠/g' -e 's/#\([0-9][0-9]*\)/\\#\1/g' > "$RUNNER_TEMP/upstream-release.md" || true
+            if [ -s "$RUNNER_TEMP/upstream-release.md" ]; then
+              { echo "## Upstream ${VERSION} release notes"; echo; cat "$RUNNER_TEMP/upstream-release.md"; echo; } >> "$RUNNER_TEMP/upstream.md"
+            fi
+          fi
           if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$SHA" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
             COUNT=$(git rev-list --no-merges --count "${PREV_SHA}..HEAD")
-            # No @name (it would notify people) and no #123 (it would link to this repository's issues).
-            UP=$(git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD" | sed -e 's/@/＠/g' -e 's/#\([0-9][0-9]*\)/\\#\1/g')
+            if [ "$COUNT" -gt 0 ]; then
+              UP=$(git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD" | sed -e 's/@/＠/g' -e 's/#\([0-9][0-9]*\)/\\#\1/g')
+              {
+                echo "## Upstream changes"; echo
+                echo "${COUNT} changes since the previous Android build ([all of them](https://github.com/${UPSTREAM}/compare/${PREV_SHA}...${SHA})):"; echo
+                echo "$UP"
+                if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
+                echo
+              } >> "$RUNNER_TEMP/upstream.md"
+            fi
           fi
-          WROTE=0
-          if [ "$COUNT" -gt 0 ]; then
-            {
-              echo
-              echo "## Upstream changes"
-              echo
-              echo "${COUNT} changes since the previous Android build ([all of them](https://github.com/${UPSTREAM}/compare/${PREV_SHA}...${SHA})):"
-              echo
-              echo "$UP"
-              if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
-            } >> notes.md
-            WROTE=1
-          fi
-          if [ -f "$RUNNER_TEMP/layer/whats-new.md" ] && [ "$PREV_LAYER" != "$CUR_LAYER" ]; then
-            { echo; echo "## Android changes"; echo; cat "$RUNNER_TEMP/layer/whats-new.md"; } >> notes.md
-            WROTE=1
-          fi
-          if [ "$WROTE" = "0" ]; then
-            { echo; echo "No changes since the previous Android build."; } >> notes.md
-          fi
+
+          # 3. Put it together: Android news first, then upstream, then the install notes.
+          {
+            echo "**VectorCraft ${VERSION} for Android** (early preview, ARM64)"
+            echo
+            echo "Built automatically from upstream \`${UPSTREAM}\` at \`${REF}\` (commit \`${SHA}\`) with the Android layer applied."
+            echo
+            cat "$RUNNER_TEMP/android.md" "$RUNNER_TEMP/upstream.md"
+            if [ ! -s "$RUNNER_TEMP/android.md" ] && [ ! -s "$RUNNER_TEMP/upstream.md" ]; then
+              echo "No changes since the previous Android build."; echo
+            fi
+            echo "## Install"
+            echo
+            echo "- Needs an ARM64 phone or tablet running Android 9 or newer with a Vulkan GPU."
+            echo "- Download the \`.apk\`, open it, and allow installs from your file manager or browser when Android asks."
+            echo "- No storage permission is needed: Open, Save As and Export use Android's own file picker."
+            echo "- Early preview: no system clipboard or printing yet. A hardware keyboard is recommended."
+            echo "- Unofficial build, not made or supported by the VectorCraft team. If an update will not install over an older build, uninstall the old one first."
+          } > notes.md
           gh release create "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "VectorCraft ${VERSION} Android (${SHA})" --notes-file notes.md
+
+      - name: Update the feature list in the README
+        if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'true'
+        continue-on-error: true
+        working-directory: fork
+        run: |
+          if ! git diff --quiet -- README.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "README: update Android feature list"
+            git push
+          fi
+
+      - name: Report a failed build
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          LOG="$RUNNER_TEMP/build.log"
+          touch "$LOG"
+          ERR=$(grep -E -A8 '^(error|Error|Traceback|The winit|The Android|LAYER ERROR)' "$LOG" | head -n 80 || true)
+          if [ -z "$ERR" ]; then ERR=$(tail -n 40 "$LOG"); fi
+          ERR=$(printf '%s\n' "$ERR" | sed 's/@/＠/g')
+          SIG=$(printf '%s' "$ERR" | sha256sum | cut -c1-12)
+          {
+            echo "The release build failed for upstream \`${UPSTREAM}\` at \`${REF}\`. No release was made; the previous one is still there."
+            echo
+            echo "Paste the lines below to Claude, and ask for a fixed layer file."
+            echo
+            echo '```'
+            printf '%s\n' "$ERR"
+            echo '```'
+            echo
+            echo "Full log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "<!-- error-signature:${SIG} -->"
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md" >> "$GITHUB_STEP_SUMMARY"
+          gh label create android-build-broken --repo "$GITHUB_REPOSITORY" --color B60205 --description "The Android layer does not build on upstream" --force || true
+          N=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label android-build-broken --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$N" ]; then
+            # The same error as already reported: say nothing new.
+            if gh issue view "$N" --repo "$GITHUB_REPOSITORY" --json body,comments --jq '[.body] + [.comments[].body] | join("\n")' 2>/dev/null | grep -q "error-signature:${SIG}"; then
+              echo "This error is already reported in issue #$N."
+            else
+              gh issue comment "$N" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/body.md" || true
+            fi
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Android release build failed (${REF})" --label android-build-broken --body-file "$RUNNER_TEMP/body.md" || echo "Could not open an issue: tick Settings > General > Features > Issues."
+          fi

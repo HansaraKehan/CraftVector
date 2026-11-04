@@ -1,0 +1,141 @@
+name: Check that the Android layer still builds on upstream
+
+# Every night: take upstream's newest code (not a release), add the Android layer and only check
+# that it compiles (no APK, no release). If it does not, an issue is opened (or updated) with the
+# first error lines; paste those lines to Claude. When it compiles again the issue is closed.
+# Needs: Settings > General > Features > Issues ticked (forks have Issues off by default).
+on:
+  schedule:
+    - cron: "43 20 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream branch or tag to check (empty = main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: android-canary
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: storytold/vectorcraft
+  TARGET: aarch64-linux-android
+  NDK_VERSION: 28.2.13676358
+  CARGO_TERM_COLOR: never
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Pick the upstream ref
+        id: ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          VAR_REF: ${{ vars.CANARY_REF }}
+        run: |
+          REF="${INPUT_REF:-${VAR_REF:-main}}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Check out this repository (the Android layer lives here)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Check out upstream VectorCraft
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.ref.outputs.ref }}
+          path: src
+
+      - name: Add the Android layer on top of upstream
+        shell: bash
+        working-directory: src
+        run: |
+          mkdir -p "$RUNNER_TEMP/layer"
+          tar xzf ../fork/android-layer/vectorcraft-android-layer.tar.gz -C "$RUNNER_TEMP/layer"
+          python3 "$RUNNER_TEMP/layer/apply_layer.py" 2>&1 | tee -a "$RUNNER_TEMP/check.log"
+
+      - name: Install the Rust version upstream asks for
+        run: |
+          RUSTV=$(grep -m1 '^rust-version' src/Cargo.toml | cut -d'"' -f2)
+          RUSTV=$(printf '%s\n%s\n' "${RUSTV:-$MIN_RUST}" "$MIN_RUST" | sort -V | tail -n1)
+          rustup toolchain install "$RUSTV" --profile minimal --target "$TARGET"
+          rustup default "$RUSTV"
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          key: android-arm64-check
+
+      - name: Install the Android NDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;${NDK_VERSION}"
+
+      - name: Compile the Android app (check only)
+        shell: bash
+        working-directory: src
+        run: |
+          BIN="$ANDROID_HOME/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android28-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android28-clang"
+          cargo check -p vectorcraft-android --target "$TARGET" -j 3 2>&1 | tee -a "$RUNNER_TEMP/check.log"
+
+      - name: Close the open "build breaks" issue (it builds again)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          N=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label android-build-broken --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$N" ]; then
+            gh issue close "$N" --repo "$GITHUB_REPOSITORY" --comment "The Android layer builds on upstream again (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})." || true
+          fi
+
+      - name: Report the failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          LOG="$RUNNER_TEMP/check.log"
+          touch "$LOG"
+          ERR=$(grep -E -A8 '^(error|Error|Traceback|The winit|The Android|LAYER ERROR)' "$LOG" | head -n 80 || true)
+          if [ -z "$ERR" ]; then ERR=$(tail -n 40 "$LOG"); fi
+          ERR=$(printf '%s\n' "$ERR" | sed 's/@/＠/g')
+          SIG=$(printf '%s' "$ERR" | sha256sum | cut -c1-12)
+          {
+            echo "The Android layer no longer builds on upstream \`${UPSTREAM}\` at \`${REF}\`."
+            echo
+            echo "Paste the lines below to Claude, and ask for a fixed layer file."
+            echo
+            echo '```'
+            printf '%s\n' "$ERR"
+            echo '```'
+            echo
+            echo "Full log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            echo "<!-- error-signature:${SIG} -->"
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md" >> "$GITHUB_STEP_SUMMARY"
+          gh label create android-build-broken --repo "$GITHUB_REPOSITORY" --color B60205 --description "The Android layer does not build on upstream" --force || true
+          N=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label android-build-broken --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$N" ]; then
+            # The same error as already reported: say nothing new.
+            if gh issue view "$N" --repo "$GITHUB_REPOSITORY" --json body,comments --jq '[.body] + [.comments[].body] | join("\n")' 2>/dev/null | grep -q "error-signature:${SIG}"; then
+              echo "This error is already reported in issue #$N."
+            else
+              gh issue comment "$N" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/body.md" || true
+            fi
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Android build breaks on upstream (${REF})" --label android-build-broken --body-file "$RUNNER_TEMP/body.md" || echo "Could not open an issue: tick Settings > General > Features > Issues."
+          fi
