@@ -2,7 +2,7 @@ name: Build and release VectorCraft Android APK
 
 # Builds the newest upstream VectorCraft (storytold/vectorcraft) with the Android layer
 # applied on top, then publishes the APK as a GitHub Release.
-# Every night it looks at upstream: only when upstream has published a NEW version (a v1.2.3 tag) does it
+# Every night it looks at upstream's latest release: only when it is NEW (no android-v<version> release yet) does it
 # build and release. Run it by hand for a specific ref, to rebuild with a new layer zip (tick force), or
 # to test a build without publishing (untick publish: the APK is kept as a download for 14 days).
 # The Android layer is the one zip android-layer/vectorcraft-android-layer.tar.gz in this repository;
@@ -49,11 +49,15 @@ jobs:
       - name: Pick the upstream ref
         id: ref
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_REF: ${{ inputs.ref }}
           VAR_REF: ${{ vars.UPSTREAM_REF }}
         run: |
-          # Default: upstream's newest released version (a plain v1.2.3 tag), not its latest commit.
-          LATEST=$(git ls-remote --tags --refs "https://github.com/${UPSTREAM}.git" 'v*' | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          # Default: upstream's latest published release (not main, whose Cargo.toml lags behind).
+          LATEST=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if ! printf '%s' "$LATEST" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            LATEST=$(git ls-remote --tags --refs "https://github.com/${UPSTREAM}.git" 'v*' | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          fi
           REF="${INPUT_REF:-${VAR_REF:-${LATEST:-main}}}"
           echo "Building upstream ref: $REF"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
@@ -78,10 +82,16 @@ jobs:
           FORCE: ${{ inputs.force }}
           PUBLISH: ${{ inputs.publish }}
         run: |
-          VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)
           SHA=$(git -C src rev-parse --short=7 HEAD)
+          REF="${{ steps.ref.outputs.ref }}"
           # The tag is also the app's version name: the in-app updater compares it with the newest release tag.
-          TAG="android-v${VER}-${SHA}"
+          if printf '%s' "$REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            VER="${REF#v}"                 # an upstream release: the version comes from the tag name
+            TAG="android-v${VER}"
+          else
+            VER=$(grep -m1 '^version' src/Cargo.toml | cut -d'"' -f2)   # a branch or commit you typed in
+            TAG="android-v${VER}-${SHA}"
+          fi
           {
             echo "version=$VER"
             echo "sha=$SHA"
@@ -245,9 +255,9 @@ jobs:
           PREV_SHA=""; PREV_VER=""
           : > "$RUNNER_TEMP/prev.md"
           if [ -n "$PREV_TAG" ]; then
-            # android-v<ver>-<sha7>[-<layer6>][-r<run>]
-            PREV_VER=$(printf '%s' "$PREV_TAG" | sed -E 's/^android-v(.*)-[0-9a-f]{7}(-[0-9a-f]{6})?(-r[0-9]+)?$/\1/')
-            PREV_SHA=$(printf '%s' "$PREV_TAG" | sed -E 's/^android-v.*-([0-9a-f]{7})(-[0-9a-f]{6})?(-r[0-9]+)?$/\1/')
+            # android-v<ver>[-<sha7>][-<layer6>][-r<run>]  (the sha and layer parts exist on older releases)
+            PREV_VER=$(printf '%s' "$PREV_TAG" | sed -E 's/^android-v//; s/-r[0-9]+$//; s/-[0-9a-f]{6}$//; s/-[0-9a-f]{7}$//')
+            PREV_SHA=$(printf '%s' "$PREV_TAG" | sed -nE 's/^android-v.*-([0-9a-f]{7})(-[0-9a-f]{6})?(-r[0-9]+)?$/\1/p')
             gh release view "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/prev.md" || true
           fi
 
@@ -264,13 +274,18 @@ jobs:
               { echo "## Upstream ${VERSION} release notes"; echo; cat "$RUNNER_TEMP/upstream-release.md"; echo; } >> "$RUNNER_TEMP/upstream.md"
             fi
           fi
-          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$SHA" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
-            COUNT=$(git rev-list --no-merges --count "${PREV_SHA}..HEAD")
+          # What to compare with: the previous upstream version's tag, else the commit of an older-style release.
+          BASE=""
+          if [ -n "$PREV_VER" ] && git rev-parse -q --verify "refs/tags/v${PREV_VER}^{commit}" > /dev/null; then BASE="v${PREV_VER}"
+          elif [ -n "$PREV_SHA" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then BASE="$PREV_SHA"; fi
+          TO="$REF"; if ! git rev-parse -q --verify "refs/tags/${REF}" > /dev/null; then TO="$SHA"; fi
+          if [ -n "$BASE" ] && [ "$(git rev-parse "${BASE}^{commit}")" != "$(git rev-parse HEAD)" ]; then
+            COUNT=$(git rev-list --no-merges --count "${BASE}..HEAD")
             if [ "$COUNT" -gt 0 ]; then
-              UP=$(git log --no-merges --max-count=40 --pretty='- %s' "${PREV_SHA}..HEAD" | sed -e 's/@/＠/g' -e 's/#\([0-9][0-9]*\)/\\#\1/g')
+              UP=$(git log --no-merges --max-count=40 --pretty='- %s' "${BASE}..HEAD" | sed -e 's/@/＠/g' -e 's/#\([0-9][0-9]*\)/\\#\1/g')
               {
                 echo "## Upstream changes"; echo
-                echo "${COUNT} changes since the previous Android build ([all of them](https://github.com/${UPSTREAM}/compare/${PREV_SHA}...${SHA})):"; echo
+                echo "${COUNT} upstream changes since ${BASE} ([all of them](https://github.com/${UPSTREAM}/compare/${BASE}...${TO})):"; echo
                 echo "$UP"
                 if [ "$COUNT" -gt 40 ]; then echo "- …and $((COUNT - 40)) more"; fi
                 echo
@@ -297,7 +312,7 @@ jobs:
             echo "- Unofficial build, not made or supported by the VectorCraft team. If an update will not install over an older build, uninstall the old one first."
           } > notes.md
           gh release create "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "VectorCraft ${VERSION} Android (${SHA})" --notes-file notes.md
+            --title "VectorCraft ${VERSION} Android" --notes-file notes.md
 
       - name: Update the feature list in the README
         if: steps.ver.outputs.skip != 'true' && steps.ver.outputs.publish == 'true'
